@@ -360,6 +360,44 @@ pub(package) fn with_along(p: vec3, axis: u32, x: f32) -> vec3 {
     )
 }
 
+/// Proves a slab `[lo, hi]` empty by checking `field.interval_near` directly first, and when a
+/// wide slab's diagonal defeats a Lipschitz ball (`stepped_near`), tiling the two perpendicular
+/// axes up to 4×4 (short-circuiting on the first sub-box that may cross 0).
+fn slab_empty<M: Field<Substance>>(field: M, lo: vec3, hi: vec3, axis: u32) -> bool {
+    if !may_cross(field.interval_near(Box3 { lo, hi })) {
+        return true
+    }
+    let ext = hi - lo
+    let a1 = (axis + 1) % 3
+    let a2 = (axis + 2) % 3
+    let e0 = max(along(ext, axis), 1.0e-5)
+    let e1 = along(ext, a1)
+    let e2 = along(ext, a2)
+    if max(e1, e2) <= e0 * 1.5 {
+        return false
+    }
+    let n1: u32 = if e1 > e0 * 3.0 { 4 } else if e1 > e0 * 1.5 { 2 } else { 1 }
+    let n2: u32 = if e2 > e0 * 3.0 { 4 } else if e2 > e0 * 1.5 { 2 } else { 1 }
+    let lo1 = along(lo, a1)
+    let lo2 = along(lo, a2)
+    let s1 = e1 / f32(n1)
+    let s2 = e2 / f32(n2)
+    for i in 0..n1 {
+        let u0 = lo1 + f32(i) * s1
+        let u1 = if i + 1 == n1 { along(hi, a1) } else { lo1 + f32(i + 1) * s1 }
+        for j in 0..n2 {
+            let v0 = lo2 + f32(j) * s2
+            let v1 = if j + 1 == n2 { along(hi, a2) } else { lo2 + f32(j + 1) * s2 }
+            let slo = with_along(with_along(lo, a1, u0), a2, v0)
+            let shi = with_along(with_along(hi, a1, u1), a2, v1)
+            if may_cross(field.interval_near(Box3 { lo: slo, hi: shi })) {
+                return false
+            }
+        }
+    }
+    true
+}
+
 /// Binary-searches the lower (or `upper`) face of box `(lo, hi)` along `axis` inward (8 steps)
 /// while the slab it sweeps provably holds no surface, returning the face's new coordinate.
 fn shrink<M: Field<Substance>>(field: M, lo: vec3, hi: vec3, axis: u32, upper: bool) -> f32 {
@@ -372,8 +410,7 @@ fn shrink<M: Field<Substance>>(field: M, lo: vec3, hi: vec3, axis: u32, upper: b
         } else {
             Box3 { lo, hi: with_along(hi, axis, mid) }
         }
-        let iv = field.interval_near(slab)
-        let empty = !may_cross(iv)
+        let empty = slab_empty(field, slab.lo, slab.hi, axis)
         if upper {
             if empty { c = mid } else { a = mid }
         } else {
@@ -383,13 +420,55 @@ fn shrink<M: Field<Substance>>(field: M, lo: vec3, hi: vec3, axis: u32, upper: b
     if upper { c } else { a }
 }
 
-/// Tightens a thing's bounding sphere into a tight axis-aligned box on the CPU using
-/// `field.interval_near` (8 binary-search steps per face = 48 Lipschitz-narrowed interval queries).
+/// Tightens a thing's bounding sphere into a tight axis-aligned box on the CPU using a bounded
+/// 3-level octree prune followed by 6-face `slab_empty` binary search (handles both tight
+/// interval fields and `stepped_near` Lipschitz-ball fields whose giant slabs cannot shrink).
 pub fn tight_aabb<M: Field<Substance>>(field: M) -> Box3 {
     let b = field.bound()
     let r = min(b.radius, 1.0e4)
     var lo = b.centre - vec3(r)
     var hi = b.centre + vec3(r)
+    var boxes: Vec<Box3> = Vec::new()
+    boxes.push(Box3 { lo, hi })
+    for _lvl in 0..3 {
+        var next: Vec<Box3> = Vec::new()
+        var overflow = false
+        for i in 0..boxes.len() {
+            let bx = boxes[i]
+            if may_cross(field.interval_near(bx)) {
+                if next.len() + 8 <= 512 {
+                    for c in bx.split() {
+                        next.push(c)
+                    }
+                } else {
+                    overflow = true
+                    break
+                }
+            }
+        }
+        if overflow {
+            break
+        }
+        boxes = take next
+        if boxes.len() == 0 {
+            // No box of it may hold its surface: it has none (an absent thing), and its tight
+            // box holds nothing.
+            return Box3 { lo: b.centre, hi: b.centre }
+        }
+    }
+    var olo = vec3(1.0e30)
+    var ohi = vec3(-1.0e30)
+    for i in 0..boxes.len() {
+        let bx = boxes[i]
+        if may_cross(field.interval_near(bx)) {
+            olo = min(olo, bx.lo)
+            ohi = max(ohi, bx.hi)
+        }
+    }
+    if ohi.x >= olo.x {
+        lo = olo
+        hi = ohi
+    }
     for axis in 0..3 {
         lo = with_along(lo, axis, shrink(field, lo, hi, axis, upper: false))
         hi = with_along(hi, axis, shrink(field, lo, hi, axis, upper: true))
@@ -432,6 +511,60 @@ pub(package) fn tight_aabb_rest<M: Field<Substance>>(field: M) -> Box3 {
     Box3 { lo, hi }
 }
 
+/// Fixed integer power-of-two anchor level for `aabb` (`anchor_step = BRICK * 2^k_anchor`),
+/// depending ONLY on `aabb` so every LOD ring and every eye position shares one world-anchored
+/// brick lattice (`grid_for_anchored`) with bit-identical brick coordinates `gb = cell_offset / BRICK + b`.
+pub fn anchor_level(aabb: Box3) -> i32 {
+    let span = max(aabb.hi.x - aabb.lo.x, max(aabb.hi.y - aabb.lo.y, aabb.hi.z - aabb.lo.z))
+    max(i32(ceil(log2(max(span / (f32(BRICK) * 2.0), 1.0e-4)))), 0)
+}
+
+/// Builds a single-LOD `GridSpec` covering `aabb` with exact power-of-two cell spacing `cell`,
+/// anchored to `anchor_step = BRICK * 2^k_anchor` (derived from `aabb` alone). Because `origin`
+/// never moves when `cell` or the eye changes and `cell_offset` is always a multiple of `BRICK`,
+/// any brick `(level, gb = cell_offset / BRICK + b)` maps to the exact same IEEE-754 corner bits
+/// across every cut, enabling persistent `BrickPool` caching with zero re-extraction.
+pub(package) fn grid_for_anchored(
+    aabb: Box3,
+    cell: f32,
+    k_anchor: i32,
+    base_brick: u32,
+    orig_id: u32,
+    shift: vec3,
+) -> GridSpec {
+    let pad = vec3(cell * 2.0)
+    let bspan = cell * f32(BRICK)
+    let anchor_step = max(f32(BRICK) * exp2(f32(k_anchor)), bspan)
+    let origin = (floor((aabb.lo - shift) / anchor_step) - vec3(1.0)) * anchor_step
+    let lo_rel = max(aabb.lo - pad - shift - origin, vec3(0.0))
+    let b0 = vec3u(u32(floor(lo_rel.x / bspan)), u32(floor(lo_rel.y / bspan)), u32(floor(lo_rel.z / bspan)))
+    let g_lo = origin + vec3(f32(b0.x), f32(b0.y), f32(b0.z)) * bspan
+    let span = max(aabb.hi + pad - shift - g_lo, vec3(cell))
+    let nx = max(u32(ceil(span.x / bspan)), 1)
+    let ny = max(u32(ceil(span.y / bspan)), 1)
+    let nz = max(u32(ceil(span.z / bspan)), 1)
+    GridSpec {
+        origin,
+        cell,
+        dims: vec3u(nx, ny, nz),
+        base_brick,
+        orig_id,
+        seam_mask: 0,
+        parent_grid: NONE,
+        has_hole: 0,
+        hole_min: vec3u(0, 0, 0),
+        pad0: 0,
+        hole_max: vec3u(0, 0, 0),
+        pad1: 0,
+        cell_offset: b0 * BRICK,
+        pad2: 0,
+        parent_hole_min: vec3u(0, 0, 0),
+        pad3: 0,
+        shift,
+        pad4: 0,
+    }
+}
+
 /// Builds a single-LOD `GridSpec` covering `aabb` with cell spacing `cell`, padded by 2 cells so
 /// the surface never touches the grid boundary. Its corners are on the world's lattice placed at
 /// `shift` (`lattice`: `shift` and whole cells from the world's origin), and it covers `aabb`
@@ -441,9 +574,9 @@ pub(package) fn tight_aabb_rest<M: Field<Substance>>(field: M) -> Box3 {
 /// millimetre cells lost most of itself.)
 pub(package) fn grid_for(aabb: Box3, cell: f32, base_brick: u32, orig_id: u32, shift: vec3) -> GridSpec {
     let pad = vec3(cell * 2.0)
-    let origin = floor((aabb.lo - pad - shift) / cell) * cell
-    let span = max(aabb.hi + pad - shift - origin, vec3(cell))
     let bspan = cell * f32(BRICK)
+    let origin = floor((aabb.lo - pad - shift) / bspan) * bspan
+    let span = max(aabb.hi + pad - shift - origin, vec3(cell))
     let nx = max(u32(ceil(span.x / bspan)), 1)
     let ny = max(u32(ceil(span.y / bspan)), 1)
     let nz = max(u32(ceil(span.z / bspan)), 1)
@@ -636,53 +769,16 @@ pub fn build_lod_grids(
     (grids, total_bricks, has_seams)
 }
 
-/// Estimates the nearest visible surface depth inside camera `v`'s view frustum via a 5×5 CPU
-/// ray probe grid spanning `[2%, 98%]` of the viewport. Prevents fine Multi-LOD clipmap rings
-/// from centering on empty air or off-screen geometry beside/behind the eye while staying safely
-/// in front of the nearest visible hit (`0.85 * min_hit`, floored at `d_surf`).
-pub fn probe_visible_near<M: Field<Substance>>(field: M, v: View, d_surf: f32, max_t: f32) -> f32 {
-    let lip = max(field.lipschitz(1.0), 1.0)
-    let inv_lip = 1.0 / lip
-    let t_cap = max(max_t, d_surf + 0.1)
-    var min_t = t_cap
-    var any_hit = false
-    for iy in 0..5 {
-        let py = (0.02 + 0.24 * f32(iy)) * v.size.y
-        for ix in 0..5 {
-            let px = (0.02 + 0.24 * f32(ix)) * v.size.x
-            let d = v.ray(vec2(px, py))
-            var t = 0.0
-            for _step in 0..32 {
-                if t >= min_t {
-                    break
-                }
-                let f = field.distance(v.at + d * t)
-                if f <= 0.002 {
-                    min_t = t
-                    any_hit = true
-                    break
-                }
-                t += max(f * inv_lip, 0.002 + 0.001 * t)
-            }
-        }
-    }
-    let floor_d = if lip > 2.0 { 0.75 * d_surf } else { d_surf }
-    if !any_hit {
-        return floor_d
-    }
-    max(0.85 * min_t, floor_d)
-}
-
-/// Builds a strictly 2:1-balanced hierarchy of frustum-fitted nested clipmap `GridSpec`s covering
-/// `aabb` for camera `v`: Level 0 spans the whole `aabb` at `h_top` (so shadows, GI and SDF
-/// splatting stay complete off-screen), while each finer level `lvl >= 1` (`h = h_top / 2^lvl`)
-/// tightly encloses the truncated view frustum out to depth `R = h_parent / (k_px * v.pixel())`
-/// (with 1-parent-brick eye padding and a 12% edge margin), snapped to integer coarse brick
-/// boundaries with a `>= 1` parent-brick margin inside any parent seam face.
+/// Builds a strictly 2:1-balanced hierarchy of world-anchored, **distance-only** nested clipmap
+/// `GridSpec`s covering `aabb` around eye position `eye_at` (never depending on `v.forward`, so
+/// pure camera rotation changes zero bricks and off-screen sun casters stay resident).
+/// Every level has an exact power-of-two `cell` anchored to `anchor_level(aabb)` so every brick
+/// `(level, gb = cell_offset / BRICK + b)` keeps bit-identical world coordinates across cuts.
 /// Returns `(grids, total_bricks, has_seams)`.
-pub fn build_lod_grids_view(
+pub fn build_lod_grids_distance(
     aabb: Box3,
-    v: View,
+    eye_at: vec3,
+    px: f32,
     h_near: f32,
     h_top: f32,
     z_near: f32,
@@ -690,12 +786,15 @@ pub fn build_lod_grids_view(
     k_px: f32,
     max_parent_span: u32,
     area_budget: u32,
-    root_min_ratio: f32,
     shift: vec3,
-    widen: f32 = 1.0,
+    reach_mult: f32 = 1.0,
 ) -> (Vec<GridSpec>, u32, bool) {
-    if h_top <= h_near * 1.45 {
-        let g = grid_for(aabb, h_near, base_brick: 0, orig_id: orig_id, shift: shift)
+    let k_anchor = anchor_level(aabb)
+    let h_cap = exp2(f32(k_anchor))
+    let h_root_top = min(h_top, h_cap)
+    let h_finest = min(h_near, h_root_top)
+    if h_root_top <= h_finest * 1.45 {
+        let g = grid_for_anchored(aabb, h_finest, k_anchor, base_brick: 0, orig_id: orig_id, shift: shift)
         let tb = g.dims.x * g.dims.y * g.dims.z
         var out: Vec<GridSpec> = Vec::new()
         out.push(g)
@@ -703,28 +802,30 @@ pub fn build_lod_grids_view(
     }
     var levels: u32 = 1
     var scale = 1.0
-    while levels < MAX_LOD_LEVELS && h_near * scale * 1.95 < h_top {
+    while levels < MAX_LOD_LEVELS && h_finest * scale * 1.5 < h_root_top {
         scale *= 2.0
         levels += 1
     }
-    // Align the root cell size to the power-of-two ladder ending at `h_near` (clamped to
-    // `[root_min_ratio * h_top, h_top]`) so intermediate levels hit screen-space targets without a
-    // 1.6× phase mismatch.
-    let h_root = clamp(h_near * scale, root_min_ratio * h_top, h_top)
+    let h_root = min(h_finest * scale, h_cap)
     var grids: Vec<GridSpec> = Vec::new()
-    grids.push(grid_for(aabb, h_root, base_brick: 0, orig_id: orig_id, shift: shift))
-    let tan_y = 1.12 * widen / max(v.focal, 1.0e-4)
-    let tan_x = (v.size.x / max(v.size.y, 1.0)) * tan_y
-    let px_rad = max(v.pixel(), 1.0e-5)
-    let dx_far = max(abs(v.at.x - aabb.lo.x), abs(v.at.x - aabb.hi.x))
-    let dy_far = max(abs(v.at.y - aabb.lo.y), abs(v.at.y - aabb.hi.y))
-    let dz_far = max(abs(v.at.z - aabb.lo.z), abs(v.at.z - aabb.hi.z))
+    grids.push(grid_for_anchored(aabb, h_root, k_anchor, base_brick: 0, orig_id: orig_id, shift: shift))
+    let px_rad = max(px, 1.0e-5)
+    let dx_far = max(abs(eye_at.x - aabb.lo.x), abs(eye_at.x - aabb.hi.x))
+    let dy_far = max(abs(eye_at.y - aabb.lo.y), abs(eye_at.y - aabb.hi.y))
+    let dz_far = max(abs(eye_at.z - aabb.lo.z), abs(eye_at.z - aabb.hi.z))
     let max_reach = sqrt(dx_far * dx_far + dy_far * dy_far + dz_far * dz_far)
-    let span_cap = i32(max(max_parent_span, 4))
-    let vol_cap: i32 = 160000
-    // Total parent-brick surface-area budget across all finer levels (with GPU per-brick frustum
-    // refinement culling off-screen corners of the rotated world AABB before field evaluation).
-    var rem_area: i32 = i32(max(area_budget, 1200))
+    let lin_scale = max(reach_mult, 1.0)
+    let area_scale = lin_scale * lin_scale
+    let vol_scale = area_scale * lin_scale
+    let is_single_ring = levels <= 2
+    let base_span = min(max(max_parent_span, 4), if is_single_ring { 40 } else { 28 })
+    let span_cap = i32(ceil(f32(base_span) * lin_scale))
+    let vol_cap: i32 = i32((if is_single_ring { 48000.0 } else { 24000.0 }) * vol_scale)
+    var rem_area: i32 = i32(
+        f32(max(area_budget, 1200)) * (if is_single_ring { 2.2 } else { 0.70 }) * area_scale,
+    )
+    let min_area_cap = i32((if is_single_ring { 400.0 } else { 350.0 }) * area_scale)
+    let max_area_cap = i32((if is_single_ring { 2800.0 } else { 1600.0 }) * area_scale)
     for lvl in 1..levels {
         let pi = grids.len() - 1
         let prev = grids[pi]
@@ -742,15 +843,14 @@ pub fn build_lod_grids_view(
             break
         }
         let rem_lvls = max(i32(levels - lvl), 1)
-        let area_cap = clamp((rem_area * 5) / (rem_lvls * 4 + 1), 400, 9000)
-        let r_want = prev.cell / (max(k_px, 0.5) * px_rad)
+        let area_cap = clamp((rem_area * 5) / (rem_lvls * 4 + 1), min_area_cap, max_area_cap)
+        let r_base = prev.cell / (max(k_px, 0.5) * px_rad)
         let zn = max(z_near - 2.0 * pbspan, 0.0)
-        // Skip levels whose entire reach falls inside the empty air gap `[0, z_near)` in front of the eye.
-        if r_want < zn {
+        if r_base < zn {
             break
         }
+        let r_want = r_base * reach_mult
         var reach = clamp(r_want, zn + 2.0 * pbspan, max(max_reach, zn + 2.0 * pbspan))
-        var fov_s = 1.0
         let pad = pbspan
         var lo_x: i32 = 0
         var hi_x: i32 = 0
@@ -758,27 +858,11 @@ pub fn build_lod_grids_view(
         var hi_y: i32 = 0
         var lo_z: i32 = 0
         var hi_z: i32 = 0
+        var final_vol: i32 = 0
         for iter in 0..6 {
-            let near_c = v.at + v.forward * zn
-            let nrx = v.right * (zn * tan_x * fov_s)
-            let nry = v.up * (zn * tan_y * fov_s)
-            let n0 = near_c - nrx - nry
-            let n1 = near_c + nrx - nry
-            let n2 = near_c - nrx + nry
-            let n3 = near_c + nrx + nry
-            let far_c = v.at + v.forward * reach
-            let rx = v.right * (reach * tan_x * fov_s)
-            let ry = v.up * (reach * tan_y * fov_s)
-            let c0 = far_c - rx - ry
-            let c1 = far_c + rx - ry
-            let c2 = far_c - rx + ry
-            let c3 = far_c + rx + ry
-            let box_lo = min(min(min(n0, n1), min(n2, n3)), min(min(c0, c1), min(c2, c3))) -
-                vec3(pad)
-            let box_hi = max(max(max(n0, n1), max(n2, n3)), max(max(c0, c1), max(c2, c3))) +
-                vec3(pad)
-            let lo_f = (box_lo - prev_origin) / pbspan
-            let hi_f = (box_hi - prev_origin) / pbspan
+            let half = vec3(reach + pad)
+            let lo_f = (eye_at - half - prev_origin) / pbspan
+            let hi_f = (eye_at + half - prev_origin) / pbspan
             lo_x = max(min_x, i32(floor(lo_f.x)))
             hi_x = min(max_x, i32(ceil(hi_f.x)))
             lo_y = max(min_y, i32(floor(lo_f.y)))
@@ -791,29 +875,28 @@ pub fn build_lod_grids_view(
             let mspan = max(sx, max(sy, sz))
             let area = sx * sy + sy * sz + sz * sx
             let vol = sx * sy * sz
+            final_vol = vol
             if (mspan <= span_cap && area <= area_cap && vol <= vol_cap) || iter == 5 {
                 break
             }
-            var scale = 1.0
+            var s = 1.0
             if mspan > span_cap {
-                scale = min(scale, (f32(span_cap) / f32(mspan)) * 0.90)
+                s = min(s, (f32(span_cap) / f32(mspan)) * 0.90)
             }
             if area > area_cap {
-                scale = min(scale, sqrt(f32(area_cap) / f32(area)) * 0.90)
+                s = min(s, sqrt(f32(area_cap) / f32(area)) * 0.90)
             }
             if vol > vol_cap {
-                scale = min(scale, pow(f32(vol_cap) / f32(vol), 0.3333) * 0.92)
+                s = min(s, pow(f32(vol_cap) / f32(vol), 0.3333) * 0.92)
             }
-            if reach > zn + 2.5 * pbspan {
-                reach = zn + max(2.0 * pbspan, (reach - zn) * scale)
-            } else {
-                fov_s = max(0.15, fov_s * scale)
-            }
+            reach = max(zn + 2.0 * pbspan, reach * s)
         }
-        // Final hard clamp per axis around the frustum's near-mid point so the near plane at `zn`
-        // can never exceed `span_cap`.
-        let focus_p = v.at + v.forward * (0.5 * (zn + reach))
-        let foc_b = (focus_p - prev_origin) / pbspan
+        // If even the minimum sphere reaching `zn` overflows `vol_cap * 2` on a flat slab, stop
+        // refining instead of clamping a huge floor/air slab around `eye_at`.
+        if final_vol > vol_cap * 2 {
+            break
+        }
+        let foc_b = (clamp(eye_at, aabb.lo, aabb.hi) - prev_origin) / pbspan
         if hi_x - lo_x > span_cap {
             let mid = clamp(i32(round(foc_b.x)), lo_x + span_cap / 2, hi_x - span_cap / 2)
             lo_x = max(min_x, mid - span_cap / 2)
@@ -867,8 +950,6 @@ pub fn build_lod_grids_view(
             (prev.cell_offset.z + hole_min.z) * 2,
         )
         if sm == 0 && prev.seam_mask == 0 {
-            // Child replaces 100% of root grid cleanly — drop the empty parent so it wastes zero
-            // cull bricks and keeps `grids.len() == 1` (single-grid fast path!).
             grids[pi] = GridSpec {
                 origin: prev.origin,
                 cell: 0.5 * prev.cell,
@@ -876,7 +957,7 @@ pub fn build_lod_grids_view(
                 base_brick: 0,
                 orig_id,
                 seam_mask: 0,
-                parent_grid: pi,
+                parent_grid: NONE,
                 has_hole: 0,
                 hole_min: vec3u(0, 0, 0),
                 pad0: 0,
@@ -928,33 +1009,173 @@ pub fn build_lod_grids_view(
     (grids, total_bricks, has_seams)
 }
 
+/// Expands every seamed level of a valid 2:1-balanced distance grid hierarchy `need` outward by
+/// `max(span / 4, 2)` parent bricks (clamped to each parent's legal 2:1 interior and volume cap)
+/// so the returned `wide` hierarchy is mathematically guaranteed to satisfy `grids_hold(wide, need)`
+/// while giving walking cameras dozens of frames of zero-extraction slack before stepping a ring.
+pub fn expand_lod_grids(need: Vec<GridSpec>) -> (Vec<GridSpec>, u32, bool) {
+    let n = need.len()
+    if n <= 1 {
+        var tb: u32 = 0
+        if n == 1 {
+            tb = need[0].dims.x * need[0].dims.y * need[0].dims.z
+        }
+        return (need.clone(), tb, false)
+    }
+    var wide: Vec<GridSpec> = Vec::new()
+    wide.push(GridSpec { has_hole: 0, hole_min: vec3u(0, 0, 0), hole_max: vec3u(0, 0, 0), ..need[0] })
+    for i in 1..n {
+        let p = wide[i - 1]
+        let w = need[i]
+        let min_x: u32 = if (p.seam_mask & 1) != 0 { 1 } else { 0 }
+        let min_y: u32 = if (p.seam_mask & 4) != 0 { 1 } else { 0 }
+        let min_z: u32 = if (p.seam_mask & 16) != 0 { 1 } else { 0 }
+        let max_x: u32 = if p.dims.x > (if (p.seam_mask & 2) != 0 { 1 } else { 0 }) {
+            p.dims.x - (if (p.seam_mask & 2) != 0 { 1 } else { 0 })
+        } else {
+            min_x
+        }
+        let max_y: u32 = if p.dims.y > (if (p.seam_mask & 8) != 0 { 1 } else { 0 }) {
+            p.dims.y - (if (p.seam_mask & 8) != 0 { 1 } else { 0 })
+        } else {
+            min_y
+        }
+        let max_z: u32 = if p.dims.z > (if (p.seam_mask & 32) != 0 { 1 } else { 0 }) {
+            p.dims.z - (if (p.seam_mask & 32) != 0 { 1 } else { 0 })
+        } else {
+            min_z
+        }
+        let w_poff_x = w.cell_offset.x / 2
+        let w_poff_y = w.cell_offset.y / 2
+        let w_poff_z = w.cell_offset.z / 2
+        let blo_x = clamp((w_poff_x - p.cell_offset.x) / BRICK, min_x, max_x)
+        let blo_y = clamp((w_poff_y - p.cell_offset.y) / BRICK, min_y, max_y)
+        let blo_z = clamp((w_poff_z - p.cell_offset.z) / BRICK, min_z, max_z)
+        let bhi_x = clamp(blo_x + w.dims.x / 2, blo_x, max_x)
+        let bhi_y = clamp(blo_y + w.dims.y / 2, blo_y, max_y)
+        let bhi_z = clamp(blo_z + w.dims.z / 2, blo_z, max_z)
+        var px: u32 = 2
+        var py: u32 = 2
+        var pz: u32 = 2
+        var ex_lo_x = if blo_x > min_x + px { blo_x - px } else { min_x }
+        var ex_hi_x = min(bhi_x + px, max_x)
+        var ex_lo_y = if blo_y > min_y + py { blo_y - py } else { min_y }
+        var ex_hi_y = min(bhi_y + py, max_y)
+        var ex_lo_z = if blo_z > min_z + pz { blo_z - pz } else { min_z }
+        var ex_hi_z = min(bhi_z + pz, max_z)
+        // Keep expanded level within super-cull volume cap (<= 64000 parent bricks = 8000 super-bricks).
+        for _iter in 0..4 {
+            let vol = (ex_hi_x - ex_lo_x) * (ex_hi_y - ex_lo_y) * (ex_hi_z - ex_lo_z)
+            if vol <= 64000 || (px == 0 && py == 0 && pz == 0) {
+                break
+            }
+            px = px / 2
+            py = py / 2
+            pz = pz / 2
+            ex_lo_x = if blo_x > min_x + px { blo_x - px } else { min_x }
+            ex_hi_x = min(bhi_x + px, max_x)
+            ex_lo_y = if blo_y > min_y + py { blo_y - py } else { min_y }
+            ex_hi_y = min(bhi_y + py, max_y)
+            ex_lo_z = if blo_z > min_z + pz { blo_z - pz } else { min_z }
+            ex_hi_z = min(bhi_z + pz, max_z)
+        }
+        let hole_min = vec3u(ex_lo_x * BRICK, ex_lo_y * BRICK, ex_lo_z * BRICK)
+        let hole_max = vec3u(ex_hi_x * BRICK, ex_hi_y * BRICK, ex_hi_z * BRICK)
+        var sm: u32 = 0
+        if ex_lo_x > 0 { sm |= 1 }
+        if ex_hi_x < p.dims.x { sm |= 2 }
+        if ex_lo_y > 0 { sm |= 4 }
+        if ex_hi_y < p.dims.y { sm |= 8 }
+        if ex_lo_z > 0 { sm |= 16 }
+        if ex_hi_z < p.dims.z { sm |= 32 }
+        let child_dims = vec3u((ex_hi_x - ex_lo_x) * 2, (ex_hi_y - ex_lo_y) * 2, (ex_hi_z - ex_lo_z) * 2)
+        let child_off = vec3u(
+            (p.cell_offset.x + hole_min.x) * 2,
+            (p.cell_offset.y + hole_min.y) * 2,
+            (p.cell_offset.z + hole_min.z) * 2,
+        )
+        wide[i - 1] = GridSpec { has_hole: 1, hole_min, hole_max, ..p }
+        wide.push(GridSpec {
+            origin: p.origin,
+            cell: 0.5 * p.cell,
+            dims: child_dims,
+            base_brick: 0,
+            orig_id: w.orig_id,
+            seam_mask: sm,
+            parent_grid: i - 1,
+            has_hole: 0,
+            hole_min: vec3u(0, 0, 0),
+            pad0: 0,
+            hole_max: vec3u(0, 0, 0),
+            pad1: 0,
+            cell_offset: child_off,
+            pad2: 0,
+            parent_hole_min: hole_min,
+            pad3: 0,
+            shift: p.shift,
+            pad4: 0,
+        })
+    }
+    var total_bricks: u32 = 0
+    var has_seams = false
+    for i in 0..wide.len() {
+        let g = wide[i]
+        wide[i] = GridSpec { base_brick: total_bricks, ..g }
+        total_bricks += g.dims.x * g.dims.y * g.dims.z
+        if g.seam_mask != 0 {
+            has_seams = true
+        }
+    }
+    (wide, total_bricks, has_seams)
+}
+
 /// Whether the nested grids `have` hold every brick the nested grids `want` mesh, level by level:
-/// the same levels (cells, and the coarsest's place and size), and each finer level's box within
-/// `have`'s of that level. A fit with slack (`build_lod_grids_view`'s `widen`) holds the fits of
-/// the eyes near the one it was made for, so their meshes are its.
+/// every level of `want` is either strictly coarser than `have[0]` (meaning `have[0]` covers the
+/// entire AABB at a finer cell already) or matches a grid in `have` with the same `cell` and
+/// `origin` whose brick box contains `want`'s brick box.
 pub fn grids_hold(have: Vec<GridSpec>, want: Vec<GridSpec>) -> bool {
-    if have.len() != want.len() || have.len() == 0 {
+    if have.len() == 0 || want.len() == 0 {
         return false
     }
-    for i in 0..have.len() {
-        let a = have[i]
-        let b = want[i]
-        if a.cell != b.cell {
-            return false
+    let h0 = have[0]
+    let w0 = want[0]
+    if h0.origin != w0.origin {
+        return false
+    }
+    let h0_lo = h0.origin +
+        vec3(f32(h0.cell_offset.x), f32(h0.cell_offset.y), f32(h0.cell_offset.z)) * h0.cell
+    let h0_hi = h0_lo + vec3(f32(h0.dims.x), f32(h0.dims.y), f32(h0.dims.z)) * (h0.cell * f32(BRICK))
+    for j in 0..want.len() {
+        let b = want[j]
+        if b.cell > h0.cell * 1.01 {
+            // `have[0]` covers `b` only if `have[0]`'s world box contains `b`'s world box.
+            let b_lo = b.origin +
+                vec3(f32(b.cell_offset.x), f32(b.cell_offset.y), f32(b.cell_offset.z)) * b.cell
+            let b_hi = b_lo + vec3(f32(b.dims.x), f32(b.dims.y), f32(b.dims.z)) * (b.cell * f32(BRICK))
+            let eps = 1.0e-4 * max(b.cell, 1.0)
+            if b_lo.x + eps < h0_lo.x || b_lo.y + eps < h0_lo.y || b_lo.z + eps < h0_lo.z ||
+                b_hi.x - eps > h0_hi.x || b_hi.y - eps > h0_hi.y || b_hi.z - eps > h0_hi.z {
+                return false
+            }
+            continue
         }
-        if i == 0 {
-            if a.dims != b.dims || a.cell_offset != b.cell_offset || a.origin != b.origin {
-                return false
+        var found = false
+        for i in 0..have.len() {
+            let a = have[i]
+            if a.cell == b.cell {
+                let alo = a.cell_offset
+                let ahi = a.cell_offset + a.dims * BRICK
+                let blo = b.cell_offset
+                let bhi = b.cell_offset + b.dims * BRICK
+                if blo.x >= alo.x && blo.y >= alo.y && blo.z >= alo.z && bhi.x <= ahi.x &&
+                    bhi.y <= ahi.y && bhi.z <= ahi.z {
+                    found = true
+                    break
+                }
             }
-        } else {
-            let alo = a.cell_offset
-            let ahi = a.cell_offset + a.dims * BRICK
-            let blo = b.cell_offset
-            let bhi = b.cell_offset + b.dims * BRICK
-            if blo.x < alo.x || blo.y < alo.y || blo.z < alo.z || bhi.x > ahi.x || bhi.y > ahi.y ||
-                bhi.z > ahi.z {
-                return false
-            }
+        }
+        if !found {
+            return false
         }
     }
     true

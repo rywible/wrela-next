@@ -566,7 +566,9 @@ pub(package) fn emit_tris(
     chunk_start: u32,
     brick_off: u32,
     held: u32,
-    slot_base: u32,
+    slot_base: [u32],
+    max_slots: u32,
+    cap_exact_slots: u32,
     corners: [f32],
     cell_verts: [u32],
     verts: [MeshVertex],
@@ -578,6 +580,7 @@ pub(package) fn emit_tris(
     cut_indices: mut Atomics<u32>,
     exact_seen: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
+    exact_slots: mut Atomics<u32>,
     quad_recs: mut Append<vec4u>,
     id: GlobalId,
 ) {
@@ -599,6 +602,7 @@ pub(package) fn emit_tris(
     let ex = rem - ey * 6
     let cbase = brick_in_chunk * CORNERS_BRICK
     let vbase = brick_in_chunk * VERTS_STRIDE
+    let slot = slot_base[0] + bi
     for axis in 0..3 {
         let e = owned_edge(axis, ex, ey, ez)
         let d0 = cdist(corners, cbase, e.from.x, e.from.y, e.from.z)
@@ -635,7 +639,9 @@ pub(package) fn emit_tris(
                 cover,
                 [e.c0, e.c1, e.c2, e.c3],
                 d0 >= 0.0,
-                slot_base + bi,
+                slot,
+                max_slots,
+                cap_exact_slots,
                 held != 0,
                 g,
                 ab.coord.xyz,
@@ -643,6 +649,7 @@ pub(package) fn emit_tris(
                 brick_in_chunk,
                 mut exact_seen,
                 mut exact_cells,
+                mut exact_slots,
                 mut quad_recs,
             )
         }
@@ -658,6 +665,8 @@ fn cover_quad(
     cs: [vec3u; 4],
     flip: bool,
     slot: u32,
+    max_slots: u32,
+    cap_exact_slots: u32,
     held: bool,
     g: GridSpec,
     b: vec3u,
@@ -665,30 +674,55 @@ fn cover_quad(
     brick_in_chunk: u32,
     exact_seen: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
+    exact_slots: mut Atomics<u32>,
     quad_recs: mut Append<vec4u>,
 ) {
     match cover {
         QuadCover::Unheld => {},
         QuadCover::Watched(at) => {
-            let k0 = cs[0].z * 49 + cs[0].y * 7 + cs[0].x
-            let k1 = cs[1].z * 49 + cs[1].y * 7 + cs[1].x
-            let k2 = cs[2].z * 49 + cs[2].y * 7 + cs[2].x
-            let k3 = cs[3].z * 49 + cs[3].y * 7 + cs[3].x
-            let _ = quad_recs.push(
-                vec4u(
-                    at & 2147483647,
-                    slot | (if flip { 1073741824 } else { 0 }) | (at & 2147483648),
-                    k0 | (k1 << 9) | (k2 << 18),
-                    k3,
-                ),
-            )
+            if slot < max_slots {
+                let k0 = cs[0].z * 49 + cs[0].y * 7 + cs[0].x
+                let k1 = cs[1].z * 49 + cs[1].y * 7 + cs[1].x
+                let k2 = cs[2].z * 49 + cs[2].y * 7 + cs[2].x
+                let k3 = cs[3].z * 49 + cs[3].y * 7 + cs[3].x
+                let _ = quad_recs.push(
+                    vec4u(
+                        at & 2147483647,
+                        slot | (if flip { 1073741824 } else { 0 }) | (at & 2147483648),
+                        k0 | (k1 << 9) | (k2 << 18),
+                        k3,
+                    ),
+                )
+            }
         },
         QuadCover::Folded => {
-            box_cells(cs, g, b, live, brick_in_chunk, mut exact_seen, mut exact_cells)
+            box_cells(
+                cs,
+                g,
+                b,
+                live,
+                brick_in_chunk,
+                slot,
+                cap_exact_slots,
+                mut exact_seen,
+                mut exact_cells,
+                mut exact_slots,
+            )
         },
         QuadCover::Unsound => {
             if held {
-                box_cells(cs, g, b, live, brick_in_chunk, mut exact_seen, mut exact_cells)
+                box_cells(
+                    cs,
+                    g,
+                    b,
+                    live,
+                    brick_in_chunk,
+                    slot,
+                    cap_exact_slots,
+                    mut exact_seen,
+                    mut exact_cells,
+                    mut exact_slots,
+                )
             }
         },
     }
@@ -702,14 +736,20 @@ pub(package) fn box_cells(
     b: vec3u,
     live: Live,
     brick_in_chunk: u32,
+    slot: u32,
+    cap_exact_slots: u32,
     exact_seen: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
+    exact_slots: mut Atomics<u32>,
 ) {
     for k in 0..4 {
         let ck = cs[k]
         let cell = ck.z * 49 + ck.y * 7 + ck.x
         if claim_exact_cell(mut exact_seen, brick_in_chunk, cell) {
-            let _ = exact_cells.push(ExactCell { lo: brick_corner(g, b, ck), h: g.cell, live })
+            let ei = exact_cells.push(ExactCell { lo: brick_corner(g, b, ck), h: g.cell, live })
+            if ei < cap_exact_slots {
+                exact_slots.store(i: ei, value: slot)
+            }
         }
     }
 }
@@ -1102,8 +1142,11 @@ fn process_lod_edge(
     live: Live,
     held: bool,
     slot: u32,
+    max_slots: u32,
+    cap_exact_slots: u32,
     exact_seen: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
+    exact_slots: mut Atomics<u32>,
     quad_recs: mut Append<vec4u>,
 ) {
     let ua = if axis == 0 { vec3u(1, 0, 0) } else if axis == 1 { vec3u(0, 1, 0) } else {
@@ -1173,6 +1216,8 @@ fn process_lod_edge(
             [l0, l1, l2, l3],
             flip,
             slot,
+            max_slots,
+            cap_exact_slots,
             held,
             g,
             b,
@@ -1180,6 +1225,7 @@ fn process_lod_edge(
             brick_in_chunk,
             mut exact_seen,
             mut exact_cells,
+            mut exact_slots,
             mut quad_recs,
         )
         return
@@ -1265,9 +1311,12 @@ pub(package) fn emit_tris_lod(
     seam_cells: mut Append<SeamCell>,
     seam_verts: mut Atomics<u32>,
     held: u32,
-    slot_base: u32,
+    slot_base: [u32],
+    max_slots: u32,
+    cap_exact_slots: u32,
     exact_seen: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
+    exact_slots: mut Atomics<u32>,
     quad_recs: mut Append<vec4u>,
     id: GlobalId,
 ) {
@@ -1291,6 +1340,7 @@ pub(package) fn emit_tris_lod(
     let g = grids[ab.coord.w]
     let cbase = brick_in_chunk * CORNERS_BRICK
     let vbase = brick_in_chunk * VERTS_STRIDE
+    let brick_slot = slot_base[0] + bi
 
     for axis in 0..3 {
         let eb = if axis == 0 { ey } else if axis == 1 { ez } else { ex }
@@ -1360,9 +1410,12 @@ pub(package) fn emit_tris_lod(
                     seam_verts: mut seam_verts,
                     live: ab.live,
                     held: held != 0,
-                    slot: slot_base + bi,
+                    slot: brick_slot,
+                    max_slots: max_slots,
+                    cap_exact_slots: cap_exact_slots,
                     exact_seen: mut exact_seen,
                     exact_cells: mut exact_cells,
+                    exact_slots: mut exact_slots,
                     quad_recs: mut quad_recs,
                 )
             }

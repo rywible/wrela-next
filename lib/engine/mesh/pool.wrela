@@ -1,0 +1,905 @@
+// Persistent world-anchored GPU `BrickPool`: caches extracted interior bricks by integer
+// `BrickKey = (gb.x, gb.y, gb.z, level, hole_nb_mask)` across LOD ring moves and camera motion,
+// extracts the 2:1 seam boundary bricks of a cut into a transient tail, and compacts the cut's
+// bricks into one contiguous draw buffer.
+//
+// The drawn cut and the wanted cut. An update is a commit or nothing (`pool_decide`): it draws
+// the new cut only when every brick of it is in the pool or extracted by it (or the pool was
+// emptied for it, cold); else what is drawn, its draw lists, its live slots and its seam tail,
+// stays the last committed cut's, whole, and the update says it is late (`OVERFLOW_BRICKS`). A
+// cut is never drawn with bricks missing.
+
+use mesh::grid::{
+    ActiveBrick, BRICK, CAP_SEAM, ExactCell, GridSpec, NONE, OVERFLOW_BRICKS, OVERFLOW_CREASES,
+    OVERFLOW_CUT, OVERFLOW_EXACT, OVERFLOW_INDICES, OVERFLOW_SEAMS, OVERFLOW_THIN, OVERFLOW_TRANS,
+    OVERFLOW_UNLOCAL, brick_in_hole,
+}
+use std::collections::Vec
+use std::gpu::{Append, Atomics, DispatchArgs, DrawIndexedArgs, GlobalId, LocalId, One, Slots, WorkgroupId}
+
+/// Number of `u32` words per persistent brick in `pool_slot_meta`: `(first_index, index_count)`.
+pub const POOL_META_WORDS: u32 = 2
+
+/// Maximum transient seam-boundary bricks per batch cut (occupying slots `[pool_cap .. pool_cap + SEAM_SLOTS_CAP)`).
+pub const SEAM_SLOTS_CAP: u32 = 8192
+
+/// Maximum probe length in the open-addressed `BrickPool` hash table.
+const PROBE_MAX: u32 = 64
+
+/// Number of parallel prefix-sum groups for active-cut index compaction (`256 * 256 = 65536` active bricks).
+pub const COMPACT_GROUPS: u32 = 256
+pub const COMPACT_PER_GROUP: u32 = 256
+
+/// Persistent watermark layout in `pool_marks[0..16]`:
+///   `0`: persistent `verts` count
+///   `1`: persistent `quad_recs` count
+///   `2`: persistent `thin_keep` count
+///   `3`: persistent `pool_indices` count
+///   `4`: persistent `pool_exact_cells` count
+///   `5`: persistent interior slot cursor (`0 .. pool_cap`)
+///   `6`: previous total `verts` count (including transient seam tail, for targeted cert zeroing)
+///   `7`: previous total `thin_keep` count (including transient seam tail, for targeted proof zeroing)
+pub const MARK_VERTS: u32 = 0
+pub const MARK_QUADS: u32 = 1
+pub const MARK_THIN: u32 = 2
+pub const MARK_IDX: u32 = 3
+pub const MARK_EXACT: u32 = 4
+pub const MARK_SLOTS: u32 = 5
+pub const MARK_PREV_VERTS: u32 = 6
+pub const MARK_PREV_THIN: u32 = 7
+/// The committed cut's counts, kept for the readback of an update that drew nothing new: its
+/// drawn indices, wanted active bricks, vertices and exact cells.
+pub const MARK_DRAWN_IDX: u32 = 8
+pub const MARK_DRAWN_ACTIVE: u32 = 9
+pub const MARK_DRAWN_VERTS: u32 = 10
+pub const MARK_DRAWN_EXACT: u32 = 11
+pub const MARK_DRAWN_SEAM_CELLS: u32 = 12
+pub const POOL_MARK_WORDS: u32 = 16
+
+/// `pool_gate`'s words (`pool_decide`): whether this update commits (`GATE_WHOLE`, `GATE_COLD`: a
+/// cold pool drawn with whatever it extracted, or `GATE_NONE`; 0 is no pool update's), the misses
+/// and seam bricks it extracts, and what each append buffer's count is taken from before
+/// extraction.
+pub const GATE_COMMIT: u32 = 0
+pub const GATE_MISSES: u32 = 1
+pub const GATE_SEAMS: u32 = 2
+pub const GATE_VERTS: u32 = 3
+pub const GATE_QUADS: u32 = 4
+pub const GATE_THIN: u32 = 5
+pub const GATE_POOL_EXACT: u32 = 6
+pub const GATE_EXACT: u32 = 7
+pub const GATE_WORDS: u32 = 8
+pub const GATE_WHOLE: u32 = 1
+pub const GATE_COLD: u32 = 2
+pub const GATE_NONE: u32 = 3
+
+/// Computes the 6-bit mask of faces of brick `b` that lie on grid `g`'s active 2:1 seam boundary.
+pub fn brick_seam_mask(g: GridSpec, b: vec3u) -> u32 {
+    if g.seam_mask == 0 {
+        return 0
+    }
+    var m: u32 = 0
+    if b.x == 0 && (g.seam_mask & 1) != 0 { m |= 1 }
+    if b.x + 1 == g.dims.x && (g.seam_mask & 2) != 0 { m |= 2 }
+    if b.y == 0 && (g.seam_mask & 4) != 0 { m |= 4 }
+    if b.y + 1 == g.dims.y && (g.seam_mask & 8) != 0 { m |= 8 }
+    if b.z == 0 && (g.seam_mask & 16) != 0 { m |= 16 }
+    if b.z + 1 == g.dims.z && (g.seam_mask & 32) != 0 { m |= 32 }
+    m
+}
+
+/// Computes the 7-bit mask of which `+dx,+dy,+dz` neighbor bricks (`(dx,dy,dz) in {0,1}^3 \ {0}`)
+/// of brick `b` lie inside `g`'s refined child hole `[hole_min, hole_max)`. Every owned edge of
+/// an interior brick depends only on `b` and these 7 neighbors.
+pub fn brick_hole_mask(g: GridSpec, b: vec3u) -> u32 {
+    if g.has_hole == 0 {
+        return 0
+    }
+    var m: u32 = 0
+    for k in 1..8 {
+        let nb = vec3u(b.x + (k & 1), b.y + ((k >> 1) & 1), b.z + (k >> 2))
+        if brick_in_hole(g, nb) {
+            m |= u32(1) << (k - 1)
+        }
+    }
+    m
+}
+
+/// Encodes brick `(g, b, hole_m)` into a unique 128-bit integer world `BrickKey` (with bit 31 of
+/// `.w` always 1 so occupied keys are never zero).
+pub fn brick_key(g: GridSpec, b: vec3u, hole_m: u32) -> vec4u {
+    let gb = vec3u(g.cell_offset.x / BRICK + b.x, g.cell_offset.y / BRICK + b.y, g.cell_offset.z / BRICK + b.z)
+    let lvl = u32(clamp(i32(round(log2(max(g.cell, 1.0e-6)))) + 32, 0, 63))
+    let meta = u32(2147483648) | (lvl << 16) | ((hole_m & 127) << 8) | (g.orig_id & 255)
+    vec4u(gb.x, gb.y, gb.z, meta)
+}
+
+/// A box of bricks on the world's lattice of bricks (`[lo, hi)`, in bricks: a grid's
+/// `cell_offset / BRICK` and up), and how many it holds.
+struct BrickBox {
+    lo: vec3i,
+    hi: vec3i,
+}
+
+fn box_count(b: BrickBox) -> u32 {
+    let e = b.hi - b.lo
+    if e.x <= 0 || e.y <= 0 || e.z <= 0 {
+        return 0
+    }
+    u32(e.x) * u32(e.y) * u32(e.z)
+}
+
+fn box_meet(a: BrickBox, b: BrickBox) -> BrickBox {
+    BrickBox { lo: max(a.lo, b.lo), hi: min(a.hi, b.hi) }
+}
+
+fn grid_base(g: GridSpec) -> vec3i {
+    vec3i(i32(g.cell_offset.x / BRICK), i32(g.cell_offset.y / BRICK), i32(g.cell_offset.z / BRICK))
+}
+
+/// The bricks of `g` off its seam faces (`brick_seam_mask` 0: those the pool keeps).
+fn interior_box(g: GridSpec) -> BrickBox {
+    let o = grid_base(g)
+    let lo = vec3i(
+        if (g.seam_mask & 1) != 0 { 1 } else { 0 },
+        if (g.seam_mask & 4) != 0 { 1 } else { 0 },
+        if (g.seam_mask & 16) != 0 { 1 } else { 0 },
+    )
+    let hi = vec3i(
+        i32(g.dims.x) - (if (g.seam_mask & 2) != 0 { 1 } else { 0 }),
+        i32(g.dims.y) - (if (g.seam_mask & 8) != 0 { 1 } else { 0 }),
+        i32(g.dims.z) - (if (g.seam_mask & 32) != 0 { 1 } else { 0 }),
+    )
+    BrickBox { lo: o + lo, hi: o + hi }
+}
+
+/// The bricks whose hole mask (`brick_hole_mask`: a `+` neighbour in `g`'s hole) may be other
+/// than none: those within a brick below the hole, and in it. Empty when `g` has no hole.
+fn hole_reach(g: GridSpec) -> BrickBox {
+    if g.has_hole == 0 {
+        return BrickBox { lo: vec3i(0), hi: vec3i(0) }
+    }
+    let o = grid_base(g)
+    let lo = vec3i(i32(g.hole_min.x / BRICK), i32(g.hole_min.y / BRICK), i32(g.hole_min.z / BRICK))
+    let hi = vec3i(i32(g.hole_max.x / BRICK), i32(g.hole_max.y / BRICK), i32(g.hole_max.z / BRICK))
+    BrickBox { lo: o + lo - vec3i(1), hi: o + hi }
+}
+
+/// The most bricks of the cut `want` that a pool holding the cut `have` (every brick of it its
+/// cull kept) may miss, and the most bricks on `want`'s seam faces: a count from the two cuts'
+/// boxes, never a guess, so an update that dispatches for that many misses and seam bricks draws
+/// its whole cut (`pool_decide`). A brick of `want` off its seam faces is held when a level of
+/// `have` with its cell has it off its own seam faces too, with the same hole mask: outside the
+/// reach of both levels' holes, or anywhere when the two holes are one.
+pub fn cut_bounds(have: Vec<GridSpec>, want: Vec<GridSpec>) -> (u32, u32) {
+    var misses: u32 = 0
+    var seams: u32 = 0
+    for i in 0..want.len() {
+        let g = want[i]
+        let all = g.dims.x * g.dims.y * g.dims.z
+        let inner = interior_box(g)
+        let n_inner = box_count(inner)
+        seams += all - n_inner
+        var held: u32 = 0
+        for j in 0..have.len() {
+            let o = have[j]
+            if o.cell != g.cell || o.origin != g.origin || o.shift != g.shift || o.orig_id != g.orig_id {
+                continue
+            }
+            let both = box_meet(inner, interior_box(o))
+            let ga = hole_reach(g)
+            let oa = hole_reach(o)
+            let same_hole = g.has_hole == o.has_hole && ga.lo == oa.lo && ga.hi == oa.hi
+            var k = box_count(both)
+            if !same_hole {
+                let a = box_count(box_meet(both, ga))
+                let b = box_count(box_meet(both, oa))
+                let ab = box_count(box_meet(box_meet(both, ga), oa))
+                k = k - min(k, a + b - ab)
+            }
+            held = max(held, k)
+        }
+        misses += n_inner - min(held, n_inner)
+    }
+    (misses, seams)
+}
+
+/// 32-bit avalanche hash of a `BrickKey`.
+pub fn pool_hash_mix(k: vec4u) -> u32 {
+    var h = k.x.wrapping_mul(374761393)
+    h = h.wrapping_add(k.y.wrapping_mul(668265263))
+    h = h ^ (h >> 13)
+    h = h.wrapping_mul(1274126177)
+    h = h.wrapping_add(k.z.wrapping_mul(2246822519))
+    h = h ^ (h >> 16)
+    h = h.wrapping_mul(3266489917)
+    h = h.wrapping_add(k.w.wrapping_mul(668265263))
+    h = h ^ (h >> 15)
+    h
+}
+
+/// Initializes `pool_hash_slots` to `NONE`.
+@strict
+@compute(64)
+pub(package) fn reset_pool_hash(hash_slots: mut Slots<u32>, id: GlobalId) {
+    hash_slots[id] = NONE
+}
+
+/// Decides an update (after `pool_probe`): it commits when the pool was emptied for it (`cold`)
+/// or when every miss and seam brick of the cut fits what it dispatches (`miss_limit`,
+/// `seam_limit`) and the pool's free slots. A commit reclaims the last cut's seam tail (the
+/// counts restored to the persistent watermarks, the reclaimed range noted for `zero_seam_certs`)
+/// and extracts; no commit extracts nothing and keeps every count, so what is drawn is untouched.
+@strict
+@compute(1)
+pub(package) fn pool_decide(
+    miss_count: [u32],
+    miss_limit: u32,
+    seam_count: [u32],
+    seam_limit: u32,
+    pool_cap: u32,
+    cold: u32,
+    verts_count: [u32],
+    quad_count: [u32],
+    thin_count: [u32],
+    exact_base: [u32],
+    marks: mut Atomics<u32>,
+    slot_base: mut Atomics<u32>,
+    pool_tri_count: mut Atomics<u32>,
+    gate: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let _ = id
+    let misses = miss_count[0]
+    let seams = seam_count[0]
+    let used = marks.load(i: MARK_SLOTS)
+    let whole = misses <= miss_limit && seams <= seam_limit && used + misses <= pool_cap
+    let commit = if cold != 0 { GATE_COLD } else if whole { GATE_WHOLE } else { GATE_NONE }
+    gate.store(i: GATE_COMMIT, value: commit)
+    if commit == GATE_NONE {
+        gate.store(i: GATE_MISSES, value: 0)
+        gate.store(i: GATE_SEAMS, value: 0)
+        gate.store(i: GATE_VERTS, value: verts_count[0])
+        gate.store(i: GATE_QUADS, value: quad_count[0])
+        gate.store(i: GATE_THIN, value: thin_count[0])
+        gate.store(i: GATE_POOL_EXACT, value: marks.load(i: MARK_EXACT))
+        gate.store(i: GATE_EXACT, value: exact_base[0])
+        marks.store(i: MARK_PREV_VERTS, value: marks.load(i: MARK_VERTS))
+        marks.store(i: MARK_PREV_THIN, value: marks.load(i: MARK_THIN))
+        return
+    }
+    gate.store(i: GATE_MISSES, value: min(misses, miss_limit))
+    gate.store(i: GATE_SEAMS, value: min(seams, seam_limit))
+    gate.store(i: GATE_VERTS, value: marks.load(i: MARK_VERTS))
+    gate.store(i: GATE_QUADS, value: marks.load(i: MARK_QUADS))
+    gate.store(i: GATE_THIN, value: marks.load(i: MARK_THIN))
+    gate.store(i: GATE_POOL_EXACT, value: marks.load(i: MARK_EXACT))
+    gate.store(i: GATE_EXACT, value: 0)
+    marks.store(i: MARK_PREV_VERTS, value: verts_count[0])
+    marks.store(i: MARK_PREV_THIN, value: thin_count[0])
+    slot_base.store(i: 0, value: used)
+    pool_tri_count.store(i: 0, value: marks.load(i: MARK_IDX))
+    for k in 1..16 {
+        pool_tri_count.store(i: k, value: 0)
+    }
+}
+
+/// On a commit, clears `brick_alive[0..n]` before the committed cut's slots are marked
+/// (`pool_mark_alive`); else leaves the drawn cut's slots alive.
+@strict
+@compute(64)
+pub(package) fn pool_clear_alive(gate: [u32], n: u32, alive: mut Atomics<u32>, id: GlobalId) {
+    if gate[GATE_COMMIT] != GATE_NONE && id.x < n {
+        alive.store(i: id.x, value: 0)
+    }
+}
+
+/// On a commit, marks every slot of the committed cut (`draw_slots`) alive.
+@strict
+@compute(64)
+pub(package) fn pool_mark_alive(
+    gate: [u32],
+    draw_slots: [u32],
+    draw_count: [u32],
+    cap_slots: u32,
+    n: u32,
+    alive: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    if gate[GATE_COMMIT] == GATE_NONE || id.x >= min(draw_count[0], cap_slots) {
+        return
+    }
+    let s = draw_slots[id.x]
+    if s < n {
+        alive.store(i: s, value: 1)
+    }
+}
+
+/// Zeroes ONLY the reclaimed transient seam tail of `vert_cert` (`[marks[MARK_VERTS] .. marks[MARK_PREV_VERTS])`)
+/// and `thin_proof` (`[marks[MARK_THIN] .. marks[MARK_PREV_THIN])`), leaving every resident
+/// interior brick's certificates and proofs completely intact.
+@strict
+@compute(64)
+pub(package) fn zero_seam_certs(
+    marks: [u32],
+    cap_verts: u32,
+    vert_cert: mut Atomics<u32>,
+    thin_proof: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let v0 = min(marks[MARK_VERTS], cap_verts)
+    let v1 = min(marks[MARK_PREV_VERTS], cap_verts)
+    if v0 + id.x < v1 {
+        vert_cert.store(i: v0 + id.x, value: 0)
+    }
+    let t0 = min(marks[MARK_THIN], cap_verts)
+    let t1 = min(marks[MARK_PREV_THIN], cap_verts)
+    if t0 + id.x < t1 {
+        thin_proof.store(i: t0 + id.x, value: 0)
+    }
+}
+
+/// Prepares indirect dispatch args for `zero_seam_certs` (sized to the reclaimed seam tail).
+@strict
+@compute(1)
+pub(package) fn prep_zero_seam_certs(
+    marks: [u32],
+    cap_verts: u32,
+    args: mut One<DispatchArgs>,
+    id: GlobalId,
+) {
+    let v0 = min(marks[MARK_VERTS], cap_verts)
+    let v1 = min(marks[MARK_PREV_VERTS], cap_verts)
+    let t0 = min(marks[MARK_THIN], cap_verts)
+    let t1 = min(marks[MARK_PREV_THIN], cap_verts)
+    let n = max(if v1 > v0 { v1 - v0 } else { 0 }, if t1 > t0 { t1 - t0 } else { 0 })
+    args.set(id, DispatchArgs { x: (n + 63) / 64, y: 1, z: 1 })
+}
+
+/// Probes the persistent `BrickPool` hash table for every culled active brick of the new cut:
+/// - Seam-boundary bricks (`seam_m != 0`) go to `active_seam`.
+/// - Resident interior hits (`seam_m == 0`, key found) push their slot to `draw_slots`, and are
+///   not extracted.
+/// - Interior misses go to `miss_interior` for incremental extraction.
+/// What is drawn is not touched: `pool_decide` and the commit's passes do that.
+@strict
+@compute(64)
+pub(package) fn pool_probe(
+    grids: [GridSpec],
+    active: [ActiveBrick],
+    active_count: [u32],
+    cap_active: u32,
+    first: u32,
+    hash_mask: u32,
+    hash_slots: [u32],
+    pool_keys: [u32],
+    draw_slots: mut Append<u32>,
+    miss_interior: mut Append<ActiveBrick>,
+    active_seam: mut Append<ActiveBrick>,
+    pool_stats: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let bi = first + id.x
+    if bi >= min(active_count[0], cap_active) {
+        return
+    }
+    let ab = active[bi]
+    let g = grids[ab.coord.w]
+    let b = ab.coord.xyz
+    let sm = brick_seam_mask(g, b)
+    if sm != 0 {
+        let _ = active_seam.push(ab)
+        let _ = pool_stats.add(i: 2, value: 1)
+        return
+    }
+    let hm = brick_hole_mask(g, b)
+    let key = brick_key(g, b, hm)
+    var idx = pool_hash_mix(key) & hash_mask
+    for _step in 0..PROBE_MAX {
+        let s = hash_slots[idx]
+        if s == NONE {
+            break
+        }
+        let kb = s * 4
+        if pool_keys[kb] == key.x &&
+            pool_keys[kb + 1] == key.y &&
+            pool_keys[kb + 2] == key.z &&
+            pool_keys[kb + 3] == key.w {
+            let _ = draw_slots.push(s)
+            let _ = pool_stats.add(i: 0, value: 1)
+            return
+        }
+        idx = (idx + 1) & hash_mask
+    }
+    let _ = miss_interior.push(ab)
+    let _ = pool_stats.add(i: 1, value: 1)
+}
+
+/// Writes per-brick index slice metadata (`first_index`, `index_count`) and `pool_keys` (when
+/// `is_interior != 0`), and appends every slot to `draw_slots` (one that draws no triangle may
+/// still hold exact cells, which follow its slot's life).
+@strict
+@compute(64)
+pub(package) fn pool_write_meta(
+    grids: [GridSpec],
+    active: [ActiveBrick],
+    active_count: [u32],
+    cap_bricks: u32,
+    cap_indices: u32,
+    chunk_start: u32,
+    slot_base_buf: [u32],
+    max_slots: u32,
+    is_interior: u32,
+    brick_idx_saved: [u32],
+    brick_idx_offsets: [u32],
+    slot_meta: mut Atomics<u32>,
+    pool_keys: mut Atomics<u32>,
+    draw_slots: mut Append<u32>,
+    id: GlobalId,
+) {
+    let j = id.x
+    let bi = chunk_start + j
+    if bi >= min(active_count[0], cap_bricks) {
+        return
+    }
+    let slot = slot_base_buf[0] + bi
+    if slot >= max_slots {
+        return
+    }
+    let cnt = brick_idx_saved[j]
+    let first = brick_idx_offsets[j]
+    let clamped = if first >= cap_indices { 0 } else { min(cnt, cap_indices - first) }
+    slot_meta.store(i: slot * POOL_META_WORDS, value: first)
+    slot_meta.store(i: slot * POOL_META_WORDS + 1, value: clamped)
+    if is_interior != 0 {
+        let ab = active[bi]
+        let g = grids[ab.coord.w]
+        let b = ab.coord.xyz
+        let key = brick_key(g, b, brick_hole_mask(g, b))
+        let kb = slot * 4
+        pool_keys.store(i: kb, value: key.x)
+        pool_keys.store(i: kb + 1, value: key.y)
+        pool_keys.store(i: kb + 2, value: key.z)
+        pool_keys.store(i: kb + 3, value: key.w)
+    }
+    let _ = draw_slots.push(slot)
+}
+
+/// Lock-free open-addressed insertion of newly extracted interior bricks into `pool_hash_slots`.
+/// Must run in a separate dispatch after `pool_write_meta` so `pool_keys[slot]` is visible first.
+@strict
+@compute(64)
+pub(package) fn pool_insert(
+    active_count: [u32],
+    cap_bricks: u32,
+    first: u32,
+    slot_base_buf: [u32],
+    pool_cap: u32,
+    hash_mask: u32,
+    pool_keys: [u32],
+    hash_slots: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let bi = first + id.x
+    if bi >= min(active_count[0], cap_bricks) {
+        return
+    }
+    let slot = slot_base_buf[0] + bi
+    if slot >= pool_cap {
+        return
+    }
+    let kb = slot * 4
+    let key = vec4u(pool_keys[kb], pool_keys[kb + 1], pool_keys[kb + 2], pool_keys[kb + 3])
+    if key.w == 0 {
+        return
+    }
+    var idx = pool_hash_mix(key) & hash_mask
+    for _step in 0..PROBE_MAX {
+        let (prev, stored) = hash_slots.compare_exchange_weak(i: idx, expected: NONE, new: slot)
+        if stored {
+            return
+        }
+        if prev != NONE {
+            idx = (idx + 1) & hash_mask
+        }
+    }
+}
+
+/// Saves persistent watermarks after extracting `miss_interior` and before extracting the
+/// transient `active_seam` tail (on a commit; an update that commits nothing keeps them).
+@strict
+@compute(1)
+pub(package) fn save_pool_marks(
+    gate: [u32],
+    miss_count: [u32],
+    miss_limit: u32,
+    pool_cap: u32,
+    verts_count: [u32],
+    quad_count: [u32],
+    thin_count: [u32],
+    pool_tri_count: [u32],
+    pool_exact_count: [u32],
+    marks: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let _ = id
+    if gate[GATE_COMMIT] == GATE_NONE {
+        return
+    }
+    let old_slots = marks.load(i: MARK_SLOTS)
+    let added = min(miss_count[0], miss_limit)
+    let room = if pool_cap > old_slots { pool_cap - old_slots } else { 0 }
+    marks.store(i: MARK_SLOTS, value: old_slots + min(added, room))
+    marks.store(i: MARK_VERTS, value: verts_count[0])
+    marks.store(i: MARK_QUADS, value: quad_count[0])
+    marks.store(i: MARK_THIN, value: thin_count[0])
+    marks.store(i: MARK_IDX, value: pool_tri_count[0])
+    marks.store(i: MARK_EXACT, value: pool_exact_count[0])
+}
+
+/// Compaction Pass 1: sums opaque index counts across `COMPACT_PER_GROUP` active draw slots per group.
+@strict
+@compute(64)
+pub(package) fn compact_count_groups(
+    gate: [u32],
+    draw_slots: [u32],
+    draw_count: [u32],
+    cap_slots: u32,
+    slot_meta: [u32],
+    group_sums: mut Slots<u32>,
+    id: GlobalId,
+) {
+    let g = id.x
+    if g >= COMPACT_GROUPS || gate[GATE_COMMIT] == GATE_NONE {
+        return
+    }
+    let n = min(draw_count[0], cap_slots)
+    let base = g * COMPACT_PER_GROUP
+    var sum: u32 = 0
+    for k in 0..COMPACT_PER_GROUP {
+        let i = base + k
+        if i >= n {
+            break
+        }
+        let s = draw_slots[i]
+        sum += slot_meta[s * POOL_META_WORDS + 1]
+    }
+    group_sums[id] = sum
+}
+
+/// Compaction Pass 2: exclusive prefix sum over `COMPACT_GROUPS` group totals, recording total
+/// compacted brick indices in `seam_start[0]`.
+@strict
+@compute(1)
+pub(package) fn compact_scan_groups(
+    gate: [u32],
+    group_sums: [u32],
+    group_offsets: mut Atomics<u32>,
+    seam_start: mut One<u32>,
+    id: GlobalId,
+) {
+    if gate[GATE_COMMIT] == GATE_NONE {
+        return
+    }
+    var rel: u32 = 0
+    for g in 0..COMPACT_GROUPS {
+        group_offsets.store(i: g, value: rel)
+        rel += group_sums[g]
+    }
+    seam_start.set(id, rel)
+}
+
+/// Compaction Pass 3: writes per-active-slot destination offsets in `draw_slot_dst`.
+@strict
+@compute(64)
+pub(package) fn compact_local_offsets(
+    gate: [u32],
+    draw_slots: [u32],
+    draw_count: [u32],
+    cap_slots: u32,
+    slot_meta: [u32],
+    group_offsets: [u32],
+    draw_slot_dst: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let g = id.x
+    if g >= COMPACT_GROUPS || gate[GATE_COMMIT] == GATE_NONE {
+        return
+    }
+    let n = min(draw_count[0], cap_slots)
+    let base = g * COMPACT_PER_GROUP
+    var off = group_offsets[g]
+    for k in 0..COMPACT_PER_GROUP {
+        let i = base + k
+        if i >= n {
+            break
+        }
+        draw_slot_dst.store(i: i, value: off)
+        let s = draw_slots[i]
+        off += slot_meta[s * POOL_META_WORDS + 1]
+    }
+}
+
+/// Prepares 2D workgroup dispatch args `(min(n, 32768), ceil(n / 32768), 1)` for `compact_copy_indices`
+/// and 1D args for `compact_append_seam_strip`, the exact cells' copies and `pool_mark_alive`:
+/// all empty when the update commits nothing.
+@strict
+@compute(1)
+pub(package) fn prep_compact_args(
+    gate: [u32],
+    draw_count: [u32],
+    cap_slots: u32,
+    seam_tri_count: [u32],
+    cap_seam_idx: u32,
+    pool_exact_count: [u32],
+    cap_pool_exact: u32,
+    seam_exact_count: [u32],
+    cap_seam_exact: u32,
+    copy_args: mut One<DispatchArgs>,
+    seam_copy_args: mut One<DispatchArgs>,
+    exact_copy_args: mut One<DispatchArgs>,
+    seam_exact_args: mut One<DispatchArgs>,
+    alive_args: mut One<DispatchArgs>,
+    id: GlobalId,
+) {
+    let on = gate[GATE_COMMIT] != GATE_NONE
+    let n = if on { min(draw_count[0], cap_slots) } else { 0 }
+    let gx = min(n, 32768)
+    let gy = if n > 0 { (n + 32767) / 32768 } else { 0 }
+    copy_args.set(id, DispatchArgs { x: gx, y: gy, z: 1 })
+    alive_args.set(id, DispatchArgs { x: (n + 63) / 64, y: 1, z: 1 })
+    let sn = if on { min(seam_tri_count[0], cap_seam_idx) } else { 0 }
+    seam_copy_args.set(id, DispatchArgs { x: (sn + 63) / 64, y: 1, z: 1 })
+    let pe = if on { min(pool_exact_count[0], cap_pool_exact) } else { 0 }
+    exact_copy_args.set(id, DispatchArgs { x: (pe + 63) / 64, y: 1, z: 1 })
+    let se = if on { min(seam_exact_count[0], cap_seam_exact) } else { 0 }
+    seam_exact_args.set(id, DispatchArgs { x: (se + 63) / 64, y: 1, z: 1 })
+}
+
+/// Compaction Pass 4: 1 workgroup of 64 lanes per active brick copies its opaque indices from
+/// `pool_indices` into the compacted draw buffer `draw_indices` (fully coalesced, zero atomics),
+/// sliced from `first` so each dispatch stays under the GPU step budget on every device.
+@strict
+@compute(64)
+pub(package) fn compact_copy_indices(
+    draw_slots: [u32],
+    draw_count: [u32],
+    cap_slots: u32,
+    first: u32,
+    slot_meta: [u32],
+    draw_slot_dst: [u32],
+    pool_indices: [u32],
+    cap_draw_indices: u32,
+    draw_indices: mut Atomics<u32>,
+    wid: WorkgroupId,
+    lid: LocalId,
+) {
+    let i = first + wid.x
+    if i >= min(draw_count[0], cap_slots) {
+        return
+    }
+    let s = draw_slots[i]
+    let src = slot_meta[s * POOL_META_WORDS]
+    let cnt = slot_meta[s * POOL_META_WORDS + 1]
+    let dst = draw_slot_dst[i]
+    if cnt == 0 || dst >= cap_draw_indices {
+        return
+    }
+    let lim = min(cnt, cap_draw_indices - dst)
+    for iter in 0..61 {
+        let k = iter * 64 + lid.x
+        if k >= lim {
+            break
+        }
+        draw_indices.store(i: dst + k, value: pool_indices[src + k])
+    }
+}
+
+/// Appends the active 2:1 seam strip indices (`seam_strip_indices[0..seam_tri_count[0]]`) right
+/// after `seam_start[0]` in `draw_indices`.
+@strict
+@compute(64)
+pub(package) fn compact_append_seam_strip(
+    seam_tri_count: [u32],
+    cap_seam_idx: u32,
+    seam_start: [u32],
+    seam_strip_indices: [u32],
+    cap_draw_indices: u32,
+    draw_indices: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let n = min(seam_tri_count[0], cap_seam_idx)
+    if id.x >= n {
+        return
+    }
+    let dst = seam_start[0] + id.x
+    if dst < cap_draw_indices {
+        draw_indices.store(i: dst, value: seam_strip_indices[id.x])
+    }
+}
+
+/// Copies persistent base exact cells belonging to active (`brick_alive[slot] != 0`) interior
+/// bricks into `exact_cells`.
+@strict
+@compute(64)
+pub(package) fn compact_pool_exact(
+    pool_exact_cells: [ExactCell],
+    pool_exact_slots: [u32],
+    pool_exact_count: [u32],
+    cap_pool_exact: u32,
+    brick_alive: [u32],
+    exact_cells: mut Append<ExactCell>,
+    id: GlobalId,
+) {
+    if id.x >= min(pool_exact_count[0], cap_pool_exact) {
+        return
+    }
+    let s = pool_exact_slots[id.x]
+    if brick_alive[s] != 0 {
+        let _ = exact_cells.push(pool_exact_cells[id.x])
+    }
+}
+
+/// Appends the transient seam pass's base exact cells into `exact_cells`.
+@strict
+@compute(64)
+pub(package) fn compact_seam_exact(
+    seam_exact_cells: [ExactCell],
+    seam_exact_count: [u32],
+    cap_seam_exact: u32,
+    exact_cells: mut Append<ExactCell>,
+    id: GlobalId,
+) {
+    if id.x >= min(seam_exact_count[0], cap_seam_exact) {
+        return
+    }
+    let _ = exact_cells.push(seam_exact_cells[id.x])
+}
+
+/// Finalizes indirect draw arguments and readback counters for a `BrickPool` update.
+/// `tri_count` layout matches `finish_draw`:
+///   `[0]` drawn opaque indices, `[1]` trans indices, `[2]` wanted active bricks, `[3]` total verts,
+///   `[4]` max creases, `[5]` uncovered creases, `[6]` cut indices, `[7]` overflow bits,
+///   `[8]` exact cells, `[9]` thin/seam overflow, `[10]` pool hits, `[11]` pool misses,
+///   `[12]` seam cells, `[13]` unlocal quads, `[14]` used slots, `[15]` used pool indices,
+///   `[16]` seam bricks of the cut, `[17]` the update's commit (`GATE_*`), `[18]` the exact cells
+///   the arena holds.
+/// An update that commits nothing leaves every draw as it was and reads back the drawn cut's
+/// counts, late (`OVERFLOW_BRICKS`).
+@strict
+@compute(1)
+pub(package) fn finish_pool_draw(
+    gate: [u32],
+    active_count: [u32],
+    verts_count: [u32],
+    seam_quad_count: [u32],
+    seam_cell_count: [u32],
+    exact_count: [u32],
+    seam_start: [u32],
+    seam_tri_count: [u32],
+    pool_tri_count: [u32],
+    pool_stats: [u32],
+    has_seams: u32,
+    cap_indices: u32,
+    cap_pool_indices: u32,
+    cap_trans: u32,
+    cap_exact: u32,
+    cap_pool_exact: u32,
+    inst_count: u32,
+    tri_count: mut Atomics<u32>,
+    args: mut One<DrawIndexedArgs>,
+    trans_args: mut One<DrawIndexedArgs>,
+    cut_args: mut One<DrawIndexedArgs>,
+    seam_args: mut One<DrawIndexedArgs>,
+    exact_args: mut One<DrawIndexedArgs>,
+    marks: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let commit = gate[GATE_COMMIT]
+    tri_count.store(i: 10, value: pool_stats[0])
+    tri_count.store(i: 11, value: pool_stats[1])
+    tri_count.store(i: 14, value: marks.load(i: MARK_SLOTS))
+    tri_count.store(i: 15, value: pool_tri_count[0])
+    tri_count.store(i: 16, value: pool_stats[2])
+    tri_count.store(i: 17, value: commit)
+    tri_count.store(i: 18, value: marks.load(i: MARK_EXACT))
+    if commit == GATE_NONE {
+        tri_count.store(i: 0, value: marks.load(i: MARK_DRAWN_IDX))
+        tri_count.store(i: 2, value: marks.load(i: MARK_DRAWN_ACTIVE))
+        tri_count.store(i: 3, value: marks.load(i: MARK_DRAWN_VERTS))
+        tri_count.store(i: 7, value: OVERFLOW_BRICKS)
+        tri_count.store(i: 8, value: marks.load(i: MARK_DRAWN_EXACT))
+        tri_count.store(i: 12, value: marks.load(i: MARK_DRAWN_SEAM_CELLS))
+        return
+    }
+    let brick_idx = seam_start[0]
+    let strip_idx = if has_seams != 0 { seam_tri_count[0] } else { 0 }
+    let raw_idx = brick_idx + strip_idx
+    let n = min(raw_idx, cap_indices)
+    args.set(id, DrawIndexedArgs {
+        indices: n,
+        instances: if n > 0 { inst_count } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    let ss = min(brick_idx, n)
+    let sn = n - ss
+    seam_args.set(id, DrawIndexedArgs {
+        indices: sn,
+        instances: if sn > 0 { inst_count } else { 0 },
+        first_index: ss,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    let raw_trans = tri_count.load(i: 1)
+    let nt = min(raw_trans, cap_trans)
+    trans_args.set(id, DrawIndexedArgs {
+        indices: nt,
+        instances: if nt > 0 { inst_count } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    let raw_cut = tri_count.load(i: 6)
+    let nc = min(raw_cut, cap_trans)
+    cut_args.set(id, DrawIndexedArgs {
+        indices: nc,
+        instances: if nc > 0 { inst_count } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    let raw_ex = exact_count[0]
+    let nex = min(raw_ex, cap_exact)
+    exact_args.set(id, DrawIndexedArgs {
+        indices: if nex > 0 { 36 } else { 0 },
+        instances: nex,
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    var ovf: u32 = 0
+    if has_seams != 0 && (seam_quad_count[0] > CAP_SEAM || seam_cell_count[0] > CAP_SEAM) {
+        ovf |= OVERFLOW_SEAMS
+    }
+    if raw_cut > cap_trans {
+        ovf |= OVERFLOW_CUT
+    }
+    if raw_idx > cap_indices || pool_tri_count[0] > cap_pool_indices {
+        ovf |= OVERFLOW_INDICES
+    }
+    if raw_trans > cap_trans {
+        ovf |= OVERFLOW_TRANS
+    }
+    if tri_count.load(i: 5) > 0 || seam_tri_count[5] > 0 {
+        ovf |= OVERFLOW_CREASES
+    }
+    if (cap_exact > 0 && raw_ex > cap_exact) || marks.load(i: MARK_EXACT) > cap_pool_exact {
+        ovf |= OVERFLOW_EXACT
+    }
+    if tri_count.load(i: 9) > 0 || seam_tri_count[9] > 0 {
+        ovf |= OVERFLOW_THIN
+    }
+    if tri_count.load(i: 13) > 0 || seam_tri_count[13] > 0 || pool_tri_count[13] > 0 {
+        ovf |= OVERFLOW_UNLOCAL
+    }
+    // A cold pool drawn with less than its whole cut (its misses or seam bricks past what was
+    // dispatched, or past its slots) is late, and is updated again.
+    if commit == GATE_COLD &&
+        (pool_stats[1] > gate[GATE_MISSES] || pool_stats[2] > gate[GATE_SEAMS]) {
+        ovf |= OVERFLOW_BRICKS
+    }
+    tri_count.store(i: 0, value: raw_idx)
+    tri_count.store(i: 2, value: active_count[0])
+    tri_count.store(i: 3, value: verts_count[0])
+    tri_count.store(i: 7, value: ovf)
+    tri_count.store(i: 8, value: raw_ex)
+    let seam_cells_read = max(tri_count.load(i: 12), seam_tri_count[12])
+    tri_count.store(i: 12, value: seam_cells_read)
+    marks.store(i: MARK_DRAWN_SEAM_CELLS, value: seam_cells_read)
+    marks.store(i: MARK_DRAWN_IDX, value: raw_idx)
+    marks.store(i: MARK_DRAWN_ACTIVE, value: active_count[0])
+    marks.store(i: MARK_DRAWN_VERTS, value: verts_count[0])
+    marks.store(i: MARK_DRAWN_EXACT, value: raw_ex)
+}

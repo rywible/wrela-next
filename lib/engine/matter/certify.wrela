@@ -163,6 +163,70 @@ pub fn certify_sheet<S: Surface>(
     top == 0
 }
 
+/// Angular normal-error budget (radians) matched to a GGX BRDF's specular lobe half-angle
+/// (`alpha = r²`): keeps specular highlights free of faceting on glossy gold and glass while
+/// relaxing smoothly for rough matte surfaces.
+pub fn brdf_normal_budget(roughness: f32) -> f32 {
+    let r = clamp(roughness, 0.04, 1.0)
+    0.25 * max(r * r, 0.04)
+}
+
+/// Unified two-sided error bound `(delta_pos, delta_n)` over cell `[lo, lo + h]` for surface
+/// `s` (parts `live`) relative to vertex plane `(at, normal)`:
+/// - `delta_pos` (metres): full slab width enclosing `s = 0` along `normal` (`1e30` if uncertified
+///   with zero slope), bounding both mesh-to-surface and surface-to-mesh error when vertices stay
+///   in the dual-region slab.
+/// - `delta_n` (radians): upper bound on normal cone half-angle over the cell from the affine
+///   remainder `e` relative to the linear gradient magnitude `|g|` (`pi` if uncertified).
+pub fn quad_error_bound<S: Surface>(
+    s: S,
+    live: Live,
+    lo: vec3,
+    h: f32,
+    at: vec3,
+    normal: vec3,
+) -> vec2 {
+    let n_len = length(normal)
+    if !(h > 0.0) || !(n_len > 1.0e-6) {
+        return vec2(1.0e30, 3.1415927)
+    }
+    let n = normal / n_len
+    let bx = Box3 { lo, hi: lo + vec3(h) }
+    let af = s.slope_affine(bx, live)
+    if !af.valid() {
+        return vec2(1.0e30, 3.1415927)
+    }
+    let hl = 0.5 * lo
+    let hh = 0.5 * (lo + vec3(h))
+    let c_b = hl + hh
+    let h_in = (hh - hl) * (1.0 + 2.0 * CERT_EPS)
+    if !(h_in.x > 0.0 && h_in.y > 0.0 && h_in.z > 0.0) {
+        return vec2(1.0e30, 3.1415927)
+    }
+    let g = vec3(af.l.x / h_in.x, af.l.y / h_in.y, af.l.z / h_in.z)
+    let g_len = length(g)
+    let alpha = dot(g, n)
+    let abs_a = abs(alpha)
+    if !(abs_a > 1.0e-6) || !(g_len > 1.0e-6) {
+        return vec2(1.0e30, 3.1415927)
+    }
+    let w_l = h_in * n
+    let r = af.l - w_l * alpha
+    let mag_f = abs(af.c) + abs(af.l.x) + abs(af.l.y) + abs(af.l.z) + af.e
+    let margin_f = mag_f * (16.0 * CERT_EPS) + 4.0 * CERT_TINY
+    let margin_w = (abs(c_b.x) + abs(c_b.y) + abs(c_b.z) + abs(at.x) + abs(at.y) + abs(at.z)) *
+        (6.0 * CERT_EPS) +
+        (h_in.x + h_in.y + h_in.z) * (12.0 * CERT_EPS) +
+        8.0 * CERT_TINY
+    let delta_pos = 2.0 * ((abs(r.x) + abs(r.y) + abs(r.z) + af.e + margin_f) / abs_a + margin_w)
+    let g_dir_dev = acos(clamp(dot(g / g_len, n), -1.0, 1.0))
+    // For a C² surface with affine remainder `e` over a cell of width `h`, curvature `κ ≤ 4 e / (h² |g|)`
+    // so normal rotation across a 2-cell dual quad (`2 h`) is bounded by `8 e / (h |g|)`.
+    let sin_curv = clamp(8.0 * (af.e + margin_f) / max(h * g_len, 1.0e-8), 0.0, 1.0)
+    let delta_n = min(g_dir_dev + asin(sin_curv), 3.1415927)
+    vec2(delta_pos, delta_n)
+}
+
 fn u01(k: u32) -> f32 {
     f32(hash_u32(k) >> 8) * (1.0 / 16777216.0)
 }

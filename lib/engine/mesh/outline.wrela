@@ -21,7 +21,10 @@
 use matter::certify::certify_sheet
 use matter::substance::Substance
 use mesh::dc::{HOLE_PX, QUAD_OUTLINE, decode_cell, finer_than_a_hole, on_outline}
-use mesh::grid::{ActiveBrick, BRICK, ExactCell, GridSpec, MeshVertex, NONE, cell_live, unpack_oct_normal}
+use mesh::grid::{
+    ActiveBrick, BRICK, ExactCell, FrustumCull, GridSpec, MeshVertex, NONE, box_in_frustum,
+    cell_live, unpack_oct_normal,
+}
 use std::derive::Box3
 use std::field::{Field, Live}
 use std::gpu::{Append, Atomics, GlobalId, Slots}
@@ -34,7 +37,8 @@ pub type QuadRec = vec4u
 
 /// A brick's slot: its first corner on the lattice (`grid::lattice`'s index, the grid's
 /// `cell_offset` with it), its cell, the thing of its batch it is of (`GridSpec::orig_id`), and
-/// the parts live in it.
+/// the parts live in it. Stored packed as `SLOT_BRICK_WORDS` (`9`) `u32` words so pooled extraction
+/// can write at GPU-allocated slots without CPU alignment padding.
 pub struct SlotBrick: Copy + GpuData {
     pub base: vec3u,
     pub cell: f32,
@@ -43,6 +47,148 @@ pub struct SlotBrick: Copy + GpuData {
     pub pad0: u32,
     pub pad1: u32,
     pub pad2: u32,
+}
+
+/// Number of `u32` words stored per slot in `MeshBatch::slot_bricks`.
+pub const SLOT_BRICK_WORDS: u32 = 9
+
+/// Loads slot `slot` from packed `slots` (`SLOT_BRICK_WORDS` per slot).
+pub fn load_slot(slots: [u32], slot: u32) -> SlotBrick {
+    let b = slot * SLOT_BRICK_WORDS
+    SlotBrick {
+        base: vec3u(slots[b], slots[b + 1], slots[b + 2]),
+        cell: bitcast_f32(slots[b + 3]),
+        live: Live { words: vec4u(slots[b + 4], slots[b + 5], slots[b + 6], slots[b + 7]) },
+        orig: slots[b + 8],
+        pad0: 0,
+        pad1: 0,
+        pad2: 0,
+    }
+}
+
+/// Capacity of the per-batch place-keyed certificate cache (`place_cert_*`): persists sheet
+/// certificates by world cell `(gx, gy, gz, bitcast_u32(cell))` even across transient seam brick
+/// re-extractions and pool evictions.
+pub const PLACE_CERT_CAP: u32 = 32768
+pub const PLACE_CERT_HASH: u32 = 65536
+const PLACE_CERT_MASK: u32 = 65535
+const PLACE_CERT_PROBE: u32 = 16
+
+/// One entry in the place-keyed certificate cache: exact world lattice cell key + cached value.
+pub struct PlaceCert: Copy + GpuData {
+    pub key: vec4u,
+    pub val: u32,
+    pub pad0: u32,
+    pub pad1: u32,
+    pub pad2: u32,
+}
+
+fn place_cert_key(s: SlotBrick, cell: u32) -> vec4u {
+    let g = s.base + cell3(cell)
+    vec4u(g.x, g.y, g.z, bitcast_u32(s.cell))
+}
+
+fn place_cert_mix(k: vec4u) -> u32 {
+    var h = k.x.wrapping_mul(374761393)
+    h = h.wrapping_add(k.y.wrapping_mul(668265263))
+    h = h ^ (h >> 13)
+    h = h.wrapping_mul(1274126177)
+    h = h.wrapping_add(k.z.wrapping_mul(2246822519))
+    h = h ^ (h >> 16)
+    h = h.wrapping_mul(3266489917)
+    h = h.wrapping_add(k.w.wrapping_mul(668265263))
+    h ^ (h >> 15)
+}
+
+/// Looks up `(s, cell)` in the place-keyed certificate cache (`NONE` if absent).
+fn place_cert_find(
+    hash_slots: [u32],
+    entries: [PlaceCert],
+    key: vec4u,
+) -> u32 {
+    var idx = place_cert_mix(key) & PLACE_CERT_MASK
+    for _step in 0..PLACE_CERT_PROBE {
+        let e = hash_slots[idx]
+        if e == NONE {
+            return NONE
+        }
+        if entries[e].key == key {
+            return e
+        }
+        idx = (idx + 1) & PLACE_CERT_MASK
+    }
+    NONE
+}
+
+/// Initializes `place_cert_hash` to `NONE`.
+@strict
+@compute(64)
+pub(package) fn reset_place_cert(hash_slots: mut Slots<u32>, id: GlobalId) {
+    hash_slots[id] = NONE
+}
+
+/// Appends newly certified cells (`new_entries`) into `entries` and stores their values and
+/// assigned entry indices (`new_slots`) prior to `place_cert_link` (no read/write buffer aliasing).
+@strict
+@compute(64)
+pub(package) fn place_cert_append(
+    new_entries: [PlaceCert],
+    new_count: [u32],
+    cap_new: u32,
+    entries: mut Append<PlaceCert>,
+    vals: mut Atomics<u32>,
+    new_slots: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    if id.x >= min(new_count[0], cap_new) {
+        return
+    }
+    let pc = new_entries[id.x]
+    let e = entries.push(pc)
+    if e < PLACE_CERT_CAP {
+        vals.store(i: e, value: pc.val)
+        new_slots.store(i: id.x, value: e)
+    } else {
+        new_slots.store(i: id.x, value: NONE)
+    }
+}
+
+/// Publishes entries appended by `place_cert_append` into `hash_slots` via lock-free
+/// `compare_exchange` after a dispatch barrier guarantees `entries[e].key` is visible.
+@strict
+@compute(64)
+pub(package) fn place_cert_link(
+    new_entries: [PlaceCert],
+    new_count: [u32],
+    cap_new: u32,
+    new_slots: [u32],
+    entries: [PlaceCert],
+    hash_slots: mut Atomics<u32>,
+    vals: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    if id.x >= min(new_count[0], cap_new) {
+        return
+    }
+    let e = new_slots[id.x]
+    if e == NONE || e >= PLACE_CERT_CAP {
+        return
+    }
+    let pc = new_entries[id.x]
+    var idx = place_cert_mix(pc.key) & PLACE_CERT_MASK
+    for _step in 0..PLACE_CERT_PROBE {
+        let (old, stored) = hash_slots.compare_exchange_weak(i: idx, expected: NONE, new: e)
+        if stored {
+            return
+        }
+        if old != NONE {
+            if entries[old].key == pc.key {
+                vals.store(i: old, value: pc.val)
+                return
+            }
+            idx = (idx + 1) & PLACE_CERT_MASK
+        }
+    }
 }
 
 /// The words a slot keeps of its cells (343 of them, a bit each, 11 words): those all of whose
@@ -132,12 +278,13 @@ pub(package) fn outline_quads(
     cap_quads: u32,
     indices: [u32],
     verts: [MeshVertex],
-    slots: [SlotBrick],
+    slots: [u32],
     alive: [u32],
     origin: vec3,
     shift: vec3,
     first: u32,
     eye: vec4,
+    fc: FrustumCull,
     bits: mut Atomics<u32>,
     cert_cands: mut Append<vec2u>,
     thin_cands: mut Append<u32>,
@@ -150,6 +297,12 @@ pub(package) fn outline_quads(
     let q = quads[qi]
     let slot = q.y & 1073741823
     if alive[slot] == 0 {
+        return
+    }
+    let s = load_slot(slots, slot)
+    let blo = slot_corner(s, origin, shift, vec3u(0, 0, 0))
+    let bside = s.cell * f32(BRICK + 2)
+    if !box_in_frustum(blo - vec3(s.cell), blo + vec3(bside), fc) {
         return
     }
     let flip = ((q.y >> 30) & 1) != 0
@@ -185,7 +338,6 @@ pub(package) fn outline_quads(
     if kind != QUAD_OUTLINE {
         return
     }
-    let s = slots[slot]
     let cs = [q.z & 511, (q.z >> 9) & 511, (q.z >> 18) & 511, q.w & 511]
     if finer_than_a_hole(slot_corner(s, origin, shift, cell3(cs[0])), s.cell, eye) {
         return
@@ -217,17 +369,15 @@ pub(package) fn outline_quads(
 }
 
 /// Each outline cell put up for a certificate (`outline_quads`), held to what its vertex's
-/// certificate says (`vert_cert`: the slab's width it was made for, or that width less than 0
-/// where it failed): one made for a slab no wider than this frame's needs (`2 HOLE_PX` pixels)
-/// holds, and the cell needs nothing; one that failed for a slab no narrower fails, and the cell
-/// is given an exact cell; any other (none made yet, or made for an eye farther off) is put up to
-/// be made again (`due`: its place in `cert_cands`), so the costly certificates of a frame are of
-/// the few its eye's move left unsaid, asked together.
+/// certificate says (`vert_cert`, falling back to the place-keyed cache `place_cert_*` by world
+/// cell coordinates when `vert_cert[vi] == 0`): one made for a slab no wider than this frame's
+/// needs (`2 HOLE_PX` pixels) holds, and the cell needs nothing; one that failed for a slab no
+/// narrower fails, and the cell is given an exact cell; any other is put up to be certified (`due`).
 @strict
 @compute(64)
 pub(package) fn cert_due<M: Field<Substance>>(
     fields: [M],
-    slots: [SlotBrick],
+    slots: [u32],
     cert_cands: [vec2u],
     cert_count: [u32],
     cap: u32,
@@ -235,7 +385,10 @@ pub(package) fn cert_due<M: Field<Substance>>(
     origin: vec3,
     shift: vec3,
     eye: vec4,
-    vert_cert: [u32],
+    vert_cert: mut Atomics<u32>,
+    place_hash: [u32],
+    place_entries: [PlaceCert],
+    place_vals: [u32],
     bits: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
     due: mut Append<u32>,
@@ -249,11 +402,21 @@ pub(package) fn cert_due<M: Field<Substance>>(
     let vi = cert_cands[i].y
     let slot = packed >> 9
     let cell = packed & 511
-    let s = slots[slot]
+    let s = load_slot(slots, slot)
     if vi != NONE {
         let lo = slot_corner(s, origin, shift, cell3(cell))
         let need = 2.0 * HOLE_PX * length(eye.xyz - (lo + vec3(0.5 * s.cell))) * eye.w
-        let kept = bitcast_f32(vert_cert[vi])
+        var raw = vert_cert.load(i: vi)
+        if raw == 0 {
+            let e = place_cert_find(place_hash, place_entries, place_cert_key(s, cell))
+            if e != NONE {
+                raw = place_vals[e]
+                if raw != 0 {
+                    vert_cert.store(i: vi, value: raw)
+                }
+            }
+        }
+        let kept = bitcast_f32(raw)
         if kept > 0.0 && kept <= need {
             return
         }
@@ -268,12 +431,12 @@ pub(package) fn cert_due<M: Field<Substance>>(
 /// Each outline cell `cert_due` put up: certified (`certify_sheet`, the surface in the cell
 /// within a slab about its vertex's plane) for `WATCH_SLACK` of this frame's pixel (so it holds
 /// while the eye comes no nearer than that), or given an exact cell; what it found kept in
-/// `vert_cert`.
+/// `vert_cert` and in the place-keyed cache (`place_entries` / `place_vals`).
 @strict
 @compute(64)
 pub(package) fn certify_watched<M: Field<Substance>>(
     fields: [M],
-    slots: [SlotBrick],
+    slots: [u32],
     verts: [MeshVertex],
     cert_cands: [vec2u],
     due: [u32],
@@ -284,6 +447,10 @@ pub(package) fn certify_watched<M: Field<Substance>>(
     shift: vec3,
     eye: vec4,
     vert_cert: mut Atomics<u32>,
+    place_hash: [u32],
+    place_entries: [PlaceCert],
+    place_new: mut Append<PlaceCert>,
+    place_vals: mut Atomics<u32>,
     bits: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
     id: GlobalId,
@@ -297,7 +464,7 @@ pub(package) fn certify_watched<M: Field<Substance>>(
     let vi = cert_cands[at].y
     let slot = packed >> 9
     let cell = packed & 511
-    let s = slots[slot]
+    let s = load_slot(slots, slot)
     let lo = slot_corner(s, origin, shift, cell3(cell))
     let need = 2.0 * HOLE_PX * length(eye.xyz - (lo + vec3(0.5 * s.cell))) * eye.w
     let w = WATCH_SLACK * need
@@ -312,7 +479,15 @@ pub(package) fn certify_watched<M: Field<Substance>>(
         unpack_oct_normal(v.packed),
         w,
     )
-    vert_cert.store(i: vi, value: bitcast_u32(if ok { w } else { -need }))
+    let val = bitcast_u32(if ok { w } else { -need })
+    vert_cert.store(i: vi, value: val)
+    let key = place_cert_key(s, cell)
+    let e = place_cert_find(place_hash, place_entries, key)
+    if e != NONE {
+        place_vals.store(i: e, value: val)
+    } else {
+        let _ = place_new.push(PlaceCert { key, val, pad0: 0, pad1: 0, pad2: 0 })
+    }
     if !ok {
         exact_once(fields[s.orig], s, slot, cell, origin, shift, mut bits, mut exact_cells)
     }
@@ -336,7 +511,7 @@ fn watched_core(s: SlotBrick, origin: vec3, shift: vec3, cell: u32, eye: vec4) -
 @compute(64)
 pub(package) fn thin_watched<M: Field<Substance>>(
     fields: [M],
-    slots: [SlotBrick],
+    slots: [u32],
     alive: [u32],
     cands: [u32],
     order: [u32],
@@ -363,13 +538,22 @@ pub(package) fn thin_watched<M: Field<Substance>>(
     if alive[packed >> 9] == 0 {
         return
     }
-    let s = slots[packed >> 9]
+    let s = load_slot(slots, packed >> 9)
     let cell = packed & 511
     let (lo, w) = watched_core(s, origin, shift, cell, eye)
     if w <= 0.0 {
         return
     }
     let m = 0.5 * (s.cell - w)
+    if keep != 0 {
+        let proven = bitcast_f32(thin_proof.load(i: at))
+        if proven < 0.0 && -proven >= m {
+            // Core at margin `m <= -proven` contains the smaller core that already failed: emit
+            // an exact cell on lane 0 without re-evaluating 9 enclosures.
+            thin_masks[id] = 256
+            return
+        }
+    }
     // Asked for `WATCH_SLACK` of this frame's margin: a wider core, held by eyes nearer still.
     let mt = WATCH_SLACK * m
     let lt = lo - vec3(m - mt)
@@ -386,8 +570,9 @@ pub(package) fn thin_watched<M: Field<Substance>>(
     if keep != 0 {
         // Proven empty for now, until an octant (`thin_watched_octants`) finds it isn't.
         thin_proof.store(i: at, value: bitcast_u32(mt))
-    } else if mask == 0 {
-        // A cell beside the outline the whole's form proved empty: kept, while it holds.
+    } else {
+        // Speculatively mark beside cell proven empty at `mt` (even if octants must confirm it);
+        // `thin_watched_octants` clears the bit if any octant fails.
         let slot = packed >> 9
         let _ = bits.or(i: slot * SLOT_WORDS + SLOT_BESIDE + (cell >> 5), value: 1 << (cell & 31))
         let _ = bits.max(i: slot * SLOT_WORDS + SLOT_MARGIN, value: bitcast_u32(mt))
@@ -402,7 +587,7 @@ pub(package) fn thin_watched<M: Field<Substance>>(
 @compute(64)
 pub(package) fn thin_watched_octants<M: Field<Substance>>(
     fields: [M],
-    slots: [SlotBrick],
+    slots: [u32],
     alive: [u32],
     cands: [u32],
     order: [u32],
@@ -424,7 +609,23 @@ pub(package) fn thin_watched_octants<M: Field<Substance>>(
     if i >= min(count[0], cap) {
         return
     }
-    if ((thin_masks[id.x / 8] >> j) & 1) == 0 {
+    let tm = thin_masks[id.x / 8]
+    if tm == 256 {
+        if j != 0 {
+            return
+        }
+        let at = if keep != 0 { order[i] } else { i }
+        let packed = cands[at]
+        let slot = packed >> 9
+        if alive[slot] == 0 {
+            return
+        }
+        let cell = packed & 511
+        let s = load_slot(slots, slot)
+        exact_once(fields[s.orig], s, slot, cell, origin, shift, mut bits, mut exact_cells)
+        return
+    }
+    if ((tm >> j) & 1) == 0 {
         return
     }
     let at = if keep != 0 { order[i] } else { i }
@@ -434,7 +635,7 @@ pub(package) fn thin_watched_octants<M: Field<Substance>>(
         return
     }
     let cell = packed & 511
-    let s = slots[slot]
+    let s = load_slot(slots, slot)
     let (lo, w) = watched_core(s, origin, shift, cell, eye)
     let m = 0.5 * (s.cell - w)
     let mt = WATCH_SLACK * m
@@ -445,15 +646,20 @@ pub(package) fn thin_watched_octants<M: Field<Substance>>(
     let af = f.slope_affine(Box3 { lo: o, hi: o + vec3(0.5 * wt) }, s.live)
     if af.lo() <= 0.0 {
         if keep != 0 {
-            thin_proof.store(i: at, value: 0)
+            thin_proof.store(i: at, value: bitcast_u32(-mt))
+        } else {
+            let _ = bits.and(
+                i: slot * SLOT_WORDS + SLOT_BESIDE + (cell >> 5),
+                value: NONE ^ (u32(1) << (cell & 31)),
+            )
         }
         exact_once(f, s, slot, cell, origin, shift, mut bits, mut exact_cells)
     }
 }
 
-/// Each active brick of a chunk (`chunk_start` on) of a held mesh: its slot (`SlotBrick`, into
-/// `slots`, the chunk's span of them), and its cells' all-outside bits cleared, for
-/// `classify_cells` to set (`SLOT_OUT`, the slot `slot_base + chunk_start` on).
+/// Each active brick of a chunk (`chunk_start` on) of a held mesh: writes its packed `SlotBrick`
+/// words into `slots` at `slot = slot_base[0] + bi`, and clears its `SLOT_OUT`/`SLOT_BESIDE`/
+/// `SLOT_MARGIN` bits.
 @strict
 @compute(64)
 pub(package) fn keep_slots(
@@ -462,8 +668,9 @@ pub(package) fn keep_slots(
     active_count: [u32],
     cap_bricks: u32,
     chunk_start: u32,
-    slot_base: u32,
-    slots: mut Slots<SlotBrick>,
+    slot_base: [u32],
+    max_slots: u32,
+    slots: mut Atomics<u32>,
     bits: mut Atomics<u32>,
     id: GlobalId,
 ) {
@@ -471,18 +678,23 @@ pub(package) fn keep_slots(
     if bi >= min(active_count[0], cap_bricks) {
         return
     }
+    let slot = slot_base[0] + bi
+    if slot >= max_slots {
+        return
+    }
     let ab = active[bi]
     let g = grids[ab.coord.w]
-    slots[id] = SlotBrick {
-        base: ab.coord.xyz * BRICK + g.cell_offset,
-        cell: g.cell,
-        live: ab.live,
-        orig: g.orig_id,
-        pad0: 0,
-        pad1: 0,
-        pad2: 0,
-    }
-    let slot = slot_base + bi
+    let base = ab.coord.xyz * BRICK + g.cell_offset
+    let sb = slot * SLOT_BRICK_WORDS
+    slots.store(i: sb, value: base.x)
+    slots.store(i: sb + 1, value: base.y)
+    slots.store(i: sb + 2, value: base.z)
+    slots.store(i: sb + 3, value: bitcast_u32(g.cell))
+    slots.store(i: sb + 4, value: ab.live.words.x)
+    slots.store(i: sb + 5, value: ab.live.words.y)
+    slots.store(i: sb + 6, value: ab.live.words.z)
+    slots.store(i: sb + 7, value: ab.live.words.w)
+    slots.store(i: sb + 8, value: g.orig_id)
     for w in 0..11 {
         bits.store(i: slot * SLOT_WORDS + SLOT_OUT + w, value: 0)
         bits.store(i: slot * SLOT_WORDS + SLOT_BESIDE + w, value: 0)
@@ -497,7 +709,7 @@ pub(package) fn keep_slots(
 @compute(64)
 pub(package) fn stale_beside(
     count: u32,
-    slots: [SlotBrick],
+    slots: [u32],
     alive: [u32],
     origin: vec3,
     shift: vec3,
@@ -513,7 +725,7 @@ pub(package) fn stale_beside(
     if !(kept > 0.0) {
         return
     }
-    let s = slots[slot]
+    let s = load_slot(slots, slot)
     let lo = slot_corner(s, origin, shift, vec3u(0, 0, 0))
     let side = s.cell * f32(BRICK + 1)
     let near = length(max(max(lo - eye.xyz, eye.xyz - (lo + vec3(side))), vec3(0.0)))
@@ -543,12 +755,13 @@ pub(package) fn thin_due(
     cands: [u32],
     count: [u32],
     cap: u32,
-    slots: [SlotBrick],
+    slots: [u32],
     alive: [u32],
     origin: vec3,
     shift: vec3,
     first: u32,
     eye: vec4,
+    fc: FrustumCull,
     thin_proof: [u32],
     due: mut Append<u32>,
     id: GlobalId,
@@ -561,7 +774,12 @@ pub(package) fn thin_due(
     if alive[packed >> 9] == 0 {
         return
     }
-    let s = slots[packed >> 9]
+    let s = load_slot(slots, packed >> 9)
+    let blo = slot_corner(s, origin, shift, vec3u(0, 0, 0))
+    let bside = s.cell * f32(BRICK + 2)
+    if !box_in_frustum(blo - vec3(s.cell), blo + vec3(bside), fc) {
+        return
+    }
     let (_, w) = watched_core(s, origin, shift, packed & 511, eye)
     if w <= 0.0 {
         return
@@ -581,7 +799,7 @@ pub(package) fn thin_due(
 @compute(64)
 pub(package) fn uncertified<M: Field<Substance>>(
     fields: [M],
-    slots: [SlotBrick],
+    slots: [u32],
     cert_cands: [vec2u],
     cert_count: [u32],
     cap: u32,
@@ -598,6 +816,6 @@ pub(package) fn uncertified<M: Field<Substance>>(
     }
     let packed = cert_cands[i].x
     let slot = packed >> 9
-    let s = slots[slot]
+    let s = load_slot(slots, slot)
     exact_once(fields[s.orig], s, slot, packed & 511, origin, shift, mut bits, mut exact_cells)
 }
