@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The gate a change to how anything is drawn passes before it is called done. Usage:
 
-    tools/gate [--quick] [--full] [--only layers,tests,audit,sun,frames] [--update]
+    tools/gate [--quick] [--full] [--only layers,tests,audit,pool,sun,frames] [--update]
                [--machine NAME] [--keep DIR]
     tools/gate --seen [REV | REV..REV] [--machine NAME]
 
@@ -13,6 +13,10 @@ tools/audit, tools/bench, tools/gpu: one GPU job at a time, every dispatch under
   audit    The hole audit: small (160x90, 12 eyes, every kind) always; with --full the full one
            too (640x360, 24 eyes). A kind may fail only if the baseline names it as failing
            already (a debt, written down with what it is), and then no worse than it did.
+  pool     The pool's judge (POOLJUDGE, `engine::judge::pool`) at `POOL_SIZE`: each pooled kind
+           of the arena and the study drawn along a run and a turn at the game's fastest, its
+           pooled mesh then held to a cold extraction of its cut, bit for bit (triangles, exact
+           cells, outline records). It passes only when every kind is held.
   sun      The sun's judge (SUNJUDGE) on each of `SUN_VIEWS`, judged at 320x180 (drawn at
            640x360, a judged pixel's light the mean of its footprint's four): hard leaks, hard
            acne, the mean and 99th percentile error against 64 rays a pixel to the sun's disc,
@@ -113,7 +117,11 @@ COUNT_SLACK = (0.03, 8)
 REL_SLACK = 0.04
 ABS_SLACK = {"ms": 0.25, "err": 0.1}
 
-STEPS = ["layers", "tests", "audit", "sun", "frames"]
+STEPS = ["layers", "tests", "audit", "pool", "sun", "frames"]
+# The pool's judge: its size, the frames it may take, and what it says once every kind is held.
+POOL_SIZE = "640x360"
+POOL_FRAMES = 3000
+POOL_HELD = re.compile(r"judge pool: (\d+) kinds held")
 
 # What a result depends on, for its key: every file under these, but for the baseline itself
 # (which says whether a number passes, never what it is).
@@ -197,6 +205,10 @@ def sun_dir(tmp, scene, view, place, cell_px):
     return os.path.join(tmp, f"sun_{scene}_{view}_p{place}_c{cell_px}")
 
 
+def pool_dir(tmp):
+    return os.path.join(tmp, "pool")
+
+
 def frame_dir(tmp, scene, place):
     return os.path.join(tmp, f"frame_{scene}_p{place}")
 
@@ -214,6 +226,8 @@ def plan(builds, steps, opts, tmp):
     if "audit" in steps:
         for what in audits(opts):
             builds.add(audit_dir(tmp, what), {"SCENE": 6, "AUDIT_EYES": AUDITS[what][0]})
+    if "pool" in steps:
+        builds.add(pool_dir(tmp), {"POOLJUDGE": "true"})
     if "sun" in steps:
         for scene, view in SUN_VIEWS:
             for place, cell_px in SUN_RUNS:
@@ -334,6 +348,24 @@ def step_audit(res, base, opts, tmp, builds):
             audit(res, b.get(f"small at {SLOWEST_UNIT_FS} fs"), "small", tmp, builds, unit_fs=SLOWEST_UNIT_FS)
         except RuntimeError as e:
             res.row(f"audit small at {SLOWEST_UNIT_FS} fs", "passes", "did not run", False, str(e).splitlines()[-1][:140])
+
+
+def step_pool(res, base, opts, tmp, builds):
+    out = pool_dir(tmp)
+    builds.need(out)
+    say("the pool's judge")
+    p = run([os.path.join(TOOLS, "gpu"), "--timeout", "900", out, "--size", POOL_SIZE,
+             "--frames", str(POOL_FRAMES), "--until", "scene: done",
+             "--png", os.path.join(out, "pool.png")])
+    held = [l.split("wrela: ", 1)[-1] for l in p.stdout.splitlines() if "judge pool:" in l]
+    m = POOL_HELD.search(p.stdout)
+    if p.returncode != 0 or not m:
+        err = [l for l in p.stdout.splitlines() if "panic" in l or "error" in l]
+        res.row("pool judge", "every kind held", "not held", False,
+                (err[0] if err else (held[-1] if held else "the judge said nothing"))[:200])
+        return
+    res.measured["pool.kinds"] = int(m.group(1))
+    res.row("pool judge", "every kind held", f"{m.group(1)} kinds held", True, "")
 
 
 SUN_LINE = re.compile(
@@ -645,7 +677,7 @@ def main():
             print(f"gate: no step `{s}` (the steps: {', '.join(STEPS)})", file=sys.stderr)
             return 2
     if opts["quick"] and opts["only"] is None:
-        steps = ["layers", "tests", "audit"]
+        steps = ["layers", "tests", "audit", "pool"]
     try:
         with open(BASELINE) as f:
             baselines = json.load(f)
@@ -660,8 +692,8 @@ def main():
         say(f"this run won't be kept: {e}")
         key = None
     res = Result()
-    fns = {"layers": step_layers, "tests": step_tests, "audit": step_audit, "sun": step_sun,
-           "frames": step_frames}
+    fns = {"layers": step_layers, "tests": step_tests, "audit": step_audit, "pool": step_pool,
+           "sun": step_sun, "frames": step_frames}
     tmp = opts["keep"] or tempfile.mkdtemp(prefix="wrela-gate-")
     os.makedirs(tmp, exist_ok=True)
     try:

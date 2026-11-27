@@ -1,0 +1,480 @@
+// The pool held to a cold extraction (docs/plans/build-time-engine-4d.md, phase 3 step 1). A kind
+// is drawn by a pooled `MeshBatch` along a walk and then a turn, its pool kept and updated as the
+// eye goes, until its mesh for the last eye is settled; then that same cut (the same nested grids,
+// for the same eye) is extracted cold into a second batch by the extraction of every batch that is
+// not a pool (`MeshBatch::extract_cut_cold`). Both meshes are read back and held to each other by
+// place, never by slot or by order:
+//
+// - every triangle of the opaque draw: its three vertices' bits (place and packed normal), turned
+//   to start at the least so its winding is kept;
+// - every exact cell its extraction made (its corner, width and live parts);
+// - every outline record of a live slot: its quad's four vertices, its four cells on the world's
+//   lattice, its cell, and whether it is flipped and split the other way.
+//
+// Each side is a multiset: each item hashed and the hashes summed, whole and in `PLACES` places of
+// space (by the first vertex's or the corner's brick of the cut's coarsest cell), so a difference
+// says where it is. A pool whose kept bricks are any other than a cold extraction's draws a mesh no
+// build or cook would make: the run stops, naming the kind and the place.
+
+use matter::substance::Substance
+use matter::world::one
+use mesh::extract::{
+    BRICK, DrawnRead, ExactCell, ExtractScratch, MeshBatch, MeshVertex, extract_scratch, mesh_batch,
+}
+use mesh::grid::GridSpec
+use mesh::outline::{SLOT_BRICK_WORDS, load_slot}
+use mesh::shade::BATCH_BRICKS
+use mesh::world_draw::MeshWorld
+use picture::eye::{Eye, view}
+use std::collections::Vec
+use std::field::Field
+use std::hash::{Hasher, StateHash}
+use std::io::{Pending, print}
+
+/// The places of space each side's sums are kept in.
+const PLACES: u32 = 4096
+
+/// The most frames the pooled mesh is given to settle at the path's last eye, and the cold one
+/// after it is extracted.
+const SETTLE_FRAMES: u32 = 64
+
+/// One side's sums: items and their hashes, whole and by place, and the first item's place in
+/// each place (for the report).
+struct Sums {
+    count: u32,
+    sum: u64,
+    by_place: Vec<u64>,
+    count_by_place: Vec<u32>,
+    first_at: Vec<vec3>,
+}
+
+fn sums() -> Sums {
+    Sums {
+        count: 0,
+        sum: 0,
+        by_place: Vec::filled(PLACES, 0),
+        count_by_place: Vec::filled(PLACES, 0),
+        first_at: Vec::filled(PLACES, vec3(0.0)),
+    }
+}
+
+impl Sums {
+    fn add(mut self, h: u64, at: vec3, place_cell: f32) {
+        let q = floor(at / place_cell)
+        var ph = Hasher::new()
+        i32(q.x).state_hash(mut ph)
+        i32(q.y).state_hash(mut ph)
+        i32(q.z).state_hash(mut ph)
+        let k = u32(ph.finish() % u64(PLACES))
+        self.count += 1
+        self.sum = self.sum.wrapping_add(h)
+        self.by_place[k] = self.by_place[k].wrapping_add(h)
+        if self.count_by_place[k] == 0 {
+            self.first_at[k] = at
+        }
+        self.count_by_place[k] += 1
+    }
+}
+
+fn vert_less(a: MeshVertex, b: MeshVertex) -> bool {
+    let ka = vec4u(bitcast_u32(a.px), bitcast_u32(a.py), bitcast_u32(a.pz), a.packed)
+    let kb = vec4u(bitcast_u32(b.px), bitcast_u32(b.py), bitcast_u32(b.pz), b.packed)
+    if ka.x != kb.x {
+        return ka.x < kb.x
+    }
+    if ka.y != kb.y {
+        return ka.y < kb.y
+    }
+    if ka.z != kb.z {
+        return ka.z < kb.z
+    }
+    ka.w < kb.w
+}
+
+fn hash_vert(v: MeshVertex, h: mut Hasher) {
+    bitcast_u32(v.px).state_hash(mut h)
+    bitcast_u32(v.py).state_hash(mut h)
+    bitcast_u32(v.pz).state_hash(mut h)
+    v.packed.state_hash(mut h)
+}
+
+fn same_place(a: MeshVertex, b: MeshVertex) -> bool {
+    a.px == b.px && a.py == b.py && a.pz == b.pz
+}
+
+/// What was read of one batch: each part as its read comes in (`got`, a bit each), every part
+/// once `got` is `DRAWN_PARTS`.
+struct Drawn {
+    got: u32,
+    counts: Vec<u32>,
+    verts: Vec<MeshVertex>,
+    indices: Vec<u32>,
+    exact: Vec<ExactCell>,
+    exact_base: u32,
+    quads: Vec<vec4u>,
+    quad_count: u32,
+    slots: Vec<u32>,
+    alive: Vec<u32>,
+    quad_indices: Vec<u32>,
+}
+
+const DRAWN_PARTS: u32 = 1023
+
+fn drawn() -> Drawn {
+    Drawn {
+        got: 0,
+        counts: Vec::new(),
+        verts: Vec::new(),
+        indices: Vec::new(),
+        exact: Vec::new(),
+        exact_base: 0,
+        quads: Vec::new(),
+        quad_count: 0,
+        slots: Vec::new(),
+        alive: Vec::new(),
+        quad_indices: Vec::new(),
+    }
+}
+
+/// Takes in what has come of `r`'s reads (each answers once), stopping the run if one failed;
+/// true once every part is in.
+fn gather(r: mut DrawnRead, d: mut Drawn, what: str) -> bool {
+    if (d.got & 1) == 0 {
+        match r.counts.poll() {
+            Some(Ok(x)) => { d.counts = take x; d.got |= 1 },
+            Some(Err(_)) => panic(f"judge pool: {what}: a read failed"),
+            None => {},
+        }
+    }
+    if (d.got & 2) == 0 {
+        match r.verts.poll() {
+            Some(Ok(x)) => { d.verts = take x; d.got |= 2 },
+            Some(Err(_)) => panic(f"judge pool: {what}: a read failed"),
+            None => {},
+        }
+    }
+    if (d.got & 4) == 0 {
+        match r.indices.poll() {
+            Some(Ok(x)) => { d.indices = take x; d.got |= 4 },
+            Some(Err(_)) => panic(f"judge pool: {what}: a read failed"),
+            None => {},
+        }
+    }
+    if (d.got & 8) == 0 {
+        match r.exact.poll() {
+            Some(Ok(x)) => { d.exact = take x; d.got |= 8 },
+            Some(Err(_)) => panic(f"judge pool: {what}: a read failed"),
+            None => {},
+        }
+    }
+    if (d.got & 16) == 0 {
+        match r.exact_base.poll() {
+            Some(Ok(x)) => { d.exact_base = x[0]; d.got |= 16 },
+            Some(Err(_)) => panic(f"judge pool: {what}: a read failed"),
+            None => {},
+        }
+    }
+    if (d.got & 32) == 0 {
+        match r.quads.poll() {
+            Some(Ok(x)) => { d.quads = take x; d.got |= 32 },
+            Some(Err(_)) => panic(f"judge pool: {what}: a read failed"),
+            None => {},
+        }
+    }
+    if (d.got & 64) == 0 {
+        match r.quad_count.poll() {
+            Some(Ok(x)) => { d.quad_count = x[0]; d.got |= 64 },
+            Some(Err(_)) => panic(f"judge pool: {what}: a read failed"),
+            None => {},
+        }
+    }
+    if (d.got & 128) == 0 {
+        match r.slots.poll() {
+            Some(Ok(x)) => { d.slots = take x; d.got |= 128 },
+            Some(Err(_)) => panic(f"judge pool: {what}: a read failed"),
+            None => {},
+        }
+    }
+    if (d.got & 256) == 0 {
+        match r.alive.poll() {
+            Some(Ok(x)) => { d.alive = take x; d.got |= 256 },
+            Some(Err(_)) => panic(f"judge pool: {what}: a read failed"),
+            None => {},
+        }
+    }
+    if (d.got & 512) == 0 {
+        match r.quad_indices.poll() {
+            Some(Ok(x)) => { d.quad_indices = take x; d.got |= 512 },
+            Some(Err(_)) => panic(f"judge pool: {what}: a read failed"),
+            None => {},
+        }
+    }
+    d.got == DRAWN_PARTS
+}
+
+/// One side held: its triangles, exact cells and outline records summed (`Sums`), and the
+/// triangles that are no triangle (two corners at one place) or name a vertex past those made.
+struct Held {
+    tris: Sums,
+    exact: Sums,
+    quads: Sums,
+    flat: u32,
+    stray: u32,
+}
+
+fn held_of(d: Drawn, place_cell: f32) -> Held {
+    var out = Held { tris: sums(), exact: sums(), quads: sums(), flat: 0, stray: 0 }
+    let nv = min(d.counts[3], d.verts.len())
+    let ni = min(d.counts[0], d.indices.len())
+    var t: u32 = 0
+    while t + 3 <= ni {
+        let i0 = d.indices[t]
+        let i1 = d.indices[t + 1]
+        let i2 = d.indices[t + 2]
+        t += 3
+        if i0 >= nv || i1 >= nv || i2 >= nv {
+            out.stray += 1
+            continue
+        }
+        let a = d.verts[i0]
+        let b = d.verts[i1]
+        let c = d.verts[i2]
+        if same_place(a, b) || same_place(b, c) || same_place(a, c) {
+            out.flat += 1
+            continue
+        }
+        // Turned to start at the least vertex, its winding kept.
+        let (p, q, r) = if vert_less(a, b) && vert_less(a, c) { (a, b, c) } else if vert_less(b, c) {
+            (b, c, a)
+        } else {
+            (c, a, b)
+        }
+        var h = Hasher::new()
+        hash_vert(p, mut h)
+        hash_vert(q, mut h)
+        hash_vert(r, mut h)
+        out.tris.add(h.finish(), vec3(p.px, p.py, p.pz), place_cell)
+    }
+    // Exact cells are a set: one listed twice is drawn twice, the same pixels (the seam's
+    // `first_seam_sight` boxes a coarse cell twice where its slots are taken, never not at all).
+    let ne = min(d.exact_base, d.exact.len())
+    var keyed: Vec<vec2u> = Vec::new()
+    for k in 0..ne {
+        let e = d.exact[k]
+        var h = Hasher::new()
+        bitcast_u32(e.lo.x).state_hash(mut h)
+        bitcast_u32(e.lo.y).state_hash(mut h)
+        bitcast_u32(e.lo.z).state_hash(mut h)
+        bitcast_u32(e.h).state_hash(mut h)
+        e.live.words.state_hash(mut h)
+        let x = h.finish()
+        keyed.push(vec2u(u32(x >> 32), u32(x & 4294967295)))
+        let _ = k
+    }
+    var order: Vec<u32> = Vec::new()
+    for k in 0..keyed.len() {
+        order.push(k)
+    }
+    order.sort_by(|a: u32, b: u32| keyed[a].x < keyed[b].x || (keyed[a].x == keyed[b].x && keyed[a].y < keyed[b].y))
+    for j in 0..order.len() {
+        let k = order[j]
+        if j > 0 && keyed[order[j - 1]] == keyed[k] {
+            continue
+        }
+        out.exact.add((u64(keyed[k].x) << 32) | u64(keyed[k].y), d.exact[k].lo, place_cell)
+    }
+    let nq = min(d.quad_count, d.quads.len())
+    let n_slots = d.slots.len() / SLOT_BRICK_WORDS
+    for k in 0..nq {
+        let rec = d.quads[k]
+        let at = rec.x & 2147483647
+        let slot = rec.y & 1073741823
+        if slot >= n_slots || slot >= d.alive.len() || d.alive[slot] == 0 {
+            continue
+        }
+        if at + 6 > d.quad_indices.len() {
+            out.stray += 1
+            continue
+        }
+        let s = load_slot(d.slots, slot)
+        let cs = [rec.z & 511, (rec.z >> 9) & 511, (rec.z >> 18) & 511, rec.w & 511]
+        var h = Hasher::new()
+        (rec.y >> 30).state_hash(mut h)
+        bitcast_u32(s.cell).state_hash(mut h)
+        for j in 0..4 {
+            let c = cs[j]
+            let w = s.base + vec3u(c % 7, (c / 7) % 7, c / 49)
+            w.state_hash(mut h)
+        }
+        let corner = [
+            d.quad_indices[at],
+            d.quad_indices[at + 1],
+            d.quad_indices[at + 2],
+            d.quad_indices[at + 5],
+        ]
+        var first = vec3(0.0)
+        for j in 0..4 {
+            let vi = corner[j]
+            if vi >= nv {
+                out.stray += 1
+                continue
+            }
+            let v = d.verts[vi]
+            hash_vert(v, mut h)
+            if j == 0 {
+                first = vec3(v.px, v.py, v.pz)
+            }
+        }
+        out.quads.add(h.finish(), first, place_cell)
+    }
+    out
+}
+
+/// The first place where `a` and `b` differ, and how: `""` when they are one.
+fn differ(what: str, a: Sums, b: Sums) -> String {
+    if a.count == b.count && a.sum == b.sum {
+        return String::new()
+    }
+    for k in 0..PLACES {
+        if a.by_place[k] != b.by_place[k] || a.count_by_place[k] != b.count_by_place[k] {
+            let at = if a.count_by_place[k] > 0 { a.first_at[k] } else { b.first_at[k] }
+            return f"{what}: pooled {a.count}, cold {b.count}; first in place {k} near {at}: pooled {a.count_by_place[k]}, cold {b.count_by_place[k]}"
+        }
+    }
+    f"{what}: pooled {a.count}, cold {b.count}, summed apart"
+}
+
+/// The judge of one kind under way (`pool_judge`).
+pub struct PoolJudge {
+    scratch: ExtractScratch,
+    batches: Vec<MeshBatch>,
+    cold: Vec<MeshBatch>,
+    /// 0: the path drawn; 1: settling at its last eye; 2: the cold cut settling; 3: reading;
+    /// 4: done.
+    stage: u32,
+    k: u32,
+    waited: u32,
+    reads: Vec<DrawnRead>,
+    pooled_drawn: Drawn,
+    cold_drawn: Drawn,
+}
+
+/// A judge of the pool for a kind, its meshes made at `lattice` with cells `cell_px` pixels wide.
+pub fn pool_judge(lattice: vec3, cell_px: f32) -> PoolJudge {
+    var batches: Vec<MeshBatch> = Vec::new()
+    batches.push(mesh_batch(BATCH_BRICKS))
+    PoolJudge {
+        scratch: extract_scratch(BATCH_BRICKS, lattice, cell_px),
+        batches,
+        cold: Vec::new(),
+        stage: 0,
+        k: 0,
+        waited: 0,
+        reads: Vec::new(),
+        pooled_drawn: drawn(),
+        cold_drawn: drawn(),
+    }
+}
+
+impl PoolJudge {
+    /// A frame of the judge of `field` (named `what`) along `eyes` (a walk, then a turn) at
+    /// `width` × `height`; true once it has held the pooled mesh to the cold one (and said so),
+    /// and stopped the run if they differ.
+    pub fn frame<M: Field<Substance> + StateHash + GpuData>(
+        mut self,
+        field: M,
+        eyes: Vec<Eye>,
+        width: u32,
+        height: u32,
+        what: str,
+    ) -> bool {
+        if self.stage == 4 {
+            return true
+        }
+        let last = eyes[eyes.len() - 1]
+        self.scratch.begin_frame()
+        if self.stage <= 1 {
+            let eye = if self.k < eyes.len() { eyes[self.k] } else { last }
+            one(field).sync_batches(mut self.scratch, mut self.batches, 0, view(eye, width, height))
+            self.batches[0].maybe_queue_poll()
+            if self.k < eyes.len() {
+                self.k += 1
+                return false
+            }
+            self.stage = 1
+            if !self.batches[0].settled() {
+                self.waited += 1
+                if self.waited > SETTLE_FRAMES {
+                    panic(f"judge pool: {what}: the pooled mesh did not settle at the path's last eye: {self.batches[0].unsettled_why()}")
+                }
+                return false
+            }
+            if !self.batches[0].is_pooled() {
+                panic(f"judge pool: {what}: its mesh is not pooled, and there is no pool to judge")
+            }
+            let (eye, lip, reach) = self.batches[0].extraction_eye()
+            self.cold.push(mesh_batch(BATCH_BRICKS))
+            self.cold[0].extract_cut_cold(mut self.scratch, field, self.batches[0].drawn_cut(), eye, lip, reach)
+            self.cold[0].maybe_queue_poll()
+            self.stage = 2
+            self.waited = 0
+            return false
+        }
+        if self.stage == 2 {
+            self.cold[0].maybe_queue_poll()
+            if !self.cold[0].settled() {
+                self.waited += 1
+                if self.waited > SETTLE_FRAMES {
+                    panic(f"judge pool: {what}: the cold extraction of the pooled cut did not settle: {self.cold[0].unsettled_why()}")
+                }
+                return false
+            }
+            self.reads.push(self.batches[0].read_drawn())
+            self.reads.push(self.cold[0].read_drawn())
+            self.stage = 3
+            return false
+        }
+        let a = gather(mut self.reads[0], mut self.pooled_drawn, what)
+        let b = gather(mut self.reads[1], mut self.cold_drawn, what)
+        if !a || !b {
+            return false
+        }
+        let cut = self.batches[0].drawn_cut()
+        var coarsest = 0.0
+        for i in 0..cut.len() {
+            coarsest = max(coarsest, cut[i].cell)
+        }
+        let place_cell = max(coarsest * f32(BRICK), 1.0e-4)
+        let p = held_of(self.pooled_drawn, place_cell)
+        let c = held_of(self.cold_drawn, place_cell)
+        var faults: Vec<String> = Vec::new()
+        let dt = differ("triangles", p.tris, c.tris)
+        if dt.len() > 0 {
+            faults.push(take dt)
+        }
+        let de = differ("exact cells", p.exact, c.exact)
+        if de.len() > 0 {
+            faults.push(take de)
+        }
+        let dq = differ("outline records", p.quads, c.quads)
+        if dq.len() > 0 {
+            faults.push(take dq)
+        }
+        if p.stray > 0 || c.stray > 0 {
+            faults.push(f"records naming no vertex: pooled {p.stray}, cold {c.stray}")
+        }
+        if p.flat != c.flat {
+            faults.push(f"triangles with two corners at one place: pooled {p.flat}, cold {c.flat}")
+        }
+        if faults.len() > 0 {
+            var said = String::new()
+            for k in 0..faults.len() {
+                said.push_str(f"; {faults[k]}")
+            }
+            panic(f"judge pool: {what}: the pooled mesh after {eyes.len()} eyes is not the cold extraction of its cut{said}")
+        }
+        print(f"judge pool: {what}: after {eyes.len()} eyes (a walk and a turn), the pooled mesh of {cut.len()} levels is the cold extraction of its cut: {p.tris.count} triangles, {p.exact.count} exact cells, {p.quads.count} outline records, hash {p.tris.sum ^ p.exact.sum ^ p.quads.sum}")
+        self.stage = 4
+        true
+    }
+}

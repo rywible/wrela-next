@@ -49,7 +49,7 @@ use std::derive::{Affine3, Box3}
 use std::field::{DualQuat, Field, Live, Pruned, Rigid}
 use std::gpu::{
     AppendBuffer, DispatchArgs, DrawIndexedArgs, GpuBuffer, GpuSpan, append_buffer, buffer,
-    buffer_of, copy, dispatch, kernel_work, label, limits, read_settled, write,
+    buffer_of, copy, dispatch, kernel_work, label, limits, read, read_settled, write,
 }
 use std::hash::{Hasher, StateHash, state_hash}
 use std::io::Pending
@@ -712,6 +712,20 @@ pub struct MeshBatch {
     aabb_valid: bool,
     aabb_empty: bool,
     cached_aabb: Box3,
+}
+
+/// What a judge reads back of a batch's mesh (`MeshBatch::read_drawn`), each answered later.
+pub struct DrawnRead {
+    pub counts: Pending<u32>,
+    pub verts: Pending<MeshVertex>,
+    pub indices: Pending<u32>,
+    pub exact: Pending<ExactCell>,
+    pub exact_base: Pending<u32>,
+    pub quads: Pending<vec4u>,
+    pub quad_count: Pending<u32>,
+    pub slots: Pending<u32>,
+    pub alive: Pending<u32>,
+    pub quad_indices: Pending<u32>,
 }
 
 /// Creates a lazy `MeshBatch` (minimal initial buffers; grows cleanly on demand up to `max_bricks`).
@@ -1839,6 +1853,100 @@ impl MeshBatch {
         self.stat_reads = 0
         self.stat_bricks = 0
         out
+    }
+
+    /// Whether this batch draws a pooled mesh (`mesh::pool`).
+    pub fn is_pooled(self) -> bool {
+        self.pooled
+    }
+
+    /// The cut this batch last extracted for (its nested grids): the drawn cut once `settled`.
+    pub fn drawn_cut(self) -> Vec<GridSpec> {
+        self.lod_fit.clone()
+    }
+
+    /// The eye, the steepness and the eye's reach its last extraction was made for
+    /// (`run_extract`'s and `run_pool_update`'s `exact_eye`, `lip`, `eye_reach`).
+    pub fn extraction_eye(self) -> (vec4, f32, f32) {
+        (self.exact_eye, self.exact_lip, self.eye_reach)
+    }
+
+    /// Extracts `cut` (nested grids) of `field` cold, by the one extraction of every batch that is
+    /// not a pool (`run_extract`), for the eye `exact_eye`: what a pool's mesh of the same cut is
+    /// held to (`judge::pool`).
+    pub fn extract_cut_cold<M: Field<Substance> + StateHash + GpuData>(
+        mut self,
+        scratch: mut ExtractScratch,
+        field: M,
+        cut: Vec<GridSpec>,
+        exact_eye: vec4,
+        lip: f32,
+        eye_reach: f32,
+    ) {
+        var total: u32 = 0
+        var has_seams = false
+        for i in 0..cut.len() {
+            let g = cut[i]
+            total += g.dims.x * g.dims.y * g.dims.z
+            if g.seam_mask != 0 {
+                has_seams = true
+            }
+        }
+        let things = cut.len()
+        self.lod_fit = cut.clone()
+        scratch.set_grids(cut)
+        write(mut self.xforms, 0, [Rigid::identity()])
+        write(mut self.prev_xforms, 0, [Rigid::identity()])
+        write(mut self.inst_ids, 0, [0])
+        self.prev_xforms_dirty = false
+        self.is_skinned = false
+        self.is_deformed = false
+        self.is_rigid_cached = false
+        self.extracted_xform = Rigid::identity()
+        self.instanced = false
+        self.inst_count = 1
+        let fbuf = buffer_of([field])
+        self.run_extract(
+            mut scratch,
+            fbuf.items(),
+            sample: field,
+            things: things,
+            total_bricks: total,
+            inst_count: 1,
+            has_seams: has_seams,
+            fc: frustum_cull_none(),
+            extra_bricks: 0,
+            exact_eye: exact_eye,
+            lip: lip,
+            eye_reach: eye_reach,
+            field_key: 0,
+        )
+        self.built = true
+        self.still_frames = 0
+    }
+
+    /// Reads back what this batch draws, for a judge (`judge::pool`): its counts (`tri_count`),
+    /// its vertices, its opaque draw's indices, its exact cells and how many its extraction made
+    /// (`exact_base`: the outline's of a frame follow them), its outline records, its slots'
+    /// bricks and which are alive, and the indices the records name (a pool's arena, else the
+    /// draw's), each whole: the judge takes what the counts say of each.
+    pub fn read_drawn(self) -> DrawnRead {
+        DrawnRead {
+            counts: read(self.tri_count.items()),
+            verts: read(self.verts.items().sub(start: 0, count: self.cap_verts)),
+            indices: read(self.indices.items().sub(start: 0, count: self.cap_indices)),
+            exact: read(self.exact_cells.items().sub(start: 0, count: max(self.cap_exact, 1))),
+            exact_base: read(self.exact_base.items()),
+            quads: read(self.quad_recs.items().sub(start: 0, count: self.watch_quads_cap)),
+            quad_count: read(self.quad_recs.count()),
+            slots: read(self.slot_bricks.items()),
+            alive: read(self.brick_alive.items()),
+            quad_indices: if self.pooled {
+                read(self.pool_indices.items().sub(start: 0, count: self.pool_idx_cap))
+            } else {
+                read(self.indices.items().sub(start: 0, count: self.cap_indices))
+            },
+        }
     }
 
     /// Sticky `OVERFLOW_*` bitflags reported by the latest settled extraction (`0` = no truncation).
