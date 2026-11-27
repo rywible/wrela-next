@@ -673,7 +673,12 @@ Purpose: each source that phase 0 permits becomes poses of our bodies.
 
 ### Done when
 
-- Not met: each permitted source is imported. Imported: 100STYLE and MPI EMBM. Downloaded and not
+- Not met: each permitted source is imported. Imported: 100STYLE, MPI EMBM, CeTI-Age-Kinematics
+  and (2026-11-27) ACCAD's Open Motion Project (296 clips, 29 minutes of three performers: Male 2's
+  strikes, blocks, dodges and kicks are the nearest capture to a cast, a parry and a dodge; each
+  performer's skeleton at rest as in its first frame of standing, its rotations all 0 no pose of a
+  person; mapped joints 79 mm from the capture's at the median, its three spine bones at other
+  heights than the human's and the legs' turns from standing pulling against the feet's places). Downloaded and not
   imported: CeTI-Age-Kinematics (BVH of reaches and daily tasks, 3.1 GB, in `.movement/capture`).
   Not imported, as each needs a reader this tool doesn't have yet: the FBX sets (Rocketbox, the
   sign archive, the Lanna dances), the C3D marker sets (karate, MHAD) and the CSV and Xsens sets.
@@ -1018,6 +1023,42 @@ removes the faults of the retarget: slide, penetration and forces that cannot oc
   physics filtering cut root residual by 58–87% (0.047–0.186 down to 0.013–0.024 of weight),
   torque past strength by 64–91% (down to 0.007–0.016), run slide by 43% (1,093 down to 624 mm/s),
   and turn float from 29 mm to 0 mm.
+- Not done (a review of 2026-11-27): the line above judged four clips on two measures. The test
+  clips followed to their ends are 87.9% (the target 95%), and `p4h-12`'s filtered capture fails
+  three targets the retargeted capture keeps, which every net trained on it learned
+  (`amp-walk`, `amp-walk2`, `human7`, `human8`):
+  - It shakes. 83 to 99% of its joints' speed's power is above 6 Hz (the capture 0.6 to 2.4%),
+    at 6.5 to 7.5 Hz: a quarter of the tracker's rate. The servos alone do not: with the root held
+    on the clip's path and each servo's target the clip's, 1.9 to 2.1% (`p4h-12`'s model and the
+    new one). The cause is the net's loop. It now reads its last action and pays for changing
+    it (`--read-last`, `--rate-weight`); the judge measures it (tremor, below).
+  - It penetrates the floor 7 to 15 mm on average (the target 2.6). Two causes, both the
+    simulator's model: each part was a capsule of its two radii's mean, which left the heel's
+    flesh 5.5 mm under the surface that carried it, and a contact of 20 ms (the least at steps of
+    1/120 s) is stiff in acceleration, so a light segment (a toe, 57 g) carrying the body's weight
+    sank 6 mm in a walk and 11 in a run. The export now collides each cone as the judge measures
+    it (a capsule of its smaller radius and spheres at its larger end and middle), steps at
+    1/240 s with contacts of 10 ms and a floor margin of 0.5 mm (`sim-human5`): `p4h-12`'s tracker
+    on it, untrained there, 3.0, 4.6 and 0.7 mm on a walk, a run and a task of CeTI (it was 10.9,
+    15.4 and 7.4), the simulator's own depth and the judge's equal to 0.01 mm.
+  - Its joints leave the body's ranges by up to 0.25 rad (the capture's 95th percentile 0.014):
+    each hinge had 0.1 rad more range than the body and its servo's target 0.6 rad past that,
+    and a ball joint's three hinges hold a box of Euler angles that holds its cone of swing and
+    more. The hinges now have the body's ranges and the servos' targets are held within them
+    (0.22 to 0.11 rad on the walk); the tracker reads each ball joint's range from the model
+    (`ball_s{segment}`), works out the body's numbers as the engine does (exact to the judge's,
+    to the fourth decimal on every joint of a run) and its reward falls with the distance past
+    them (`--range-weight`).
+  - `p4h-13` fine-tunes `p4h-12` on `sim-human5` with all three, the soles held where the clip
+    plants them (`--sole-weight`), and records each frame's action, servo forces and contact
+    forces beside the filtered capture (`filtered_extra.bin`; the floor's upward force 720 N
+    under a body of 716 N standing). At its start on the new model `p4h-12`'s weights follow
+    85.1% of the training clips for 20 s.
+- The phase's check (`tools/movement/judge -- human check`, `--read filtered=` the filtered poses,
+  `--read targets=tools/movement/judge/targets`): every filtered clip judged beside its capture,
+  each measure's share in its target, the share of each set followed to its end; the phase is
+  done when the tracker follows 95% of each set to the end and the filtered capture keeps 95% of
+  its clips in each target.
 
 ### Done when
 
