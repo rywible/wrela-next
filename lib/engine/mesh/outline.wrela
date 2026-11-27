@@ -1,0 +1,484 @@
+// The outline's exact cells, found each frame for the eye of that frame from what an extraction
+// kept, so a mesh is extracted for no eye: its bricks, quads and certificates are the same from
+// every eye, and only the cells beside its outline (which an eye sees edge-on, where a mesh can
+// miss a pixel the field covers) change as the eye moves.
+//
+// An extraction keeps (`MeshBatch`'s watched state):
+//   - each opaque quad it drew (`QuadRec`: where its indices are, its brick's slot, its four
+//     cells and how they wind),
+//   - each brick's slot (`SlotBrick`: its first corner's place on the lattice, its cell, the
+//     parts live in it),
+//   - each cell of a brick all of whose corners are outside (`SLOT_OUT`, one bit a cell),
+//   - each all-outside cell near the surface with no surface beside it (`thin_keep`: a wand, a
+//     tip, a crest Dual Contouring meshes none of), and the cells it gave exact cells for the eye
+//     of no frame (folded quads, quads not drawn, seams).
+// Each frame with a new eye (`outline_quads` onward): each kept quad on the outline for that eye
+// puts its cells up for a certificate (held in `vert_cert` by its vertex, reused while the eye's
+// pixel there is no finer than the one it was made for), and each all-outside cell beside one,
+// and each kept thin cell, has its core asked of the field; what nothing proves gets an exact
+// cell, after the extraction's own.
+
+use matter::certify::certify_sheet
+use matter::substance::Substance
+use mesh::dc::{HOLE_PX, QUAD_OUTLINE, decode_cell, finer_than_a_hole, on_outline}
+use mesh::grid::{ActiveBrick, BRICK, ExactCell, GridSpec, MeshVertex, NONE, cell_live, unpack_oct_normal}
+use std::derive::Box3
+use std::field::{Field, Live}
+use std::gpu::{Append, Atomics, GlobalId, Slots}
+
+/// An opaque quad an extraction drew: `x` where its six indices begin, `y` its brick's slot (bits
+/// 0..30), whether its cells wind against their order (bit 30: `quad_order`'s `flip`) and its
+/// split (bit 31: `split_13`), `z` its first three cells (9 bits each, `x + 7y + 49z` in the
+/// brick) and `w` its fourth, in the order of their vertices before `flip`.
+pub type QuadRec = vec4u
+
+/// A brick's slot: its first corner on the lattice (`grid::lattice`'s index, the grid's
+/// `cell_offset` with it), its cell, the thing of its batch it is of (`GridSpec::orig_id`), and
+/// the parts live in it.
+pub struct SlotBrick: Copy + GpuData {
+    pub base: vec3u,
+    pub cell: f32,
+    pub live: Live,
+    pub orig: u32,
+    pub pad0: u32,
+    pub pad1: u32,
+    pub pad2: u32,
+}
+
+/// The words a slot keeps of its cells (343 of them, a bit each, 11 words): those all of whose
+/// corners are outside (`SLOT_OUT`), and this frame's outline cells (`SLOT_LINE`), cells given an
+/// exact cell (`SLOT_EXACT`) and outline cells put up for a certificate (`SLOT_CERT`).
+pub const SLOT_WORDS: u32 = 44
+pub const SLOT_OUT: u32 = 0
+pub const SLOT_LINE: u32 = 11
+pub const SLOT_EXACT: u32 = 22
+pub const SLOT_CERT: u32 = 33
+
+/// How much finer a pixel than the one a certificate or a thin cell's proof was made for the eye
+/// may come before it is made again: each is made for `WATCH_SLACK` of the pixel it is first
+/// needed for, so an eye coming nearer does not ask again each frame.
+pub const WATCH_SLACK: f32 = 1.0
+
+/// The place of corner `c` (in a brick, `0..8`) of the brick in slot `s`: `grid::lattice`'s sum,
+/// bit for bit.
+pub fn slot_corner(s: SlotBrick, origin: vec3, shift: vec3, c: vec3u) -> vec3 {
+    let n = s.base + c
+    origin + vec3(f32(n.x), f32(n.y), f32(n.z)) * s.cell + shift
+}
+
+/// Cell `k` (`x + 7y + 49z`) as its three coordinates.
+fn cell3(k: u32) -> vec3u {
+    let (x, y, z) = decode_cell(k)
+    vec3u(x, y, z)
+}
+
+/// Sets bit `cell` of a slot's set `set` (`SLOT_*`), and says whether it was clear.
+fn mark(bits: mut Atomics<u32>, slot: u32, set: u32, cell: u32) -> bool {
+    let word = slot * SLOT_WORDS + set + (cell >> 5)
+    let bit = 1 << (cell & 31)
+    (bits.or(i: word, value: bit) & bit) == 0
+}
+
+fn marked(bits: mut Atomics<u32>, slot: u32, set: u32, cell: u32) -> bool {
+    (bits.load(i: slot * SLOT_WORDS + set + (cell >> 5)) & (1 << (cell & 31))) != 0
+}
+
+/// Clears this frame's sets of each live slot (`SLOT_LINE`, `SLOT_EXACT`, `SLOT_CERT`).
+@strict
+@compute(64)
+pub(package) fn clear_watch(slots: u32, bits: mut Atomics<u32>, id: GlobalId) {
+    let per = SLOT_WORDS - SLOT_LINE
+    let s = id.x / per
+    if s >= slots {
+        return
+    }
+    bits.store(i: s * SLOT_WORDS + SLOT_LINE + (id.x - s * per), value: 0)
+}
+
+/// Gives cell `cell` of slot `slot` an exact cell, once a frame.
+fn exact_once<M: Field<Substance>>(
+    f: M,
+    s: SlotBrick,
+    slot: u32,
+    cell: u32,
+    origin: vec3,
+    shift: vec3,
+    bits: mut Atomics<u32>,
+    exact_cells: mut Append<ExactCell>,
+) {
+    if mark(mut bits, slot, SLOT_EXACT, cell) {
+        let lo = slot_corner(s, origin, shift, cell3(cell))
+        let _ = exact_cells.push(ExactCell { lo, h: s.cell, live: cell_live(f, lo, s.cell, s.live) })
+    }
+}
+
+/// Each kept quad (`QuadRec`) of a live slot, held to the eye `eye` (`xyz` its place, `w` its
+/// pixel's width a metre out): on the outline (`on_outline`, the eye this frame's alone) and not
+/// finer than a hole there, its four cells are this frame's outline cells (`SLOT_LINE`), each
+/// put up for a certificate once (`cert_cands`: `(slot << 9 | cell, vertex)`), and each of its
+/// all-outside face neighbours in the brick (`SLOT_OUT`) put up as a thin candidate
+/// (`thin_cands`: `slot << 9 | cell`), for what of the field reaches past the outline.
+@strict
+@compute(64)
+pub(package) fn outline_quads(
+    quads: [QuadRec],
+    quad_count: [u32],
+    cap_quads: u32,
+    indices: [u32],
+    verts: [MeshVertex],
+    slots: [SlotBrick],
+    alive: [u32],
+    origin: vec3,
+    shift: vec3,
+    eye: vec4,
+    bits: mut Atomics<u32>,
+    cert_cands: mut Append<vec2u>,
+    thin_cands: mut Append<u32>,
+    id: GlobalId,
+) {
+    let qi = id.x
+    if qi >= min(quad_count[0], cap_quads) {
+        return
+    }
+    let q = quads[qi]
+    let slot = q.y & 1073741823
+    if alive[slot] == 0 {
+        return
+    }
+    let flip = ((q.y >> 30) & 1) != 0
+    let split13 = (q.y >> 31) != 0
+    // The quad's corners as stored (`store_quad`): (a, b, c, a, c, d), its corners (q0..q3)
+    // `(d, a, b, c)` where it is split along `q1–q3`, else `(a, b, c, d)`.
+    let a = indices[q.x]
+    let b = indices[q.x + 1]
+    let c = indices[q.x + 2]
+    let d = indices[q.x + 5]
+    let (q0, q1, q2, q3) = if split13 { (d, a, b, c) } else { (a, b, c, d) }
+    let v0 = verts[q0]
+    let v1 = verts[q1]
+    let v2 = verts[q2]
+    let v3 = verts[q3]
+    let p0 = vec3(v0.px, v0.py, v0.pz)
+    let p1 = vec3(v1.px, v1.py, v1.pz)
+    let p2 = vec3(v2.px, v2.py, v2.pz)
+    let p3 = vec3(v3.px, v3.py, v3.pz)
+    let kind = on_outline(
+        p0,
+        p1,
+        p2,
+        p3,
+        unpack_oct_normal(v0.packed),
+        unpack_oct_normal(v1.packed),
+        unpack_oct_normal(v2.packed),
+        unpack_oct_normal(v3.packed),
+        split13: split13,
+        e: eye.xyz,
+        reach: 0.0,
+    )
+    if kind != QUAD_OUTLINE {
+        return
+    }
+    let s = slots[slot]
+    let cs = [q.z & 511, (q.z >> 9) & 511, (q.z >> 18) & 511, q.w & 511]
+    if finer_than_a_hole(slot_corner(s, origin, shift, cell3(cs[0])), s.cell, eye) {
+        return
+    }
+    // The vertices of the cells, in the cells' order (`quad_order` undone).
+    let vs = if flip { [q0, q3, q2, q1] } else { [q0, q1, q2, q3] }
+    for k in 0..4 {
+        let cell = cs[k]
+        if mark(mut bits, slot, SLOT_LINE, cell) {
+            if mark(mut bits, slot, SLOT_CERT, cell) {
+                let _ = cert_cands.push(vec2u((slot << 9) | cell, vs[k]))
+            }
+            let (cx, cy, cz) = decode_cell(cell)
+            for f in 0..6 {
+                let axis = f >> 1
+                let up = (f & 1) == 1
+                let at = if axis == 0 { cx } else if axis == 1 { cy } else { cz }
+                if (up && at < BRICK) || (!up && at > 0) {
+                    let step = if axis == 0 { 1 } else if axis == 1 { 7 } else { 49 }
+                    let n = if up { cell + step } else { cell - step }
+                    if marked(mut bits, slot, SLOT_OUT, n) && mark(mut bits, slot, SLOT_LINE, n) {
+                        let _ = thin_cands.push((slot << 9) | n)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Each outline cell put up for a certificate (`outline_quads`): certified (`certify_sheet`, the
+/// surface in the cell within a slab a pixel wide about its vertex's plane) for a pixel no finer
+/// than this frame's there, or given an exact cell. A vertex's certificate is kept in `vert_cert`
+/// as the slab's width it was made for (or that width less than 0 where it failed): one made for
+/// a slab no wider than this frame's needs holds, one that failed for a slab no narrower fails,
+/// and else it is made again, for `WATCH_SLACK` of this frame's.
+@strict
+@compute(64)
+pub(package) fn certify_watched<M: Field<Substance>>(
+    fields: [M],
+    slots: [SlotBrick],
+    verts: [MeshVertex],
+    cert_cands: [vec2u],
+    cert_count: [u32],
+    cap: u32,
+    first: u32,
+    origin: vec3,
+    shift: vec3,
+    eye: vec4,
+    vert_cert: mut Atomics<u32>,
+    bits: mut Atomics<u32>,
+    exact_cells: mut Append<ExactCell>,
+    id: GlobalId,
+) {
+    let i = first + id.x
+    if i >= min(cert_count[0], cap) {
+        return
+    }
+    let packed = cert_cands[i].x
+    let vi = cert_cands[i].y
+    let slot = packed >> 9
+    let cell = packed & 511
+    let s = slots[slot]
+    let lo = slot_corner(s, origin, shift, cell3(cell))
+    let px = length(eye.xyz - (lo + vec3(0.5 * s.cell))) * eye.w
+    let need = 2.0 * HOLE_PX * px
+    let f = fields[s.orig]
+    if vi != NONE {
+        let kept = bitcast_f32(vert_cert.load(i: vi))
+        if kept > 0.0 && kept <= need {
+            return
+        }
+        if !(kept < 0.0 && -kept >= need) {
+            let w = WATCH_SLACK * need
+            let v = verts[vi]
+            let ok = certify_sheet(
+                fields,
+                s.orig,
+                s.live,
+                lo,
+                s.cell,
+                vec3(v.px, v.py, v.pz),
+                unpack_oct_normal(v.packed),
+                w,
+            )
+            vert_cert.store(i: vi, value: bitcast_u32(if ok { w } else { -need }))
+            if ok {
+                return
+            }
+        }
+    }
+    exact_once(f, s, slot, cell, origin, shift, mut bits, mut exact_cells)
+}
+
+/// The core of cell `cell` of slot `s` for the eye `eye` (`filter_thin_cells`' core: the cell
+/// less a quarter pixel on every side), as its low corner and width; a width of 0 or less where
+/// the cell is thinner than a hole.
+fn watched_core(s: SlotBrick, origin: vec3, shift: vec3, cell: u32, eye: vec4) -> (vec3, f32) {
+    let lo = slot_corner(s, origin, shift, cell3(cell))
+    let px = length(eye.xyz - (lo + vec3(0.5 * s.cell))) * eye.w
+    let m = 0.5 * HOLE_PX * px
+    (lo + vec3(m), s.cell - 2.0 * m)
+}
+
+/// A thin candidate's first half (`filter_thin_cells`' for a kept slot): the core whole, and the
+/// octants its form doesn't clear into `thin_masks` (a slice's, by invocation). A kept candidate
+/// (`keep` true, from `thin_keep`) is first held to its last proof (`thin_proof`, the core's margin
+/// it was proven empty at: an eye whose margin there is no finer holds it).
+@strict
+@compute(64)
+pub(package) fn thin_watched<M: Field<Substance>>(
+    fields: [M],
+    slots: [SlotBrick],
+    alive: [u32],
+    cands: [u32],
+    order: [u32],
+    count: [u32],
+    cap: u32,
+    first: u32,
+    origin: vec3,
+    shift: vec3,
+    eye: vec4,
+    keep: u32,
+    thin_proof: mut Atomics<u32>,
+    thin_masks: mut Slots<u32>,
+    id: GlobalId,
+) {
+    let i = first + id.x
+    thin_masks[id] = 0
+    if i >= min(count[0], cap) {
+        return
+    }
+    // A kept cell's place in `thin_keep` (from `thin_due`'s list), or the beside cell's own.
+    let at = if keep != 0 { order[i] } else { i }
+    let packed = cands[at]
+    if alive[packed >> 9] == 0 {
+        return
+    }
+    let s = slots[packed >> 9]
+    let cell = packed & 511
+    let (lo, w) = watched_core(s, origin, shift, cell, eye)
+    if w <= 0.0 {
+        return
+    }
+    let m = 0.5 * (s.cell - w)
+    // Asked for `WATCH_SLACK` of this frame's margin: a wider core, held by eyes nearer still.
+    let mt = WATCH_SLACK * m
+    let lt = lo - vec3(m - mt)
+    let wt = w + 2.0 * (m - mt)
+    let af = fields[s.orig].slope_affine(Box3 { lo: lt, hi: lt + vec3(wt) }, s.live)
+    var mask: u32 = 0
+    if af.lo() <= 0.0 {
+        for j in 0..8 {
+            if af.octant_range(j).lo <= 0.0 {
+                mask = mask | (u32(1) << j)
+            }
+        }
+    }
+    if keep != 0 {
+        // Proven empty for now, until an octant (`thin_watched_octants`) finds it isn't.
+        thin_proof.store(i: at, value: bitcast_u32(mt))
+    }
+    thin_masks[id] = mask
+}
+
+/// The second half: an octant of a candidate's core an invocation (eight a candidate), each the
+/// octant's own enclosure where the whole's form didn't clear it; an exact cell for a candidate
+/// one of whose octants the field's enclosure can't prove empty (and its proof undone).
+@strict
+@compute(64)
+pub(package) fn thin_watched_octants<M: Field<Substance>>(
+    fields: [M],
+    slots: [SlotBrick],
+    alive: [u32],
+    cands: [u32],
+    order: [u32],
+    count: [u32],
+    cap: u32,
+    thin_masks: [u32],
+    first: u32,
+    origin: vec3,
+    shift: vec3,
+    eye: vec4,
+    keep: u32,
+    thin_proof: mut Atomics<u32>,
+    bits: mut Atomics<u32>,
+    exact_cells: mut Append<ExactCell>,
+    id: GlobalId,
+) {
+    let i = first + id.x / 8
+    let j = id.x % 8
+    if i >= min(count[0], cap) {
+        return
+    }
+    if ((thin_masks[id.x / 8] >> j) & 1) == 0 {
+        return
+    }
+    let at = if keep != 0 { order[i] } else { i }
+    let packed = cands[at]
+    let slot = packed >> 9
+    if alive[slot] == 0 {
+        return
+    }
+    let cell = packed & 511
+    let s = slots[slot]
+    let (lo, w) = watched_core(s, origin, shift, cell, eye)
+    let m = 0.5 * (s.cell - w)
+    let mt = WATCH_SLACK * m
+    let lt = lo - vec3(m - mt)
+    let wt = w + 2.0 * (m - mt)
+    let o = lt + vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * (0.5 * wt)
+    let f = fields[s.orig]
+    let af = f.slope_affine(Box3 { lo: o, hi: o + vec3(0.5 * wt) }, s.live)
+    if af.lo() <= 0.0 {
+        if keep != 0 {
+            thin_proof.store(i: at, value: 0)
+        }
+        exact_once(f, s, slot, cell, origin, shift, mut bits, mut exact_cells)
+    }
+}
+
+/// Each active brick of a chunk (`chunk_start` on) of a held mesh: its slot (`SlotBrick`, into
+/// `slots`, the chunk's span of them), and its cells' all-outside bits cleared, for
+/// `classify_cells` to set (`SLOT_OUT`, the slot `slot_base + chunk_start` on).
+@strict
+@compute(64)
+pub(package) fn keep_slots(
+    grids: [GridSpec],
+    active: [ActiveBrick],
+    active_count: [u32],
+    cap_bricks: u32,
+    chunk_start: u32,
+    slot_base: u32,
+    slots: mut Slots<SlotBrick>,
+    bits: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let bi = chunk_start + id.x
+    if bi >= min(active_count[0], cap_bricks) {
+        return
+    }
+    let ab = active[bi]
+    let g = grids[ab.coord.w]
+    slots[id] = SlotBrick {
+        base: ab.coord.xyz * BRICK + g.cell_offset,
+        cell: g.cell,
+        live: ab.live,
+        orig: g.orig_id,
+        pad0: 0,
+        pad1: 0,
+        pad2: 0,
+    }
+    let slot = slot_base + bi
+    for w in 0..11 {
+        bits.store(i: slot * SLOT_WORDS + SLOT_OUT + w, value: 0)
+    }
+}
+
+/// Zeroes `words`.
+@strict
+@compute(64)
+pub(package) fn clear_words(words: mut Slots<u32>, id: GlobalId) {
+    words[id] = 0
+}
+
+/// Each kept thin cell (`thin_keep`) of a live slot whose last proof (`thin_proof`) doesn't hold
+/// for the eye `eye` (or that has none), put up to be asked again this frame (`due`: its place in
+/// `thin_keep`): a cheap pass over every kept cell, so the asking is of the few the eye's move
+/// left unproven.
+@strict
+@compute(64)
+pub(package) fn thin_due(
+    cands: [u32],
+    count: [u32],
+    cap: u32,
+    slots: [SlotBrick],
+    alive: [u32],
+    origin: vec3,
+    shift: vec3,
+    eye: vec4,
+    thin_proof: [u32],
+    due: mut Append<u32>,
+    id: GlobalId,
+) {
+    let i = id.x
+    if i >= min(count[0], cap) {
+        return
+    }
+    let packed = cands[i]
+    if alive[packed >> 9] == 0 {
+        return
+    }
+    let s = slots[packed >> 9]
+    let (_, w) = watched_core(s, origin, shift, packed & 511, eye)
+    if w <= 0.0 {
+        return
+    }
+    let m = 0.5 * (s.cell - w)
+    let proven = bitcast_f32(thin_proof[i])
+    if proven > 0.0 && proven <= m {
+        return
+    }
+    let _ = due.push(i)
+}

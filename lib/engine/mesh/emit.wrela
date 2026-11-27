@@ -4,7 +4,7 @@
 use matter::certify::certify_sheet
 use matter::substance::Substance
 use mesh::dc::{
-    CERT_MARKS, CREASE_STEPS, CellCorners, CreaseSolve, HOLE_PX, OUTLINE_MARKS, QUAD_FOLDED,
+    CREASE_STEPS, CellCorners, CreaseSolve, HOLE_PX, QUAD_FOLDED,
     QUAD_OUTLINE, QUAD_SPAN, Qef, cdist, claim_exact_cell, crease_part, crease_start, crease_step_cost_of,
     crease_steps, decode_cell, vertex_meta, finer_than_a_hole, hidden_crease, is_crease, on_outline, solve_cell,
     trilinear_qef,
@@ -147,8 +147,8 @@ fn quad_opaque_count(v0: u32, v1: u32, v2: u32, v3: u32, verts: [MeshVertex]) ->
 
 /// Emits one quad into its brick's contiguous opaque index slice (`brick_idx_offsets[brick] +
 /// atomic brick_idx_counts[brick]`), routing transmissive/cut quads to `trans_indices`/`cut_indices`.
-/// Returns what the quad is to the picture's cover (`mesh::proof::QuadCover`), held to
-/// `exact_eye`: the caller takes each case (`cover_quad`).
+/// Returns what the quad is to the picture's cover (`mesh::proof::QuadCover`), in a mesh `held`
+/// by the exact pass or not: the caller takes each case (`cover_quad`).
 fn emit_quad_brick(
     v0: u32,
     v1: u32,
@@ -156,9 +156,7 @@ fn emit_quad_brick(
     v3: u32,
     flip: bool,
     brick_in_chunk: u32,
-    exact_eye: vec4,
-    eye_reach: f32,
-    cell_lo: vec3,
+    held: bool,
     h: f32,
     verts: [MeshVertex],
     cap_indices: u32,
@@ -200,6 +198,7 @@ fn emit_quad_brick(
                 store_quad(mut indices, at, q0, q1, q2, q3, split13: split13, local: local)
                 return quad_cover(
                     local,
+                    at,
                     p0,
                     p1,
                     p2,
@@ -209,10 +208,7 @@ fn emit_quad_brick(
                     n2,
                     n3,
                     split13: split13,
-                    cell_lo: cell_lo,
-                    h: h,
-                    eye: exact_eye,
-                    reach: eye_reach,
+                    held: held,
                 )
             },
             None => {
@@ -565,8 +561,8 @@ pub(package) fn emit_tris(
     cap_trans: u32,
     chunk_start: u32,
     brick_off: u32,
-    exact_eye: vec4,
-    eye_reach: f32,
+    held: u32,
+    slot_base: u32,
     corners: [f32],
     cell_verts: [u32],
     verts: [MeshVertex],
@@ -578,7 +574,7 @@ pub(package) fn emit_tris(
     cut_indices: mut Atomics<u32>,
     exact_seen: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
-    cert_cands: mut Append<vec2u>,
+    quad_recs: mut Append<vec4u>,
     id: GlobalId,
 ) {
     // 4 workgroups of 64 = 256 lanes per brick (covering 216 owned edge triples).
@@ -615,9 +611,7 @@ pub(package) fn emit_tris(
                 vs[3],
                 flip: d0 >= 0.0,
                 brick_in_chunk: brick_in_chunk,
-                exact_eye: exact_eye,
-                eye_reach: eye_reach,
-                cell_lo: brick_corner(g, ab.coord.xyz, min(min(e.c0, e.c1), min(e.c2, e.c3))),
+                held: held != 0,
                 h: g.cell,
                 verts: verts,
                 cap_indices: cap_indices,
@@ -632,120 +626,82 @@ pub(package) fn emit_tris(
             cover_quad(
                 cover,
                 [e.c0, e.c1, e.c2, e.c3],
-                vs,
-                bi,
+                d0 >= 0.0,
+                slot_base + bi,
+                held != 0,
                 g,
                 ab.coord.xyz,
                 ab.live,
                 brick_in_chunk,
-                exact_eye,
                 mut exact_seen,
                 mut exact_cells,
-                mut cert_cands,
+                mut quad_recs,
             )
         }
     }
 }
 
-/// Takes each case of a quad's cover (`QuadCover`) for its 4 cells `cs`: nothing more for one
-/// covered or not held; a certificate or an exact cell for one on the outline; an exact cell for
-/// one folded or not drawn (where there is an eye to solve it for).
+/// Takes each case of a quad's cover (`QuadCover`) for its 4 cells `cs` (local to the brick at
+/// `b` of grid `g`, whose slot is `slot`; `vs` their vertices, wound as `flip` says): nothing
+/// more for one not held; kept for each frame's eye (`mesh::outline::QuadRec`) for one held;
+/// exact cells for one folded or not drawn (where it is held).
 fn cover_quad(
     cover: QuadCover,
     cs: [vec3u; 4],
-    vs: [u32; 4],
-    active_at: u32,
+    flip: bool,
+    slot: u32,
+    held: bool,
     g: GridSpec,
     b: vec3u,
     live: Live,
     brick_in_chunk: u32,
-    exact_eye: vec4,
     exact_seen: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
-    cert_cands: mut Append<vec2u>,
+    quad_recs: mut Append<vec4u>,
 ) {
     match cover {
-        QuadCover::Covered(_) => {},
         QuadCover::Unheld => {},
-        QuadCover::Outline => {
-            box_outline(
-                cs,
-                vs,
-                QUAD_OUTLINE,
-                active_at,
-                g,
-                b,
-                live,
-                brick_in_chunk,
-                mut exact_seen,
-                mut exact_cells,
-                mut cert_cands,
+        QuadCover::Watched(at) => {
+            let k0 = cs[0].z * 49 + cs[0].y * 7 + cs[0].x
+            let k1 = cs[1].z * 49 + cs[1].y * 7 + cs[1].x
+            let k2 = cs[2].z * 49 + cs[2].y * 7 + cs[2].x
+            let k3 = cs[3].z * 49 + cs[3].y * 7 + cs[3].x
+            let _ = quad_recs.push(
+                vec4u(
+                    at & 2147483647,
+                    slot | (if flip { 1073741824 } else { 0 }) | (at & 2147483648),
+                    k0 | (k1 << 9) | (k2 << 18),
+                    k3,
+                ),
             )
         },
         QuadCover::Folded => {
-            box_outline(
-                cs,
-                vs,
-                QUAD_FOLDED,
-                active_at,
-                g,
-                b,
-                live,
-                brick_in_chunk,
-                mut exact_seen,
-                mut exact_cells,
-                mut cert_cands,
-            )
+            box_cells(cs, g, b, live, brick_in_chunk, mut exact_seen, mut exact_cells)
         },
         QuadCover::Unsound => {
-            if exact_eye.w > 0.0 {
-                box_outline(
-                    cs,
-                    vs,
-                    QUAD_FOLDED,
-                    active_at,
-                    g,
-                    b,
-                    live,
-                    brick_in_chunk,
-                    mut exact_seen,
-                    mut exact_cells,
-                    mut cert_cands,
-                )
+            if held {
+                box_cells(cs, g, b, live, brick_in_chunk, mut exact_seen, mut exact_cells)
             }
         },
     }
 }
 
-/// An outline quad's 4 cells `cs` (local to the brick at `b` of grid `g`), each marked as on the
-/// outline (`OUTLINE_MARKS`, for `dilate_outline`): a folded quad's cells are given exact cells; an
-/// outline quad's are put up for a certificate, once each (`CERT_MARKS`, `certify_outline`), and
-/// given exact cells where none is proven.
-pub(package) fn box_outline(
+/// A quad's 4 cells `cs` (local to the brick at `b` of grid `g`) given exact cells, once each in
+/// their brick (`claim_exact_cell`): those of a quad folded or not drawn, from every eye.
+pub(package) fn box_cells(
     cs: [vec3u; 4],
-    vs: [u32; 4],
-    kind: u32,
-    active_at: u32,
     g: GridSpec,
     b: vec3u,
     live: Live,
     brick_in_chunk: u32,
     exact_seen: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
-    cert_cands: mut Append<vec2u>,
 ) {
     for k in 0..4 {
         let ck = cs[k]
         let cell = ck.z * 49 + ck.y * 7 + ck.x
-        let word = brick_in_chunk * 12 + (cell >> 5)
-        let bit = 1 << (cell & 31)
-        let _ = exact_seen.or(i: OUTLINE_MARKS + word, value: bit)
-        if kind == QUAD_FOLDED {
-            if claim_exact_cell(mut exact_seen, brick_in_chunk, cell) {
-                let _ = exact_cells.push(ExactCell { lo: brick_corner(g, b, ck), h: g.cell, live })
-            }
-        } else if (exact_seen.or(i: CERT_MARKS + word, value: bit) & bit) == 0 {
-            let _ = cert_cands.push(vec2u((active_at << 9) | cell, vs[k]))
+        if claim_exact_cell(mut exact_seen, brick_in_chunk, cell) {
+            let _ = exact_cells.push(ExactCell { lo: brick_corner(g, b, ck), h: g.cell, live })
         }
     }
 }
@@ -765,123 +721,6 @@ pub(package) fn note_seams(
         if seam_count[0] > tested {
             let _ = tri_count.add(i: 9, value: seam_count[0] - tested)
         }
-    }
-}
-
-/// Counts in `tri_count[9]` a batch's outline cells past what its `certify_outline` slices
-/// certify (`OVERFLOW_THIN`: those cells have neither a certificate nor an exact cell).
-@strict
-@compute(1)
-pub(package) fn note_uncertified(
-    cert_count: [u32],
-    tested: u32,
-    tri_count: mut Atomics<u32>,
-    id: GlobalId,
-) {
-    if id.x == 0 {
-        let _ = tri_count.max(i: 11, value: cert_count[0])
-        if cert_count[0] > tested {
-            let _ = tri_count.add(i: 9, value: cert_count[0] - tested)
-        }
-    }
-}
-
-/// After a batch's chunks (with exact cells): each outline cell put up for a certificate
-/// (`box_outline`) is certified (`certify_sheet`: the surface inside it provably in a slab two
-/// `HOLE_PX` (a pixel) wide parallel to the plane of its mesh vertex, which lies on the surface,
-/// so mesh and surface stand within a pixel of each other across it: what the hole audit holds an
-/// outline to), or given an exact cell, its pixels solved.
-@strict
-@compute(64)
-pub(package) fn certify_outline<M: Field<Substance>>(
-    fields: [M],
-    grids: [GridSpec],
-    active: [ActiveBrick],
-    verts: [MeshVertex],
-    cert_cands: [vec2u],
-    cert_count: [u32],
-    first: u32,
-    exact_eye: vec4,
-    exact_cells: mut Append<ExactCell>,
-    id: GlobalId,
-) {
-    let i = first + id.x
-    if i >= min(cert_count[0], CAP_SURF) {
-        return
-    }
-    let packed = cert_cands[i].x
-    let vi = cert_cands[i].y
-    let cell = packed & 511
-    let (cx, cy, cz) = decode_cell(cell)
-    let ab = active[packed >> 9]
-    let g = grids[ab.coord.w]
-    let h = g.cell
-    let cell_lo = brick_corner(g, ab.coord.xyz, vec3u(cx, cy, cz))
-    let live = ab.live
-    let px = length(exact_eye.xyz - (cell_lo + vec3(0.5 * h))) * exact_eye.w
-    if vi != NONE {
-        let v = verts[vi]
-        let at = vec3(v.px, v.py, v.pz)
-        let n = unpack_oct_normal(v.packed)
-        if certify_sheet(fields, g.orig_id, live, cell_lo, h, at, n, 2.0 * HOLE_PX * px) {
-            return
-        }
-    }
-    let _ = exact_cells.push(
-        ExactCell { lo: cell_lo, h, live: cell_live(fields[g.orig_id], cell_lo, h, live) },
-    )
-}
-
-/// Pass 3e (with exact cells): each wholly outside cell (all 8 corners) beside an outline cell
-/// (`box_outline`'s marks) across a face, not yet given an exact cell, as a candidate for one
-/// (`filter_thin_cells`, which gives it one where its core may hold surface). What of the field
-/// stands past the mesh's outline (a chord's sagitta; a tip or crest finer than a cell) lies in an
-/// outline cell or reaches into such a neighbour's core; a surface that only meets its face
-/// reaches less than a quarter pixel in, thinner than a hole. A neighbour with a corner inside is
-/// a surface cell, meshed, and an outline cell itself if the outline passes it.
-@strict
-@compute(64)
-pub(package) fn dilate_outline(
-    active_count: [u32],
-    cap_bricks: u32,
-    chunk_start: u32,
-    corners: [f32],
-    exact_seen: mut Atomics<u32>,
-    thin_cands: mut Append<u32>,
-    id: GlobalId,
-) {
-    let brick_in_chunk = id.x / 384
-    let cell = id.x - brick_in_chunk * 384
-    let bi = chunk_start + brick_in_chunk
-    if bi >= min(active_count[0], cap_bricks) || cell >= VERTS_BRICK {
-        return
-    }
-    let (cx, cy, cz) = decode_cell(cell)
-    let cbase = brick_in_chunk * CORNERS_BRICK
-    for j in 0..8 {
-        if cdist(corners, cbase, cx + (j & 1), cy + ((j >> 1) & 1), cz + (j >> 2)) < 0.0 {
-            return
-        }
-    }
-    if (exact_seen.load(i: brick_in_chunk * 12 + (cell >> 5)) & (1 << (cell & 31))) != 0 {
-        return
-    }
-    let marks = OUTLINE_MARKS + brick_in_chunk * 12
-    var beside = false
-    for a in 0..6 {
-        let axis = a >> 1
-        let up = (a & 1) == 1
-        let at = if axis == 0 { cx } else if axis == 1 { cy } else { cz }
-        if (up && at < 6) || (!up && at > 0) {
-            let step = if axis == 0 { 1 } else if axis == 1 { 7 } else { 49 }
-            let n = if up { cell + step } else { cell - step }
-            if (exact_seen.load(i: marks + (n >> 5)) & (1 << (n & 31))) != 0 {
-                beside = true
-            }
-        }
-    }
-    if beside {
-        let _ = thin_cands.push((brick_in_chunk << 9) | cell)
     }
 }
 
@@ -1232,7 +1071,6 @@ fn process_lod_edge(
     axis: u32,
     lp: vec3u,
     brick_in_chunk: u32,
-    active_at: u32,
     cbase: u32,
     vbase: u32,
     corners: [f32],
@@ -1250,11 +1088,11 @@ fn process_lod_edge(
     seam_cells: mut Append<SeamCell>,
     seam_verts: mut Atomics<u32>,
     live: Live,
-    exact_eye: vec4,
-    eye_reach: f32,
+    held: bool,
+    slot: u32,
     exact_seen: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
-    cert_cands: mut Append<vec2u>,
+    quad_recs: mut Append<vec4u>,
 ) {
     let ua = if axis == 0 { vec3u(1, 0, 0) } else if axis == 1 { vec3u(0, 1, 0) } else {
         vec3u(0, 0, 1)
@@ -1306,9 +1144,7 @@ fn process_lod_edge(
             vs[3],
             flip: flip,
             brick_in_chunk: brick_in_chunk,
-            exact_eye: exact_eye,
-            eye_reach: eye_reach,
-            cell_lo: brick_corner(g, b, l0),
+            held: held,
             h: g.cell,
             verts: verts,
             cap_indices: cap_indices,
@@ -1323,16 +1159,16 @@ fn process_lod_edge(
         cover_quad(
             cover,
             [l0, l1, l2, l3],
-            vs,
-            active_at,
+            flip,
+            slot,
+            held,
             g,
             b,
             live,
             brick_in_chunk,
-            exact_eye,
             mut exact_seen,
             mut exact_cells,
-            mut cert_cands,
+            mut quad_recs,
         )
         return
     }
@@ -1416,11 +1252,11 @@ pub(package) fn emit_tris_lod(
     seam_quads: mut Append<SeamQuad>,
     seam_cells: mut Append<SeamCell>,
     seam_verts: mut Atomics<u32>,
-    exact_eye: vec4,
-    eye_reach: f32,
+    held: u32,
+    slot_base: u32,
     exact_seen: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
-    cert_cands: mut Append<vec2u>,
+    quad_recs: mut Append<vec4u>,
     id: GlobalId,
 ) {
     let brick_in_chunk = brick_off + id.x / 256
@@ -1490,7 +1326,6 @@ pub(package) fn emit_tris_lod(
                     axis: axis,
                     lp: lp,
                     brick_in_chunk: brick_in_chunk,
-                    active_at: bi,
                     cbase: cbase,
                     vbase: vbase,
                     corners: corners,
@@ -1508,11 +1343,11 @@ pub(package) fn emit_tris_lod(
                     seam_cells: mut seam_cells,
                     seam_verts: mut seam_verts,
                     live: ab.live,
-                    exact_eye: exact_eye,
-                    eye_reach: eye_reach,
+                    held: held != 0,
+                    slot: slot_base + bi,
                     exact_seen: mut exact_seen,
                     exact_cells: mut exact_cells,
-                    cert_cands: mut cert_cands,
+                    quad_recs: mut quad_recs,
                 )
             }
         }

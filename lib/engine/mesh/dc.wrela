@@ -3,6 +3,7 @@
 // skinned vertex projection.
 
 use matter::substance::Substance
+use mesh::outline::{SLOT_OUT, SLOT_WORDS}
 use mesh::grid::{
     ActiveBrick, BRICK, CAP_SURF, CHUNK_BRICKS, CORNERS_BRICK, CREASE_DOT, CREASE_SLICE, cell_live,
     CREASE_SLICE_LEAST, ExactCell, FrustumCull, GridSpec, KEPT_TRANS, MeshVertex, NONE,
@@ -1154,14 +1155,6 @@ fn push_vertex<M: Field<Substance>>(
     }
 }
 
-/// Where in `ExtractScratch::exact_seen`, after each chunk brick's 12 words of claimed cells
-/// (`claim_exact_cell`), its 12 words of outline cells (`box_outline`) begin.
-pub(package) const OUTLINE_MARKS: u32 = CHUNK_BRICKS * 12
-
-/// Where in `ExtractScratch::exact_seen`, after the outline marks, each chunk brick's 12 words of
-/// cells put up for a certificate begin (`box_outline`: each cell once).
-pub(package) const CERT_MARKS: u32 = CHUNK_BRICKS * 24
-
 /// Atomically claims `(brick_in_chunk, cell)` in the 48 KB chunk-local deduplication bitset so
 /// every cell emits at most ONE Tier-2 `ExactCell` across `solve_verts`, `refine_creases`, and
 /// the outline's quads in `emit_tris`/`emit_tris_lod` (no cell drawn twice by one brick).
@@ -1202,9 +1195,12 @@ fn surface_beside(corners: [f32], base: u32, cx: u32, cy: u32, cz: u32) -> bool 
 }
 
 /// Pass 2a: Classifies every cell of a chunk (`7×7×7 = 343` per brick) from its 8 corner signs,
-/// clears its vertex slot and deduplication bit, appends sign-changing cells to `surf`, and appends
-/// all-positive owned cells whose minimum corner distance falls within `lip * half_diag` to
-/// `thin_cands` so sub-cell thin features (wands, tips, crests) are never dropped by Dual Contouring.
+/// clears its vertex slot and deduplication bit, and appends sign-changing cells to `surf`. In a
+/// mesh the exact pass holds (`held`), it also marks each all-outside cell in its slot's bits
+/// (`mesh::outline::SLOT_OUT`, the slot `slot_base` on), and keeps each all-positive owned cell
+/// whose least corner is within `lip * half_diag` of the surface with no surface beside it in
+/// `thin_keep` (`slot << 9 | cell`), so the sub-cell thin features Dual Contouring sees nothing
+/// of (wands, tips, crests) are solved for each frame's eye (`mesh::outline::thin_watched`).
 @strict
 @compute(64)
 pub(package) fn classify_cells(
@@ -1214,12 +1210,14 @@ pub(package) fn classify_cells(
     cap_bricks: u32,
     chunk_start: u32,
     lip: f32,
-    exact_eye: vec4,
+    held: u32,
+    slot_base: u32,
     corners: [f32],
     cell_verts: mut Slots<u32>,
     exact_seen: mut Atomics<u32>,
     surf: mut Append<u32>,
-    thin_cands: mut Append<u32>,
+    watch_bits: mut Atomics<u32>,
+    thin_keep: mut Append<u32>,
     id: GlobalId,
 ) {
     // 6 workgroups of 64 = 384 lanes per brick (covering 343 cells).
@@ -1232,8 +1230,6 @@ pub(package) fn classify_cells(
     }
     if (cell & 31) == 0 {
         exact_seen.store(i: brick_in_chunk * 12 + (cell >> 5), value: 0)
-        exact_seen.store(i: OUTLINE_MARKS + brick_in_chunk * 12 + (cell >> 5), value: 0)
-        exact_seen.store(i: CERT_MARKS + brick_in_chunk * 12 + (cell >> 5), value: 0)
     }
     cell_verts[id] = NONE
     let (cx, cy, cz) = decode_cell(cell)
@@ -1249,136 +1245,16 @@ pub(package) fn classify_cells(
     }
     if neg != 0 && neg != 8 {
         let _ = surf.push((brick_in_chunk << 9) | cell)
-    } else if neg == 0 && exact_eye.w > 0.0 && cx < BRICK && cy < BRICK && cz < BRICK {
-        let ab = active[bi]
-        let g = grids[ab.coord.w]
-        let thresh = max(lip, 1.0) * 0.8660254 * g.cell
-        if min_d <= thresh && !surface_beside(corners, cbase, cx, cy, cz) {
-            let cell_lo = brick_corner(g, ab.coord.xyz, vec3u(cx, cy, cz))
-            if !finer_than_a_hole(cell_lo, g.cell, exact_eye) {
-                let _ = thin_cands.push((brick_in_chunk << 9) | cell)
+    } else if neg == 0 && held != 0 {
+        let slot = slot_base + bi
+        let _ = watch_bits.or(i: slot * SLOT_WORDS + SLOT_OUT + (cell >> 5), value: 1 << (cell & 31))
+        if cx < BRICK && cy < BRICK && cz < BRICK {
+            let g = grids[active[bi].coord.w]
+            let thresh = max(lip, 1.0) * 0.8660254 * g.cell
+            if min_d <= thresh && !surface_beside(corners, cbase, cx, cy, cz) {
+                let _ = thin_keep.push((slot << 9) | cell)
             }
         }
-    }
-}
-
-/// Counts in `tri_count[9]` a chunk's candidates past what its `filter_thin_cells` slices test
-/// (`OVERFLOW_THIN`, raised by `finish_draw`).
-@strict
-@compute(64)
-pub(package) fn note_untested(
-    thin_count: [u32],
-    tested: u32,
-    tri_count: mut Atomics<u32>,
-    id: GlobalId,
-) {
-    if id.x == 0 {
-        let _ = tri_count.max(i: 10, value: thin_count[0])
-        if thin_count[0] > tested {
-            let _ = tri_count.add(i: 9, value: thin_count[0] - tested)
-        }
-    }
-}
-
-/// The core of thin candidate `packed`'s cell (`filter_thin_cells`): the cell less a quarter
-/// pixel on every side, for the eye `exact_eye`, as its low corner and width; a width of 0 or
-/// less where the cell is thinner than a hole.
-fn thin_core(g: GridSpec, b: vec3u, cell: u32, exact_eye: vec4) -> (vec3, f32, vec3) {
-    let (cx, cy, cz) = decode_cell(cell)
-    let h = g.cell
-    let cell_lo = brick_corner(g, b, vec3u(cx, cy, cz))
-    let px = length(exact_eye.xyz - (cell_lo + vec3(0.5 * h))) * exact_eye.w
-    let m = 0.5 * HOLE_PX * px
-    (cell_lo + vec3(m), h - 2.0 * m, cell_lo)
-}
-
-/// Compacted pass over all-positive thin-feature candidates (`classify_cells`), its first half:
-/// each candidate's core whole (`thin_core`) against the field's enclosure
-/// (`Surface::slope_affine`, one path for every kind). A surface can hide inside a cell all of
-/// whose corners are outside it (a wand, a tip, a crest), and Dual Contouring, which sees only sign
-/// changes on edges, meshes none of it. The core is the cell less a quarter pixel on every side
-/// (`HOLE_PX / 2`): what reaches no further in is thinner than a hole (a pixel's middle missed
-/// with the field on every side of it), and asking all of the cell would ask every cell that a
-/// neighbour's surface runs along, which no interval proves empty. A core the whole's form proves
-/// empty is done; else the octants the whole's form doesn't clear (`af.octant_range(k)`) go to
-/// `filter_thin_octants` in `thin_masks` (a slice's, by its invocation), one enclosure an
-/// invocation there (a carved table's
-/// nine in one invocation were past the Radeon's line for one, 3,053,697 work).
-@strict
-@compute(64)
-pub(package) fn filter_thin_cells<M: Field<Substance>>(
-    fields: [M],
-    grids: [GridSpec],
-    active: [ActiveBrick],
-    chunk_start: u32,
-    thin_cands: [u32],
-    thin_count: [u32],
-    first: u32,
-    exact_eye: vec4,
-    thin_masks: mut Slots<u32>,
-    id: GlobalId,
-) {
-    let i = first + id.x
-    if i >= min(thin_count[0], CAP_SURF) {
-        return
-    }
-    let packed = thin_cands[i]
-    let ab = active[chunk_start + (packed >> 9)]
-    let g = grids[ab.coord.w]
-    let (lo, w, _) = thin_core(g, ab.coord.xyz, packed & 511, exact_eye)
-    var mask: u32 = 0
-    if w > 0.0 {
-        let af = fields[g.orig_id].slope_affine(Box3 { lo: lo, hi: lo + vec3(w) }, ab.live)
-        if af.lo() <= 0.0 {
-            for j in 0..8 {
-                if af.octant_range(j).lo <= 0.0 {
-                    mask = mask | (u32(1) << j)
-                }
-            }
-        }
-    }
-    thin_masks[id] = mask
-}
-
-/// The second half of `filter_thin_cells`: an invocation an octant of a candidate's core, eight a
-/// candidate, each the octant's own enclosure where the whole's form didn't clear it
-/// (`thin_masks`); an exact cell for each candidate one of whose octants the field's enclosure
-/// can't prove empty.
-@strict
-@compute(64)
-pub(package) fn filter_thin_octants<M: Field<Substance>>(
-    fields: [M],
-    grids: [GridSpec],
-    active: [ActiveBrick],
-    chunk_start: u32,
-    thin_cands: [u32],
-    thin_count: [u32],
-    thin_masks: [u32],
-    first: u32,
-    exact_eye: vec4,
-    exact_seen: mut Atomics<u32>,
-    exact_cells: mut Append<ExactCell>,
-    id: GlobalId,
-) {
-    let i = first + id.x / 8
-    let j = id.x % 8
-    if i >= min(thin_count[0], CAP_SURF) {
-        return
-    }
-    if ((thin_masks[id.x / 8] >> j) & 1) == 0 {
-        return
-    }
-    let packed = thin_cands[i]
-    let local_bi = packed >> 9
-    let cell = packed & 511
-    let ab = active[chunk_start + local_bi]
-    let g = grids[ab.coord.w]
-    let (lo, w, cell_lo) = thin_core(g, ab.coord.xyz, cell, exact_eye)
-    let o = lo + vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * (0.5 * w)
-    let f = fields[g.orig_id]
-    let af = f.slope_affine(Box3 { lo: o, hi: o + vec3(0.5 * w) }, ab.live)
-    if af.lo() <= 0.0 && claim_exact_cell(mut exact_seen, local_bi, cell) {
-        let _ = exact_cells.push(ExactCell { lo: cell_lo, h: g.cell, live: cell_live(f, cell_lo, g.cell, ab.live) })
     }
 }
 

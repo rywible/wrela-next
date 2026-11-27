@@ -1,0 +1,209 @@
+// The levels a thing is meshed at, by the eye's distance alone: nested rings on one lattice of
+// cells anchored to the thing (not to the eye, nor to where it looks), each a power of two of a
+// metre, so a brick of a level is the same brick from every eye that wants it and turning the eye
+// changes no brick.
+//
+// Level `k` has cells `2^k` m wide. A point `d` m from the eye wants cells no wider than
+// `cell_px` pixels there: `2^k <= cell_px · px · d` (`px` the pixel's width a metre out). So
+// level `k` is wanted out to `R_k = 2^(k+1) / (cell_px · px)`, where level `k + 1` is fine enough:
+// the ring of level `k` is the cube about the eye of half-width `R_k`, snapped out to its parent
+// level's bricks. Each ring keeps at least one parent brick inside its parent's seam faces (2:1:
+// no cell meets one more than twice its width), and the coarsest level holds the whole thing.
+//
+// A ring moves only when the eye leaves the parent bricks round its centre (`RING_SLACK` of them):
+// its centre is the eye snapped to that lattice, and its half-width grows by as much, so it always
+// holds `R_k`. Between such moves, nothing about the cut changes.
+
+use matter::substance::Substance
+use mesh::grid::{BRICK, GridSpec, MAX_LOD_LEVELS, NONE}
+use std::collections::Vec
+use std::derive::Box3
+
+/// The parent bricks the eye may move from a ring's centre before the ring moves with it.
+pub const RING_SLACK: f32 = 2.0
+
+/// The most bricks the coarsest level spans along its longest axis: past it, it is coarser.
+pub const ROOT_BRICKS: f32 = 64.0
+
+/// `2^k`.
+fn pow2(k: i32) -> f32 {
+    exp2(f32(k))
+}
+
+/// The level whose cells are no wider than `h` (and `2^(k+1)` wider).
+pub fn level_of(h: f32) -> i32 {
+    i32(floor(log2(max(h, 1.0e-6))))
+}
+
+/// The distance from `e` to the nearest point of box `b` (0 inside it), and to the farthest.
+fn box_reach(b: Box3, e: vec3) -> (f32, f32) {
+    let near = length(max(max(b.lo - e, e - b.hi), vec3(0.0)))
+    let far = length(max(abs(b.lo - e), abs(b.hi - e)))
+    (near, far)
+}
+
+/// The finest cell a ring has (m): no finer than `CELL_LEAST` four times over, the finest a
+/// thing seen closest is meshed at.
+pub const RING_FINEST: f32 = 0.0004
+
+/// The lattice the rings of a thing whose tight box is `aabb` stand on: its origin, a fixed
+/// margin below the box (the same for every eye). Every level's corners are at whole numbers of
+/// its own cells from it, and a corner a finer level shares with a coarser is the same sum of
+/// the same origin and a power of two times a whole number, the same bits (`grid::lattice`).
+pub fn ring_anchor(aabb: Box3) -> vec3 {
+    let span = max(aabb.hi.x - aabb.lo.x, max(aabb.hi.y - aabb.lo.y, aabb.hi.z - aabb.lo.z))
+    aabb.lo - vec3(0.02 * span + 1.0e-3)
+}
+
+/// The rings of a thing whose tight box is `aabb`, for an eye at `eye` whose pixel is `px` wide
+/// a metre out, cells `cell_px` pixels wide, the coarsest no finer than `h_floor` (`grid::
+/// size_floor`, what a compact thing's surface fits in) and none finer than `RING_FINEST`: the
+/// grids
+/// (`grid::GridSpec`, nested as `build_lod_grids` nests them, each level's cell `2^k`), their
+/// bricks in all, and whether any level has a seam.
+pub fn build_ring_grids(
+    aabb: Box3,
+    eye: vec3,
+    px: f32,
+    cell_px: f32,
+    h_floor: f32,
+    orig_id: u32,
+    shift: vec3,
+) -> (Vec<GridSpec>, u32, bool) {
+    let per = cell_px * max(px, 1.0e-7)
+    let (near, far) = box_reach(aabb, eye)
+    let span = max(aabb.hi.x - aabb.lo.x, max(aabb.hi.y - aabb.lo.y, aabb.hi.z - aabb.lo.z))
+    let k_least = i32(ceil(log2(RING_FINEST)))
+    // The coarsest level: fine enough for the farthest point, no finer than `h_floor`, and no
+    // more bricks across than `ROOT_BRICKS`.
+    var k_top = max(level_of(per * far), level_of(h_floor))
+    k_top = max(k_top, i32(ceil(log2(max(span / (ROOT_BRICKS * f32(BRICK)), 1.0e-6)))))
+    // The finest: fine enough for the nearest point, within `MAX_LOD_LEVELS` of the coarsest.
+    let k_near = clamp(level_of(per * max(near, 1.0e-3)), max(k_least, k_top - i32(MAX_LOD_LEVELS) + 1), k_top)
+    let origin = ring_anchor(aabb)
+    let h_top = pow2(k_top)
+    let bspan = h_top * f32(BRICK)
+    let d = aabb.hi + vec3(2.0 * h_top) - origin
+    var grids: Vec<GridSpec> = Vec::new()
+    grids.push(
+        GridSpec {
+            origin,
+            cell: h_top,
+            dims: vec3u(
+                max(u32(ceil(d.x / bspan)), 1),
+                max(u32(ceil(d.y / bspan)), 1),
+                max(u32(ceil(d.z / bspan)), 1),
+            ),
+            base_brick: 0,
+            orig_id,
+            seam_mask: 0,
+            parent_grid: NONE,
+            has_hole: 0,
+            hole_min: vec3u(0, 0, 0),
+            pad0: 0,
+            hole_max: vec3u(0, 0, 0),
+            pad1: 0,
+            cell_offset: vec3u(0, 0, 0),
+            pad2: 0,
+            parent_hole_min: vec3u(0, 0, 0),
+            pad3: 0,
+            shift,
+            pad4: 0,
+        },
+    )
+    var k = k_top - 1
+    while k >= k_near {
+        let pi = grids.len() - 1
+        let prev = grids[pi]
+        let pbspan = prev.cell * f32(BRICK)
+        let prev_origin = prev.origin +
+            vec3(f32(prev.cell_offset.x), f32(prev.cell_offset.y), f32(prev.cell_offset.z)) * prev.cell
+        let min_x: i32 = if (prev.seam_mask & 1) != 0 { 1 } else { 0 }
+        let min_y: i32 = if (prev.seam_mask & 4) != 0 { 1 } else { 0 }
+        let min_z: i32 = if (prev.seam_mask & 16) != 0 { 1 } else { 0 }
+        let max_x: i32 = i32(prev.dims.x) - (if (prev.seam_mask & 2) != 0 { 1 } else { 0 })
+        let max_y: i32 = i32(prev.dims.y) - (if (prev.seam_mask & 8) != 0 { 1 } else { 0 })
+        let max_z: i32 = i32(prev.dims.z) - (if (prev.seam_mask & 32) != 0 { 1 } else { 0 })
+        if min_x >= max_x || min_y >= max_y || min_z >= max_z {
+            break
+        }
+        // The ring: the eye snapped to the parent's bricks `RING_SLACK` at a time, and the
+        // distance level `k` is wanted to (`R_k`) and that slack past it.
+        let step = RING_SLACK * pbspan
+        let centre = origin + (floor((eye - origin) / step) + vec3(0.5)) * step
+        let half = pow2(k + 1) / per + step
+        let lo_f = (centre - vec3(half) - prev_origin) / pbspan
+        let hi_f = (centre + vec3(half) - prev_origin) / pbspan
+        let lo_x = max(min_x, i32(floor(lo_f.x)))
+        let hi_x = min(max_x, i32(ceil(hi_f.x)))
+        let lo_y = max(min_y, i32(floor(lo_f.y)))
+        let hi_y = min(max_y, i32(ceil(hi_f.y)))
+        let lo_z = max(min_z, i32(floor(lo_f.z)))
+        let hi_z = min(max_z, i32(ceil(hi_f.z)))
+        if lo_x >= hi_x || lo_y >= hi_y || lo_z >= hi_z {
+            break
+        }
+        let blo = vec3u(u32(lo_x), u32(lo_y), u32(lo_z))
+        let bhi = vec3u(u32(hi_x), u32(hi_y), u32(hi_z))
+        let hole_min = blo * BRICK
+        let hole_max = bhi * BRICK
+        var sm: u32 = 0
+        if blo.x > 0 {
+            sm |= 1
+        }
+        if bhi.x < prev.dims.x {
+            sm |= 2
+        }
+        if blo.y > 0 {
+            sm |= 4
+        }
+        if bhi.y < prev.dims.y {
+            sm |= 8
+        }
+        if blo.z > 0 {
+            sm |= 16
+        }
+        if bhi.z < prev.dims.z {
+            sm |= 32
+        }
+        let child = GridSpec {
+            origin: prev.origin,
+            cell: 0.5 * prev.cell,
+            dims: (bhi - blo) * 2,
+            base_brick: 0,
+            orig_id,
+            seam_mask: sm,
+            parent_grid: pi,
+            has_hole: 0,
+            hole_min: vec3u(0, 0, 0),
+            pad0: 0,
+            hole_max: vec3u(0, 0, 0),
+            pad1: 0,
+            cell_offset: (prev.cell_offset + hole_min) * 2,
+            pad2: 0,
+            parent_hole_min: hole_min,
+            pad3: 0,
+            shift: prev.shift,
+            pad4: 0,
+        }
+        if sm == 0 && prev.seam_mask == 0 {
+            // The ring holds all of its parent: the parent goes, and the ring is the coarsest.
+            grids[pi] = GridSpec { seam_mask: 0, parent_grid: NONE, parent_hole_min: vec3u(0, 0, 0), ..child }
+        } else {
+            grids[pi] = GridSpec { has_hole: 1, hole_min, hole_max, ..prev }
+            grids.push(child)
+        }
+        k -= 1
+    }
+    var total: u32 = 0
+    var seams = false
+    for i in 0..grids.len() {
+        let g = grids[i]
+        grids[i] = GridSpec { base_brick: total, ..g }
+        total += g.dims.x * g.dims.y * g.dims.z
+        if g.seam_mask != 0 {
+            seams = true
+        }
+    }
+    (grids, total, seams)
+}

@@ -15,7 +15,7 @@
 //     either by pure Lipschitz steps `t += f(p) / L` (Mean Value Theorem, never clamped up by a
 //     heuristic minimum step) or by compiler-derived IEEE-754-sound 1D `std::derive::affine`.
 
-use mesh::dc::{QUAD_FOLDED, QUAD_INSIDE, finer_than_a_hole, on_outline}
+use mesh::dc::{QUAD_FOLDED, on_outline}
 use matter::substance::{Substance, lambert}
 use picture::eye::View
 use std::derive::{Interval, affine_form, filtered}
@@ -1133,26 +1133,17 @@ pub fn prove_tri_local(p0: vec3, p1: vec3, p2: vec3, span: f32) -> Option<LocalP
     }
 }
 
-/// A quad of the mesh shown to need no exact cell: it was stored for drawing (a `LocalProof`),
-/// and every eye within reach of the one it was meshed for sees all of it from the one side
-/// (`dc::on_outline`), or its cells are too fine to stand off the field by a hole
-/// (`dc::finer_than_a_hole`). Made only by `quad_cover`.
-pub struct CoverProof: Copy {
-    seal: (),
-}
-
 /// What a quad of the mesh is to the picture's cover: the one answer `mesh::emit` gets for each
 /// quad, and must take each case of (a `match`), so that no quad the mesh can't be shown to cover
 /// with goes without an exact cell because a rewrite forgot to ask.
 pub enum QuadCover: Copy {
-    /// Drawn, and shown to need nothing more.
-    Covered(CoverProof),
     /// Drawn in a mesh the exact pass doesn't hold: one meshed for no eye (a pool's shared
     /// mesh, a mesh drawn only to the sun's map), or a transmissive quad (glass has its own pass).
     Unheld,
-    /// Drawn, on the mesh's outline for some eye within reach: its cells are certified
-    /// (`certify_outline`) or solved exactly.
-    Outline,
+    /// Drawn, in a mesh whose outline is found each frame for that frame's eye (`mesh::outline`):
+    /// kept (its indices' place, and its split along `q1-q3` in the top bit), for its cells to
+    /// be certified or solved exactly whenever it is on the outline.
+    Watched(u32),
     /// Drawn, but wound against its normals (folded, so culled): its cells are solved exactly.
     Folded,
     /// Not drawn (a vertex of its four never solved, not local, or no room left for its indices):
@@ -1160,12 +1151,14 @@ pub enum QuadCover: Copy {
     Unsound,
 }
 
-/// The cover of an opaque quad just stored for drawing (`local`), with corners `p0..p3` and unit
-/// normals `n0..n3`, split along `p1-p3` when `split13`, in a cell at `cell_lo` of width `h`,
-/// held to the eye `eye` (`xyz` its place, `w` its pixel's width a metre out; `w` 0 for no eye)
-/// and every eye within `reach` of it.
+/// The cover of an opaque quad just stored for drawing (`local`) at index `at`, with corners
+/// `p0..p3` and unit normals `n0..n3`, split along `p1-p3` when `split13`, in a mesh `held` by
+/// the exact pass (its outline found each frame, `mesh::outline`) or not. A quad wound against
+/// its normals is folded from every eye; any other is kept, for the frames whose eye sees it on
+/// the outline.
 pub fn quad_cover(
     local: LocalProof,
+    at: u32,
     p0: vec3,
     p1: vec3,
     p2: vec3,
@@ -1175,20 +1168,17 @@ pub fn quad_cover(
     n2: vec3,
     n3: vec3,
     split13: bool,
-    cell_lo: vec3,
-    h: f32,
-    eye: vec4,
-    reach: f32,
+    held: bool,
 ) -> QuadCover {
     let _ = local
-    if eye.w <= 0.0 {
+    if !held {
         return QuadCover::Unheld
     }
-    let kind = on_outline(p0, p1, p2, p3, n0, n1, n2, n3, split13: split13, e: eye.xyz, reach: reach)
-    if kind == QUAD_INSIDE || finer_than_a_hole(cell_lo, h, eye) {
-        return QuadCover::Covered(CoverProof { seal: () })
+    // Folded is the eye's no matter where it stands (`on_outline`'s first test).
+    if on_outline(p0, p1, p2, p3, n0, n1, n2, n3, split13: split13, e: p0, reach: 0.0) == QUAD_FOLDED {
+        return QuadCover::Folded
     }
-    if kind == QUAD_FOLDED { QuadCover::Folded } else { QuadCover::Outline }
+    QuadCover::Watched(at | (if split13 { 2147483648 } else { 0 }))
 }
 
 /// The cover of a transmissive quad shown local (`local`), whether or not its buffer had room:
@@ -1325,7 +1315,6 @@ fn proof_tokens_erase_to_zero_bytes() {
         f"EmptyProof must be 0 bytes, got {size_of::<EmptyProof>()}",
     )
     assert(size_of::<LocalProof>() == 0, "LocalProof must be 0 bytes")
-    assert(size_of::<CoverProof>() == 0, "CoverProof must be 0 bytes")
     assert(
         size_of::<RayBox>() == 16,
         f"RayBox must be 16 bytes (one vec4), got {size_of::<RayBox>()}",
@@ -1354,9 +1343,9 @@ fn a_triangle_is_stored_only_where_it_is_local_and_a_quad_says_what_covers_it() 
     let far = vec3(1.0e30, 0.0, 0.0)
     assert(prove_quad_local(p0, far, p2, p3, span).is_none(), "a corner out of all bounds is refused")
     assert(prove_tri_local(p0, p1, p2, span).is_some(), "a triangle within its cells is local")
-    let facing = vec4(0.05, 0.05, 1.0, 0.001)
-    let cover = |eye: vec4, n: vec3| quad_cover(
+    let cover = |held: bool, n: vec3| quad_cover(
         local,
+        120,
         p0,
         p1,
         p2,
@@ -1366,32 +1355,27 @@ fn a_triangle_is_stored_only_where_it_is_local_and_a_quad_says_what_covers_it() 
         n,
         n,
         split13: false,
-        cell_lo: p0,
-        h: h,
-        eye: eye,
-        reach: 0.01,
+        held: held,
     )
-    // Faced by the eye, it needs no exact cell; with no eye, it isn't held to one.
-    match cover(facing, z) {
-        QuadCover::Covered(_) => {},
-        QuadCover::Unheld => panic("a quad an eye faces is held to it"),
-        QuadCover::Outline => panic("a quad an eye faces is not on its outline"),
-        QuadCover::Folded => panic("a quad an eye faces is not folded"),
+    // Held, it is kept for each frame's eye to find on its outline or not; not held, it is held
+    // to nothing.
+    match cover(true, z) {
+        QuadCover::Watched(at) => assert(at == 120, f"kept at {at}"),
+        QuadCover::Unheld => panic("a quad of a held mesh is held"),
+        QuadCover::Folded => panic("a quad wound with its normals is not folded"),
         QuadCover::Unsound => panic("a stored quad is sound"),
     }
-    match cover(vec4(0.05, 0.05, 1.0, 0.0), z) {
+    match cover(false, z) {
         QuadCover::Unheld => {},
-        QuadCover::Covered(_) => panic("with no eye nothing is shown covered"),
-        QuadCover::Outline => panic("with no eye there is no outline"),
-        QuadCover::Folded => panic("with no eye nothing is folded"),
+        QuadCover::Watched(_) => panic("a mesh not held keeps nothing"),
+        QuadCover::Folded => panic("a mesh not held is held to nothing"),
         QuadCover::Unsound => panic("a stored quad is sound"),
     }
-    // Seen edge on (the eye in its plane), it is on the outline: certified or solved.
-    match cover(vec4(1.0, 0.05, 0.0, 0.001), z) {
-        QuadCover::Outline => {},
+    // Wound against its normals, it is folded from every eye.
+    match cover(true, -z) {
         QuadCover::Folded => {},
-        QuadCover::Covered(_) => panic("a quad seen edge on can't be shown covered"),
-        QuadCover::Unheld => panic("a quad seen edge on is held to its eye"),
+        QuadCover::Watched(_) => panic("a quad wound against its normals is folded"),
+        QuadCover::Unheld => panic("a quad of a held mesh is held"),
         QuadCover::Unsound => panic("a stored quad is sound"),
     }
 }

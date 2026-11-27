@@ -5,7 +5,9 @@
 // nothing, each a brick's 512 corners evaluated for nothing.
 
 use matter::substance::Substance
-use mesh::grid::{BRICK, CORNERS_BRICK, brick_corner, cull_brick, cull_super_brick, grid_for, tight_aabb}
+use mesh::grid::{BRICK, CORNERS_BRICK, brick_corner, brick_in_hole, cull_brick, cull_super_brick, grid_for, tight_aabb}
+use std::collections::Vec
+use std::derive::Box3
 use std::field::Field
 
 /// A field's bricks at one cell size (`cull_census`).
@@ -75,4 +77,121 @@ pub fn cull_census<M: Field<Substance>>(field: M, cell: f32) -> CullCensus {
         }
     }
     out
+}
+
+/// What `field`'s rings (`mesh::rings::build_ring_grids`) keep for an eye at `eye` (pixel `px`
+/// wide a metre out, cells `cell_px` pixels): each level's cell, the bricks of its region (its
+/// ring less its child's), and those the cull keeps, as `(cell, region, kept)`.
+pub fn ring_census<M: Field<Substance>>(field: M, eye: vec3, px: f32, cell_px: f32, h_floor: f32) -> Vec<vec3> {
+    let (grids, _, _) = mesh::rings::build_ring_grids(tight_aabb(field), eye, px, cell_px, h_floor, orig_id: 0, shift: vec3(0.0))
+    var out: Vec<vec3> = Vec::new()
+    for gi in 0..grids.len() {
+        let g = grids[gi]
+        let sd = (g.dims + vec3u(3, 3, 3)) / 4
+        var region: u32 = 0
+        var kept: u32 = 0
+        for s in 0..sd.x * sd.y * sd.z {
+            let sb = vec3u(s % sd.x, (s / sd.x) % sd.y, s / (sd.x * sd.y))
+            let b0 = sb * 4
+            let b1 = min(b0 + vec3u(4, 4, 4), g.dims)
+            var all_hole = true
+            for bz in b0.z..b1.z {
+                for by in b0.y..b1.y {
+                    for bx in b0.x..b1.x {
+                        if !brick_in_hole(g, vec3u(bx, by, bz)) {
+                            all_hole = false
+                            region += 1
+                        }
+                    }
+                }
+            }
+            if all_hole {
+                continue
+            }
+            let (may, _) = cull_super_brick(field, g, sb)
+            if !may {
+                continue
+            }
+            for bz in b0.z..b1.z {
+                for by in b0.y..b1.y {
+                    for bx in b0.x..b1.x {
+                        let b = vec3u(bx, by, bz)
+                        if !brick_in_hole(g, b) {
+                            let (hit, _) = cull_brick(field, g, b)
+                            if hit {
+                                kept += 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out.push(vec3(g.cell, f32(region), f32(kept)))
+    }
+    out
+}
+
+/// How flat `field` is brick by brick at cell size `cell` (docs/plans/build-time-engine-4d.md,
+/// phase 0 step 6): of the bricks the cull keeps on a grid round it, each one's slab (twice the
+/// distance its enclosure over the brick's box, `Surface::slope_affine`, holds the surface from
+/// a plane: `2 e / |l|` in metres), as the most, the 95th percentile, and how many have no
+/// slab (no plane, or wider than the brick); and the kept bricks.
+pub fn flat_census<M: Field<Substance>>(field: M, cell: f32) -> vec4 {
+    let g = grid_for(tight_aabb(field), cell, base_brick: 0, orig_id: 0, shift: vec3(0.0))
+    let sd = (g.dims + vec3u(3, 3, 3)) / 4
+    var slabs: Vec<f32> = Vec::new()
+    var none: u32 = 0
+    let side = cell * f32(BRICK + 1)
+    for s in 0..sd.x * sd.y * sd.z {
+        let sb = vec3u(s % sd.x, (s / sd.x) % sd.y, s / (sd.x * sd.y))
+        let (may, _) = cull_super_brick(field, g, sb)
+        if !may {
+            continue
+        }
+        let b0 = sb * 4
+        let b1 = min(b0 + vec3u(4, 4, 4), g.dims)
+        for bz in b0.z..b1.z {
+            for by in b0.y..b1.y {
+                for bx in b0.x..b1.x {
+                    let b = vec3u(bx, by, bz)
+                    let (hit, live) = cull_brick(field, g, b)
+                    if !hit {
+                        continue
+                    }
+                    let lo = brick_corner(g, b, vec3u(0, 0, 0))
+                    let bx3 = Box3 { lo, hi: lo + vec3(side) }
+                    let af = field.slope_affine(bx3, live)
+                    let gl = length(af.l) / (0.5 * side)
+                    let w = if af.valid() && gl > 0.5 { 2.0 * af.e / gl } else { 1.0e30 }
+                    if !(w < side) {
+                        none += 1
+                    } else {
+                        slabs.push(w)
+                    }
+                }
+            }
+        }
+    }
+    let n = slabs.len()
+    // A count of the slabs below each of 64 widths, a cell's 1/1024 to 64 times that, doubling
+    // each 4 bins: the most and the 95th percentile read off it.
+    var most = 0.0
+    for i in 0..n {
+        most = max(most, slabs[i])
+    }
+    var p95 = most
+    for t in 0..48 {
+        let w = cell * exp2(f32(t) / 4.0 - 10.0)
+        var below: u32 = 0
+        for i in 0..n {
+            if slabs[i] <= w {
+                below += 1
+            }
+        }
+        if f32(below) >= 0.95 * f32(n) {
+            p95 = w
+            break
+        }
+    }
+    vec4(most, p95, f32(none), f32(n) + f32(none))
 }
