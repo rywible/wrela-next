@@ -22,10 +22,11 @@ import numpy as np
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
-def longest_clean_span(data, rate, max_root_speed, max_joint_speed):
-    """Longest contiguous frame slice with no unphysical root teleport or joint jump."""
+def longest_clean_span(data, rate, max_root_speed, max_joint_speed, max_start_accel=10.0):
+    """Longest contiguous frame slice with no unphysical root teleport or joint jump, with leading
+    IK startup transients (impossible initial root acceleration > `max_start_accel` m/s^2) trimmed."""
     n = data.shape[0]
-    if n < 2 or (max_root_speed <= 0 and max_joint_speed <= 0):
+    if n < 2:
         return 0, n
     bad = np.zeros(n - 1, dtype=bool)
     if max_root_speed > 0:
@@ -34,14 +35,27 @@ def longest_clean_span(data, rate, max_root_speed, max_joint_speed):
     if max_joint_speed > 0 and data.shape[1] > 7:
         v_jnt = np.abs(data[1:, 7:] - data[:-1, 7:]).max(axis=-1) * rate
         bad |= v_jnt > max_joint_speed
-    if not bad.any():
-        return 0, n
-    cuts = [-1] + list(np.nonzero(bad)[0]) + [n - 1]
-    best_a, best_b = 0, 0
-    for c0, c1 in zip(cuts[:-1], cuts[1:]):
-        a, b = int(c0 + 1), int(c1 + 1)
-        if b - a > best_b - best_a:
-            best_a, best_b = a, b
+    if bad.any():
+        cuts = [-1] + list(np.nonzero(bad)[0]) + [n - 1]
+        best_a, best_b = 0, 0
+        for c0, c1 in zip(cuts[:-1], cuts[1:]):
+            a, b = int(c0 + 1), int(c1 + 1)
+            if b - a > best_b - best_a:
+                best_a, best_b = a, b
+    else:
+        best_a, best_b = 0, n
+    if max_start_accel > 0 and best_b - best_a > 35:
+        seg = data[best_a:best_b]
+        v = np.diff(seg[:, :3], axis=0) * rate
+        acc = np.linalg.norm(np.diff(v, axis=0) * rate, axis=-1)
+        k = 0
+        cap = min(10, seg.shape[0] - 35)
+        while k < cap:
+            if acc[k] > max_start_accel or np.linalg.norm(v[k] - v[k + 2]) > 0.35:
+                k += 1
+            else:
+                break
+        best_a += k
     return best_a, best_b
 
 
@@ -55,6 +69,8 @@ def main():
                    help="cut clips at frames where root speed exceeds this (m/s); 0 disables")
     p.add_argument("--max-joint-speed", type=float, default=25.0,
                    help="cut clips at frames where any joint speed exceeds this (rad/s); 0 disables")
+    p.add_argument("--max-start-accel", type=float, default=10.0,
+                   help="trim leading IK startup transients where root accel exceeds this (m/s^2); 0 disables")
     p.add_argument("--min-frames", type=int, default=60,
                    help="drop clean spans shorter than this many frames")
     a = p.parse_args()
@@ -77,7 +93,7 @@ def main():
             data = np.frombuffer(b, dtype="<f4", offset=24, count=n * row).reshape(n, row)[:, :q]
             assert nq in (None, q) and rate in (None, r)
             nq, rate = q, r
-            i0, i1 = longest_clean_span(data, r, a.max_root_speed, a.max_joint_speed)
+            i0, i1 = longest_clean_span(data, r, a.max_root_speed, a.max_joint_speed, a.max_start_accel)
             if i1 - i0 < a.min_frames:
                 dropped += 1
                 continue
