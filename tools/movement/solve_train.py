@@ -99,6 +99,8 @@ def main(load_packed):
     p.add_argument("--strides", default="1,2,4",
                    help="the periods (frames) a window's steps may take, each update one, 1 half the time: "
                         "a body far from the eye is solved each few frames (phase 5 step 10)")
+    p.add_argument("--slide-target", type=float, default=1000.0,
+                   help="the judge's slide target (mm/s) used to scale the ground-slide physics loss")
     p.add_argument("--eval-every", type=int, default=2000)
     p.add_argument("--threads", type=int, default=0)
     a = p.parse_args(run.args)
@@ -282,7 +284,7 @@ def main(load_packed):
         pen = torch.relu(-low1).sum(-1).mean(-1) * 1000.0 / 2.0
         near = ((low0 < 0.02) & (low1 < 0.02)).float()
         d = torch.stack([(a1 - a0)[..., [0, 2]].norm(dim=-1), (b1 - b0)[..., [0, 2]].norm(dim=-1)], -1)
-        slide = (near * d).sum((-1, -2)) / near.sum((-1, -2)).clamp(min=1.0) * rate / k * 1000.0 / 984.0
+        slide = (near * d).sum((-1, -2)) / near.sum((-1, -2)).clamp(min=1.0) * rate / k * 1000.0 / a.slide_target
         return (pen + slide).mean()
 
     def evaluate(data, n=512, seconds=4.0, k=1):

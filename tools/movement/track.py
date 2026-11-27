@@ -147,15 +147,35 @@ class Sim:
         self.geom_xmat = wp.to_torch(self.d.geom_xmat)
         self.warm = wp.to_torch(self.d.qacc_warmstart)
         self.nq, self.nv, self.nb = self.mjm.nq, self.mjm.nv, self.mjm.nbody
-        self.lo = torch.tensor(self.mjm.actuator_ctrlrange[:, 0], device=device)
-        self.hi = torch.tensor(self.mjm.actuator_ctrlrange[:, 1], device=device)
+        # Dynamically active bodies: every body that has a joint (the root freejoint and every
+        # articulated segment). Welded segments (such as 30 finger phalanges) are excluded so they
+        # cannot dominate observations, rewards or fall distance.
+        self.active = torch.tensor(
+            [b for b in range(1, self.mjm.nbody) if self.mjm.body_jntnum[b] > 0],
+            device=device, dtype=torch.long,
+        )
+        assert int(self.active[0]) == 1, f"root body 1 must be active, got {self.active[:4]}"
+        self.names = list(head["names"])
+        # Colliding capsules for computing ground clearance on reset (prevents underground launches).
+        caps = [g for g in range(self.mjm.ngeom) if self.mjm.geom_contype[g] != 0 and self.mjm.geom_type[g] == 3]
+        self.caps = torch.tensor(caps, device=device, dtype=torch.long)
+        self.cap_r = torch.tensor(self.mjm.geom_size[caps, 0], device=device, dtype=torch.float32) if caps else torch.zeros(0, device=device)
+        self.cap_h = torch.tensor(self.mjm.geom_size[caps, 1], device=device, dtype=torch.float32) if caps else torch.zeros(0, device=device)
+        self.lo = torch.tensor(self.mjm.actuator_ctrlrange[:, 0], device=device, dtype=torch.float32)
+        self.hi = torch.tensor(self.mjm.actuator_ctrlrange[:, 1], device=device, dtype=torch.float32)
+        # Per-joint action scale from each joint's true range (avoids 3-7x range overshoot on narrow
+        # spine/wrist twists while keeping full authority on hips, knees and ankles).
+        jids = self.mjm.actuator_trnid[:, 0]
+        self.jnt_lo = torch.tensor(self.mjm.jnt_range[jids, 0], device=device, dtype=torch.float32)
+        self.jnt_hi = torch.tensor(self.mjm.jnt_range[jids, 1], device=device, dtype=torch.float32)
+        self.act_scale = (0.35 * (self.jnt_hi - self.jnt_lo)).clamp(min=0.08, max=0.6)
         self.rate = head["rate"]
         self.dt = 1.0 / self.rate
         # The clips: their frames, where each starts and how long it is.
         self.ref_q = torch.tensor(refs, device=device)
         self.starts = torch.tensor(head["starts"], device=device, dtype=torch.long)
         self.lengths = torch.tensor(head["lengths"], device=device, dtype=torch.long)
-        self.ref_x, self.ref_r = self.frames_of(self.ref_q)
+        self.ref_x, self.ref_r, self.ref_lift = self.frames_of(self.ref_q)
         sets = head.get("sets") or ["training"] * len(head["names"])
         self.train = torch.tensor([i for i, s in enumerate(sets) if s == "training"] or
                                   list(range(len(sets))), device=device, dtype=torch.long)
@@ -177,18 +197,26 @@ class Sim:
         self.m.opt.gravity = wp.from_torch(g.contiguous().float(), dtype=wp.vec3)
 
     def frames_of(self, q):
-        """Each body's place and turn for each of the qpos `q` (by the simulator's kinematics, a
-        batch of worlds at a time)."""
-        out_x, out_r = [], []
+        """Each body's place and turn for each of the qpos `q`, plus the vertical lift (m) needed
+        to clear floor penetration on reset."""
+        out_x, out_r, out_l = [], [], []
         n = q.shape[0]
         b = self.n
         for i in range(0, n, b):
             k = min(b, n - i)
             self.qpos[:k] = q[i:i + k]
             mjw.kinematics(self.m, self.d)
-            out_x.append(self.xpos[:k].clone())
-            out_r.append(self.xquat[:k].clone())
-        return torch.cat(out_x), torch.cat(out_r)
+            out_x.append(self.xpos[:k, self.active].clone())
+            out_r.append(self.xquat[:k, self.active].clone())
+            if self.caps.numel():
+                gpos = self.geom_xpos[:k, self.caps, 1]
+                gmat = self.geom_xmat[:k, self.caps].reshape(k, -1, 3, 3)
+                axis_y = gmat[..., 1, 2].abs()
+                min_y = (gpos - axis_y * self.cap_h - self.cap_r).amin(dim=-1)
+                out_l.append((-min_y).clamp(min=0.0).clone())
+            else:
+                out_l.append(torch.zeros(k, device=self.dev))
+        return torch.cat(out_x), torch.cat(out_r), torch.cat(out_l)
 
     def ref_vel(self, g):
         """The qvel of frame `g` of the clips (by differences): the root's in the world, the
@@ -207,10 +235,8 @@ class Sim:
 
     def reset(self, which):
         """Starts the worlds `which` (a mask) at a random frame of a random clip, or a share of
-        them (`start_share`) at its first frame: a clip of 100STYLE starts from standing, and a
-        tracker that started each world at a random frame alone (one frame in 2,400 the first)
-        fell in the first second of 38% of the clips it played from their starts, and in the first
-        20 s of 69% (`p4h-7`)."""
+        them (`start_share`) at its first frame. Lifts any frame that penetrates the floor and
+        updates kinematics immediately so the next observation sees the new state, never the old."""
         idx = which.nonzero().flatten()
         if idx.numel() == 0:
             return
@@ -224,8 +250,11 @@ class Sim:
         self.frame[idx] = f
         g = self.starts[c] + f
         self.qpos[idx] = self.ref_q[g]
+        lift = self.ref_lift[g]
+        self.qpos[idx, 1] += torch.where(lift > 0.002, lift, torch.zeros_like(lift))
         self.qvel[idx] = self.ref_vel(g)
         self.warm[idx] = 0.0
+        mjw.kinematics(self.m, self.d)
 
     def weigh(self, results):
         """Gives each training clip that `results` (of `play`) shows was not followed four times
@@ -245,75 +274,105 @@ class Sim:
             with wp.ScopedCapture() as cap:
                 for _ in range(self.substeps):
                     mjw.step(self.m, self.d)
+                mjw.kinematics(self.m, self.d)
             self.graph = cap.graph
         if self.graph is not None:
             wp.capture_launch(self.graph)
         else:
             for _ in range(self.substeps):
                 mjw.step(self.m, self.d)
-        mjw.kinematics(self.m, self.d)
+            mjw.kinematics(self.m, self.d)
         self.frame += 1
 
 
 # ---- what the net reads, and the reward --------------------------------------------------------
 
-AHEAD = (1, 2, 5, 10)
+AHEAD = (1, 3, 6)
+
+
+def rot6d(q):
+    """Continuous 6D rotation representation (rotated +x and +y basis vectors): avoids the ±q
+    double-cover sign flip when yaw crosses ±pi."""
+    ex = torch.zeros_like(q[..., 1:])
+    ex[..., 0] = 1.0
+    ey = torch.zeros_like(q[..., 1:])
+    ey[..., 1] = 1.0
+    return torch.cat([quat_rotate(q, ex), quat_rotate(q, ey)], -1)
 
 
 def observe(sim):
-    """The body's state in its heading's frame, and the clip's next frames in it."""
+    """The body's state in its heading's frame (active bodies only, continuous 6D root orientation),
+    and the clip's next frames as direct per-body tracking deltas, target root orientation, and
+    joint angle deltas."""
     root_q = sim.xquat[:, 1]
     root_x = sim.xpos[:, 1]
     hq = quat_conj(heading(root_q))
     n = sim.n
+    act = sim.active
+    act_x = sim.xpos[:, act]
     parts = []
     parts.append(root_x[:, 1:2])
     local = quat_mul(hq, root_q)
-    parts.append(local)
+    parts.append(rot6d(local))
     parts.append(quat_rotate(hq, sim.qvel[:, :3]))
-    parts.append(sim.qvel[:, 3:6])
+    parts.append(quat_rotate(local, sim.qvel[:, 3:6]))
     parts.append(sim.qpos[:, 7:])
     parts.append(0.1 * sim.qvel[:, 6:])
-    rel = sim.xpos[:, 1:] - root_x[:, None]
+    rel = act_x[:, 1:] - root_x[:, None]
     parts.append(quat_rotate(hq[:, None].expand(-1, rel.shape[1], -1), rel).reshape(n, -1))
     for a in AHEAD:
         g = sim.global_frame(a)
-        tx = sim.ref_x[g][:, 1:] - root_x[:, None]
-        parts.append(quat_rotate(hq[:, None].expand(-1, tx.shape[1], -1), tx).reshape(n, -1))
+        # Direct per-body error vector to target (includes both root drift and local pose).
+        dx = sim.ref_x[g] - act_x
+        parts.append(quat_rotate(hq[:, None].expand(-1, dx.shape[1], -1), dx).reshape(n, -1))
+        parts.append(rot6d(quat_mul(hq, sim.ref_r[g][:, 0])))
         parts.append(sim.ref_q[g][:, 7:] - sim.qpos[:, 7:])
     return torch.cat(parts, -1)
 
 
 def errors(sim):
-    """Each world's mean distance of a segment from its place in the clip (m), its mean turn
-    from it (rad), and its root's distance."""
+    """Each world's mean distance of an active segment from its place in the clip (m), its root-
+    relative local pose distance (m), its mean turn error (rad), its root distance (m), and the
+    per-body arrays for multi-scale reward."""
     g = sim.global_frame(0)
-    dx = (sim.xpos[:, 1:] - sim.ref_x[g][:, 1:]).norm(dim=-1)
-    dr = angle_of(quat_mul(sim.xquat[:, 1:], quat_conj(sim.ref_r[g][:, 1:])))
-    return dx.mean(-1), dr.mean(-1), dx[:, 0], dx.max(-1).values
+    act = sim.active
+    sx = sim.xpos[:, act]
+    rx = sim.ref_x[g]
+    dx = (sx - rx).norm(dim=-1)
+    dx_loc = ((sx - sx[:, :1]) - (rx - rx[:, :1])).norm(dim=-1)
+    dr = angle_of(quat_mul(sim.xquat[:, act], quat_conj(sim.ref_r[g])))
+    return dx, dx_loc, dr
 
 
 def exploded(sim):
     """The worlds whose simulation blew up: a state not finite, or moving faster than 200 (m/s or
-    rad/s). On 2026-11-26 two runs on the human collapsed in 20 updates at update 990 (reward 0.77
-    to 0.42), as one such world can poison the observations' running mean and spread."""
+    rad/s)."""
     ok = torch.isfinite(sim.qpos).all(-1) & torch.isfinite(sim.qvel).all(-1)
     ok &= sim.qvel.abs().amax(-1) < 200.0
     return ~ok
 
 
-def reward(sim):
-    ex, er, eroot, emax = errors(sim)
+def reward(sim, act_clamped=None):
+    dx, dx_loc, dr = errors(sim)
+    ex = dx.mean(-1)
+    eroot = dx[:, 0]
     g = sim.global_frame(0)
-    dv = sim.qvel[:, 6:] - sim.ref_vel(g)[:, 6:]
-    r = 0.45 * torch.exp(-100.0 * ex * ex) + 0.25 * torch.exp(-2.0 * er * er) + \
-        0.1 * torch.exp(-0.005 * (dv * dv).sum(-1)) + 0.2 * torch.exp(-20.0 * eroot * eroot)
+    rv = sim.ref_vel(g)
+    dv_root = (sim.qvel[:, :3] - rv[:, :3]).norm(dim=-1)
+    dv = sim.qvel[:, 6:] - rv[:, 6:]
+    # Multi-scale PHC-style reward: sharp fine term (<50 mm accuracy) + wide global term (non-zero
+    # gradient all the way to 0.5 m) + root-relative local pose + orientation + root + velocity.
+    r_pos_fine = torch.exp(-100.0 * (dx * dx).mean(-1))
+    r_pos_wide = torch.exp(-10.0 * (dx * dx).mean(-1))
+    r_loc = torch.exp(-40.0 * (dx_loc * dx_loc).mean(-1))
+    r_rot = torch.exp(-5.0 * (dr * dr).mean(-1))
+    r_root = torch.exp(-10.0 * eroot * eroot)
+    r_vel = 0.5 * torch.exp(-0.5 * dv_root * dv_root) + 0.5 * torch.exp(-0.05 * (dv * dv).mean(-1))
+    r = (0.25 * r_pos_fine + 0.20 * r_pos_wide + 0.20 * r_loc +
+         0.15 * r_rot + 0.10 * r_root + 0.10 * r_vel)
+    if act_clamped is not None:
+        r = (r - 0.02 * (act_clamped * act_clamped).mean(-1)).clamp(min=0.0)
     bad = exploded(sim)
-    # A fall: the segments half a metre from their places on average (Luo et al. 2023's limit, for
-    # training and for success alike). Until 2026-11-26 it was 0.25 m on average or any one segment
-    # 0.5 m away: the bodies `p4h-7` lost that way still stood (their roots 0.86 m up against the
-    # clips' 0.88 at the median, none under 0.6 of it) and had drifted (the root 0.185 m from the
-    # clip's, the pose about it 0.153 m).
     fell = (ex > sim.fall_mean) | bad
     r = torch.where(bad | ~torch.isfinite(r), torch.zeros_like(r), r)
     ex = torch.where(torch.isfinite(ex), ex, torch.zeros_like(ex))
@@ -357,25 +416,68 @@ class Normal:
         self.mean, self.var, self.count = s["mean"].to(device), s["var"].to(device), s["count"]
 
 
-def mlp(n_in, n_out, hidden):
+class ValNorm:
+    """Running mean and std of value targets (scalar): keeps critic outputs near unit scale."""
+
+    def __init__(self, device):
+        self.mean = torch.tensor(0.0, device=device)
+        self.var = torch.tensor(1.0, device=device)
+        self.count = 1e-4
+
+    def update(self, x):
+        x = x[torch.isfinite(x)]
+        b = x.numel()
+        if b == 0:
+            return
+        m = x.mean()
+        v = x.var(unbiased=False)
+        d = m - self.mean
+        tot = self.count + b
+        self.mean = self.mean + d * b / tot
+        self.var = (self.var * self.count + v * b + d * d * self.count * b / tot) / tot
+        self.count = tot
+
+    def norm(self, x):
+        return (x - self.mean) / torch.sqrt(self.var + 1e-6)
+
+    def denorm(self, x):
+        return x * torch.sqrt(self.var + 1e-6) + self.mean
+
+    def state(self):
+        return {"mean": self.mean.cpu(), "var": self.var.cpu(), "count": self.count}
+
+    def load(self, s, device):
+        self.mean, self.var, self.count = s["mean"].to(device), s["var"].to(device), s["count"]
+
+
+def mlp(n_in, n_out, hidden, layer_norm=False):
     layers, last = [], n_in
     for h in hidden:
-        layers += [torch.nn.Linear(last, h), torch.nn.ELU()]
+        lin = torch.nn.Linear(last, h)
+        torch.nn.init.orthogonal_(lin.weight, gain=math.sqrt(2.0))
+        torch.nn.init.zeros_(lin.bias)
+        layers.append(lin)
+        if layer_norm:
+            layers.append(torch.nn.LayerNorm(h))
+        layers.append(torch.nn.ELU())
         last = h
-    layers.append(torch.nn.Linear(last, n_out))
+    head = torch.nn.Linear(last, n_out)
+    torch.nn.init.orthogonal_(head.weight, gain=1.0)
+    torch.nn.init.zeros_(head.bias)
+    layers.append(head)
     return torch.nn.Sequential(*layers)
 
 
-def make_agent(n_obs, n_act, hidden, log_std=None):
+def make_agent(n_obs, n_act, hidden, log_std=None, layer_norm=True):
     """The actor (a Gaussian about its mean; its spread learned, or fixed at e^`log_std`) and the
     critic, two nets."""
 
     class Agent(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.pi = mlp(n_obs, n_act, hidden)
-            self.v = mlp(n_obs, 1, hidden)
-            self.log_std = torch.nn.Parameter(torch.full((n_act,), -1.6 if log_std is None else log_std),
+            self.pi = mlp(n_obs, n_act, hidden, layer_norm=layer_norm)
+            self.v = mlp(n_obs, 1, hidden, layer_norm=layer_norm)
+            self.log_std = torch.nn.Parameter(torch.full((n_act,), -2.3 if log_std is None else log_std),
                                               requires_grad=log_std is None)
             with torch.no_grad():
                 self.pi[-1].weight.mul_(0.01)
@@ -402,30 +504,32 @@ LEAST_LOG_STD = -3.0
 BOUND = 1.1
 
 
-def ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, target_kl, bounds=0.01):
-    """PPO's epochs over the rollout (clipped at 0.2, four minibatches an epoch), the actor's and
-    the critic's gradients each clipped to 1 apart, the actions' means held within `BOUND`
-    (weight `bounds`), and no epoch after one whose mean KL passed
-    `target_kl`, the rate of learning lowered after an update that passed it and raised after one
-    under a quarter of it. Gives (the last epoch's mean KL, minibatches skipped), the share
-    clipped, the value loss and the epochs run."""
+def ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, target_kl, bounds=0.01, vnorm=None):
+    """PPO's epochs over the rollout (clipped at 0.2, 8 minibatches of 16,384 an epoch), actor and
+    critic gradients clipped to 1 apart, value targets normalized by `vnorm` when given, actions'
+    means held within `BOUND` (weight `bounds`), and smooth KL-adaptive learning rate."""
     dev = b_obs.device
     n = b_obs.shape[0]
-    mb = max(n // 4, 1)
+    mb = max(n // 8, 1)
+    if vnorm is not None:
+        vnorm.update(b_ret)
+        b_ret_t = vnorm.norm(b_ret)
+    else:
+        b_ret_t = b_ret
     actor = list(agent.pi.parameters()) + ([agent.log_std] if agent.log_std.requires_grad else [])
     critic = list(agent.v.parameters())
     skipped, kl, clipped, vloss, epochs = 0, 0.0, 0.0, 0.0, 0
-    for _ in range(5):
+    for _ in range(4):
         perm = torch.randperm(n, device=dev, generator=gen)
         kls, clips, vls = [], [], []
         for i in range(0, n, mb):
             j = perm[i:i + mb]
             dist = agent.dist(b_obs[j])
             lp = dist.log_prob(b_act[j]).sum(-1)
-            log_ratio = lp - b_logp[j]
+            log_ratio = (lp - b_logp[j]).clamp(-20.0, 20.0)
             ratio = torch.exp(log_ratio)
             pg = -torch.min(ratio * b_adv[j], ratio.clamp(0.8, 1.2) * b_adv[j]).mean()
-            vl = 0.5 * ((agent.v(b_obs[j]).squeeze(-1) - b_ret[j]) ** 2).mean()
+            vl = 0.5 * ((agent.v(b_obs[j]).squeeze(-1) - b_ret_t[j]) ** 2).mean()
             mu = dist.mean
             bl = (torch.relu(mu - BOUND) ** 2 + torch.relu(-BOUND - mu) ** 2).sum(-1).mean()
             loss = pg + vl + bounds * bl
@@ -445,18 +549,15 @@ def ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, target_kl, bounds=0
         epochs += 1
         if kls:
             kl, clipped, vloss = sum(kls) / len(kls), sum(clips) / len(clips), sum(vls) / len(vls)
-        if 0 < target_kl < kl:
+        if 0 < target_kl and kl > 2.0 * target_kl:
             break
     if target_kl <= 0:
-        # No target: the rate fixed, every epoch run.
         return (kl, skipped), clipped, vloss, epochs
-    # The rate of learning follows the KL (the adaptive rate of rl_games, used by AMP and its
-    # successors): down when a step moved the policy more than the target, up when much less.
     for g in opt.param_groups:
-        if kl > target_kl:
-            g["lr"] = max(g["lr"] / 1.5, 1e-6)
-        elif kl < 0.25 * target_kl:
-            g["lr"] = min(g["lr"] * 1.5, 1e-3)
+        if kl > 1.5 * target_kl:
+            g["lr"] = max(g["lr"] / 1.25, 1e-5)
+        elif kl < 0.5 * target_kl:
+            g["lr"] = min(g["lr"] * 1.25, 1e-3)
     return (kl, skipped), clipped, vloss, epochs
 
 
@@ -473,14 +574,15 @@ class Guard:
     def recent(self):
         return sum(self.rewards) / max(len(self.rewards), 1)
 
-    def keep(self, step, agent, opt, norm):
+    def keep(self, step, agent, opt, norm, vnorm=None):
         if len(self.rewards) < 5:
             return
         r = self.recent()
         if r >= 0.95 * self.best:
             self.best = max(self.best, r)
             self.good = {"step": step, "agent": {k: v.detach().clone() for k, v in agent.state_dict().items()},
-                         "opt": __import__("copy").deepcopy(opt.state_dict()), "norm": norm.state()}
+                         "opt": __import__("copy").deepcopy(opt.state_dict()), "norm": norm.state(),
+                         "vnorm": vnorm.state() if vnorm is not None else None}
 
     def rebase(self):
         self.rewards, self.best = [], 0.0
@@ -489,13 +591,15 @@ class Guard:
         return self.good is not None and len(self.rewards) == 5 and self.recent() < 0.85 * self.best \
             and self.rollbacks < 6
 
-    def restore(self, agent, opt, norm):
+    def restore(self, agent, opt, norm, vnorm=None):
         agent.load_state_dict(self.good["agent"])
         lr = opt.param_groups[0]["lr"] * 0.5
         opt.load_state_dict(self.good["opt"])
         for g in opt.param_groups:
             g["lr"] = lr
         norm.load(self.good["norm"], agent.log_std.device)
+        if vnorm is not None and self.good.get("vnorm") is not None:
+            vnorm.load(self.good["vnorm"], agent.log_std.device)
         self.rewards = []
         self.rollbacks += 1
 
@@ -518,6 +622,8 @@ def play(sim, agent, norm, clips, most_frames=None, record=False, push=None):
         sim.frame[:] = 0
         g = sim.starts[c]
         sim.qpos[:] = sim.ref_q[g]
+        lift = sim.ref_lift[g]
+        sim.qpos[:, 1] += torch.where(lift > 0.002, lift, torch.zeros_like(lift))
         sim.qvel[:] = sim.ref_vel(g)
         sim.warm[:] = 0.0
         mjw.kinematics(sim.m, sim.d)
@@ -538,7 +644,7 @@ def play(sim, agent, norm, clips, most_frames=None, record=False, push=None):
                 force, first, frames_on = push
                 on = (t >= first) & (t < first + frames_on)
                 sim.xfrc[:, 1, :3] = torch.where(on[:, None], force, torch.zeros_like(force))
-            sim.step(sim.ref_q[sim.global_frame(1)][:, 7:] + 0.5 * a.clamp(-1, 1))
+            sim.step(sim.ref_q[sim.global_frame(1)][:, 7:] + sim.act_scale * a.clamp(-1, 1))
             _, fell, ex = reward(sim)
             live_clip = sim.frame < (sim.lengths[sim.clip] - 1)
             newly = alive & fell & live_clip
@@ -622,13 +728,22 @@ def variants(head, refs, clip, n, seed):
     return h, np.concatenate(chunks), kinds
 
 
-def summary(results):
+def summary(results, names=None):
     if not results:
         return {"clips": 0}
     followed = sum(r["followed"] for r in results)
     frames = sum(r["frames"] for r in results)
     mean_mm = 1000.0 * sum(r["mean_m"] * r["frames"] for r in results) / max(frames, 1)
-    return {"clips": len(results), "followed": followed / len(results), "mean_segment_mm": mean_mm}
+    out = {"clips": len(results), "followed": followed / len(results), "mean_segment_mm": mean_mm}
+    if names is not None:
+        groups = {}
+        for r in results:
+            nm = names[r["clip"]]
+            src = nm.split("/", 1)[0] if "/" in nm else ""
+            groups.setdefault(src, []).append(r)
+        if len(groups) > 1:
+            out["by_source"] = {k: summary(v) for k, v in sorted(groups.items())}
+    return out
 
 
 def evaluate(sim, agent, norm, most_frames=600):
@@ -636,8 +751,8 @@ def evaluate(sim, agent, norm, most_frames=600):
     clips' results weigh how often each starts a world after."""
     training = play(sim, agent, norm, sim.train.tolist(), most_frames)
     sim.weigh(training)
-    return {"training": summary(training),
-            "test": summary(play(sim, agent, norm, sim.test.tolist(), most_frames))}
+    return {"training": summary(training, sim.names),
+            "test": summary(play(sim, agent, norm, sim.test.tolist(), most_frames), sim.names)}
 
 
 def filtered(sim, agent, norm, head, push=None):
@@ -688,16 +803,15 @@ def main():
     p.add_argument("--steps", type=int, default=1000, help="updates of the net")
     p.add_argument("--horizon", type=int, default=32)
     p.add_argument("--substeps", type=int, default=4)
-    p.add_argument("--hidden", default="1024,512")
+    p.add_argument("--hidden", default="1024,512,256")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--eval-every", type=int, default=200)
     p.add_argument("--bounds", type=float, default=0.01, help="the weight of the bounds loss on the actions' means")
-    p.add_argument("--log-std", type=float, default=None,
-                   help="the actions' spread fixed at e^this (a learned spread shrinks, and with it "
-                        "the step PPO can take: p4h-3 fell apart at a mean of -2.1)")
+    p.add_argument("--log-std", type=float, default=-2.3,
+                   help="the actions' spread fixed at e^this; pass --learn-std to learn it")
+    p.add_argument("--learn-std", action="store_true", help="learn action log_std instead of fixing it")
     p.add_argument("--target-kl", type=float, default=0.02,
-                   help="the epochs of an update stop when the mean KL of the last passes this, and the rate "
-                        "follows it; 0: no target, the rate fixed")
+                   help="target mean KL per PPO update (adaptive LR); 0 disables")
     p.add_argument("--start-share", type=float, default=0.25,
                    help="the share of worlds started at their clip's first frame (the evaluation plays each "
                         "clip from there)")
@@ -729,15 +843,18 @@ def main():
         sim.start_share = a.start_share
         sim.fall_mean = a.fall_mean
         print(f"sim: {a.worlds} worlds, {len(head['names'])} clips, {refs.shape[0]} frames, "
+              f"{sim.active.numel()} active bodies, {sim.mjm.nu} actuators, "
               f"set up in {time.time() - t0:.0f} s", flush=True)
         sim.reset(torch.ones(a.worlds, dtype=torch.bool, device=dev))
-        mjw.kinematics(sim.m, sim.d)
         n_obs = observe(sim).shape[1]
         n_act = sim.mjm.nu
         hidden = [int(x) for x in a.hidden.split(",")]
-        agent = make_agent(n_obs, n_act, hidden, a.log_std).to(dev)
+        log_std_arg = None if a.learn_std else a.log_std
+        agent = make_agent(n_obs, n_act, hidden, log_std_arg).to(dev)
         opt = torch.optim.Adam(agent.parameters(), lr=a.lr)
         norm = Normal(n_obs, dev)
+        vnorm = ValNorm(dev)
+        print(f"net: n_obs={n_obs}, n_act={n_act}, hidden={hidden}, log_std={'learned' if a.learn_std else a.log_std}", flush=True)
         step, samples = 0, 0
         best = None
         state = run.resume()
@@ -760,8 +877,6 @@ def main():
             try:
                 w = torch.load(a.init, map_location=dev, weights_only=False)
             except Exception:
-                # A run's checkpoint is a pickle (runlib) whose tensors may be the GPU's: each
-                # storage is read onto this device.
                 import io
                 import pickle
                 import torch.storage as ts
@@ -774,13 +889,16 @@ def main():
                     ts._load_from_bytes = was
             agent.load_state_dict({k: v.to(dev) for k, v in w["agent"].items()})
             norm.load(w["norm"], dev)
+            if "vnorm" in w:
+                vnorm.load(w["vnorm"], dev)
             print(f"init: the net and the observations' scale of {a.init} (its update {w.get('step')})", flush=True)
         if state is not None:
             agent.load_state_dict(state["agent"])
             opt.load_state_dict(state["opt"])
             norm.load(state["norm"], dev)
+            if "vnorm" in state:
+                vnorm.load(state["vnorm"], dev)
             step, samples = state["step"], state["samples"]
-            # A generator's state is a CPU byte tensor on any device.
             gen.set_state(state["gen"].cpu())
             torch.set_rng_state(state["torch_rng"])
             if "weights" in state:
@@ -810,21 +928,22 @@ def main():
                     act = dist.sample()
                     obs_buf[h], act_buf[h] = o, act
                     logp_buf[h] = dist.log_prob(act).sum(-1)
-                    val_buf[h] = agent.v(o).squeeze(-1)
-                    sim.step(sim.ref_q[sim.global_frame(1)][:, 7:] + 0.5 * act.clamp(-1, 1))
-                    r, fell, _ = reward(sim)
+                    val_buf[h] = vnorm.denorm(agent.v(o).squeeze(-1))
+                    act_c = act.clamp(-1, 1)
+                    sim.step(sim.ref_q[sim.global_frame(1)][:, 7:] + sim.act_scale * act_c)
+                    r, fell, _ = reward(sim, act_c)
                     blown += int(exploded(sim).sum())
                     ended = sim.frame >= (sim.lengths[sim.clip] - 2)
                     # At a clip's end the return goes on (its value); at a fall it stops.
                     trunc_val[h] = 0.0
                     if ended.any():
-                        trunc_val[h] = torch.where(ended & ~fell, agent.v(norm(observe(sim))).squeeze(-1), 0.0)
+                        trunc_val[h] = torch.where(ended & ~fell, vnorm.denorm(agent.v(norm(observe(sim))).squeeze(-1)), 0.0)
                     rew_buf[h] = r
                     done_buf[h] = (fell | ended).float()
                     ep_r += float(r.mean())
                     ep_fall += float(fell.float().mean())
                     sim.reset(fell | ended)
-                val_buf[H] = agent.v(norm(observe(sim))).squeeze(-1)
+                val_buf[H] = vnorm.denorm(agent.v(norm(observe(sim))).squeeze(-1))
                 # GAE.
                 adv = torch.zeros(H, N, device=dev)
                 last = torch.zeros(N, device=dev)
@@ -841,7 +960,7 @@ def main():
             with torch.no_grad():
                 past = float((agent.pi(b_obs[:4096]).abs() > 1.0).float().mean())
             kl, clipped, vloss, epochs = ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, a.target_kl,
-                                             a.bounds)
+                                             a.bounds, vnorm=vnorm)
             skipped += kl[1]
             step += 1
             samples += H * N
@@ -862,10 +981,10 @@ def main():
             if guard.collapsed():
                 print(f"update {step}: collapse (reward {guard.recent():.3f} against {guard.best:.3f}): "
                       f"back to update {guard.good['step']}, rate of learning halved", flush=True)
-                guard.restore(agent, opt, norm)
+                guard.restore(agent, opt, norm, vnorm)
                 step = guard.good["step"]
             elif step % 25 == 0:
-                guard.keep(step, agent, opt, norm)
+                guard.keep(step, agent, opt, norm, vnorm)
             if a.eval_every and step % a.eval_every == 0:
                 last_eval = evaluate(sim, agent, norm)
                 print(f"evaluate at {step}: {json.dumps(last_eval)}", flush=True)
@@ -880,7 +999,7 @@ def main():
             if run.due() or step == a.steps:
                 run.checkpoint(step, {
                     "agent": {k: v.cpu() for k, v in agent.state_dict().items()},
-                    "opt": opt.state_dict(), "norm": norm.state(), "step": step,
+                    "opt": opt.state_dict(), "norm": norm.state(), "vnorm": vnorm.state(), "step": step,
                     "samples": samples, "gen": gen.get_state().cpu(),
                     "torch_rng": torch.get_rng_state(), "weights": sim.weights.cpu(), "best": best,
                     "n_obs": n_obs, "n_act": n_act,
@@ -907,8 +1026,8 @@ def main():
         if a.filtered:
             data, results = filtered(sim, agent, norm, head)
             run.output("filtered.bin", data)
-            full = {"training": summary([r for r in results if r["clip"] in set(sim.train.tolist())]),
-                    "test": summary([r for r in results if r["clip"] in set(sim.test.tolist())])}
+            full = {"training": summary([r for r in results if r["clip"] in set(sim.train.tolist())], sim.names),
+                    "test": summary([r for r in results if r["clip"] in set(sim.test.tolist())], sim.names)}
             print(f"the filtered capture, every clip to its end: {json.dumps(full)}", flush=True)
         run.finish({"step": step, "samples": samples, "evaluation": final, "full": full,
                     "seconds": time.time() - t0})

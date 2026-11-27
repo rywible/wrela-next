@@ -22,15 +22,44 @@ import numpy as np
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
+def longest_clean_span(data, rate, max_root_speed, max_joint_speed):
+    """Longest contiguous frame slice with no unphysical root teleport or joint jump."""
+    n = data.shape[0]
+    if n < 2 or (max_root_speed <= 0 and max_joint_speed <= 0):
+        return 0, n
+    bad = np.zeros(n - 1, dtype=bool)
+    if max_root_speed > 0:
+        v_root = np.linalg.norm(data[1:, :3] - data[:-1, :3], axis=-1) * rate
+        bad |= v_root > max_root_speed
+    if max_joint_speed > 0 and data.shape[1] > 7:
+        v_jnt = np.abs(data[1:, 7:] - data[:-1, 7:]).max(axis=-1) * rate
+        bad |= v_jnt > max_joint_speed
+    if not bad.any():
+        return 0, n
+    cuts = [-1] + list(np.nonzero(bad)[0]) + [n - 1]
+    best_a, best_b = 0, 0
+    for c0, c1 in zip(cuts[:-1], cuts[1:]):
+        a, b = int(c0 + 1), int(c1 + 1)
+        if b - a > best_b - best_a:
+            best_a, best_b = a, b
+    return best_a, best_b
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("sets", nargs="+")
     p.add_argument("--most", type=int, default=0, help="at most this many clips of each set")
     p.add_argument("-o", required=True)
     p.add_argument("--sim", default=".movement/sim", help="the export's folder (its refs/)")
+    p.add_argument("--max-root-speed", type=float, default=5.0,
+                   help="cut clips at frames where root speed exceeds this (m/s); 0 disables")
+    p.add_argument("--max-joint-speed", type=float, default=25.0,
+                   help="cut clips at frames where any joint speed exceeds this (rad/s); 0 disables")
+    p.add_argument("--min-frames", type=int, default=60,
+                   help="drop clean spans shorter than this many frames")
     a = p.parse_args()
     names, starts, lengths, chunks, which = [], [], [], [], []
-    nq, rate, total, missing = None, None, 0, 0
+    nq, rate, total, missing, trimmed, dropped = None, None, 0, 0, 0, 0
     for s in a.sets:
         path = s if s.endswith(".txt") else os.path.join(ROOT, "tools/movement/split", f"{s}.txt")
         lines = [l.strip() for l in open(path) if l.strip() and not l.startswith("#")]
@@ -48,6 +77,14 @@ def main():
             data = np.frombuffer(b, dtype="<f4", offset=24, count=n * row).reshape(n, row)[:, :q]
             assert nq in (None, q) and rate in (None, r)
             nq, rate = q, r
+            i0, i1 = longest_clean_span(data, r, a.max_root_speed, a.max_joint_speed)
+            if i1 - i0 < a.min_frames:
+                dropped += 1
+                continue
+            if i0 > 0 or i1 < n:
+                trimmed += 1
+                data = data[i0:i1]
+                n = data.shape[0]
             names.append(name)
             which.append(os.path.basename(s)[:-4] if s.endswith(".txt") else s)
             starts.append(total)
@@ -59,8 +96,8 @@ def main():
                        "rate": rate, "sets": which}).encode()
     with open(a.o, "wb") as f:
         f.write(b"WRFS" + struct.pack("<I", len(head)) + head + body)
-    print(f"pack: {len(names)} clips ({missing} not exported), {total} frames ({total / rate / 3600:.2f} h), "
-          f"{os.path.getsize(a.o) / 1e6:.1f} MB")
+    print(f"pack: {len(names)} clips ({missing} not exported, {trimmed} trimmed at spikes, {dropped} dropped), "
+          f"{total} frames ({total / rate / 3600:.2f} h), {os.path.getsize(a.o) / 1e6:.1f} MB")
 
 
 main()

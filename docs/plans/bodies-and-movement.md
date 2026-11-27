@@ -391,6 +391,7 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-26 | `p4h-6` (L4): phase 4 on the human: 629 training clips, 91 test held out, 4000 updates; the actions' spread fixed at e^-2.3, the KL held to 0.05, collapses rolled back; stable, but the rate fell to 5.9e-5 and its falls a step at update 600 were 2.5% against p4h-3's 1.5%: stopped at update 690 for the bounds loss | 2.00 |
 | 2026-11-26 | `p4h-7` (L4): phase 4 on the human: 629 training clips, 91 test held out, 4000 updates; p4h-3's rate (2e-4, five epochs) with the actions' means held within 1.1 and collapses rolled back; no collapse, its best at update 2,000 (32.8% of training clips and 25.3% of test clips followed for 20 s, 54 mm), flat after, done | 10.71 |
 | 2026-11-26 | `p4h-8` (L4): phase 4 on the human with CeTI: 2038 clips of 100STYLE and CeTI (the fingers moved), 5000 updates; a quarter of the worlds started at their clip's first frame, the rate held to a KL of 0.1; 18.6, 22.4 and 24.6% of training clips followed for 20 s at updates 500, 1,000 and 1,500 (p4h-7 5.9, 20.3 and 28.6% of fewer clips), 47 mm: stopped at update 1,527 for the limit of a fall, its weights the start of `p4h-9` | 7.69 |
+| 2026-11-26 | `p4h-9` (L4): phase 4 on the human with CeTI: 2038 clips, 3500 updates from p4h-8's weights at update 1527; a fall at 0.5 m on average (Luo et al. 2023), a quarter of the worlds started at their clip's first frame, the rate held to a KL of 0.1 from 5e-5, stopped after full-pipeline audit found 48% joint-limit violations, stale reset kinematics, finger hijacking and 42 m/s reference spikes | 1.42 |
 
 #### A new machine
 
@@ -979,6 +980,23 @@ removes the faults of the retarget: slide, penetration and forces that cannot oc
   and the judge read it as they read the capture. The inverse of the export's qpos is exact
   (`-- human inverse test`: 234,187 frames, each segment's place to 0.0015 mm and its turn to
   0.0017 mrad).
+- Audit of `p4h-1`..`p4h-9` (2026-11-27): `p4h-9` was stopped after a full-pipeline audit found
+  seven root causes holding 100STYLE follow rate to 11.1% (70/629; headline 24.6% was mostly
+  standing CeTI clips): (1) welded finger bodies were still included in `observe()`, `errors()` and
+  `reward()` (30 of 55 bodies, 54.5%), and unlocking 40 finger DOFs halved throughput; (2) swing-twist
+  to Euler axis bounds caused 48.06% of reference frames (92.92% of CeTI, 21.66% of 100STYLE) to
+  violate MuJoCo `jnt_range`, causing nonstop solver iteration warnings; (3) `Sim.reset()` never
+  called `mjw.kinematics()`, so frame 0 of every reset episode observed stale segment poses from
+  the prior dead episode; (4) underground reset frames (up to -11.8 cm) launched bodies at 2.01 m/s
+  and 50 clips had velocity spikes up to 41.95 m/s; (5) averaged bidirectional strengths halved
+  ankle plantarflexion (`kp = 320 < mgL = 702`), clamped `ctrlrange` starved straight-knee torque,
+  and uniform `armature = 0.01` was 550x toe inertia; (6) unnormalized critic returns, narrow
+  exponential reward (dead past 0.20 m), `±pi` quaternion sign flips, and missing direct per-body
+  error features stalled PPO; (7) `lib/engine/judge/movement.wrela` truncated contact arrays at 64
+  parts (corrupting duty on the 81-part human). All seven are fixed in `.movement/sim-human3`
+  (2,038 sanitized clips, 25 active bodies, `nq = 69`, `nu = 62`, 0.0000% joint limit violations,
+  max root speed 4.99 m/s, 0.0023 mm kinematic error), along with the human torso/limb/ankle
+  geometry polish in `game/world/human.wrela`.
 
 ### Done when
 

@@ -48,14 +48,18 @@ const LEAST: f32 = 0.001
 const LEAST_INERTIA: f32 = 0.000001
 
 /// A servo's stiffness: this many times the joint's strength per radian.
-const STIFF: f32 = 4.0
+const STIFF: f32 = 5.0
+
+/// Minimum share of the body's total mass a segment's subtree must carry to stay articulated in
+/// the simulator (0.06%: on a 73 kg human, 44 g — keeps toes at 57 g and hands at 400 g, while
+/// welding 3–19 g finger phalanges whose whole-finger subtrees are <= 35 g and otherwise add 40
+/// high-frequency DOFs with negligible effect on whole-body balance and contact).
+const DYNAMIC_SHARE: f32 = 0.0006
 
 /// The fewest frames of a filtered clip kept (1 s at 30 a second): the solver's windows are 16.
 const LEAST_FRAMES: u32 = 30
 
-/// The model's step (s): 4 to a frame of the poses at 30 a second. On the L4 on 2026-11-25 the body
-/// stepped 95,000 frames a second at 4,096 worlds so (Newton, 10 iterations), 51,000 at steps of
-/// 1/240 s; 50 iterations were no faster than 10 (tools/movement/sim_speed_body.py).
+/// The model's step (s): 4 to a frame of the poses at 30 a second.
 const STEP: f32 = 0.008333334
 
 fn v3(v: vec3) -> String {
@@ -211,9 +215,66 @@ fn depth_first<const S: u32>(b: Body<S>) -> Vec<u32> {
     order
 }
 
+/// Tight Euler angle bounds `(lo, hi)` for each hinge of joint `j`: for a ball joint, samples
+/// valid swing-twist poses inside the joint's anatomical range cone and transforms them through
+/// `euler`, because swing-twist bounds do not contain the decomposed Euler angles (shoulders and
+/// wrists previously violated MuJoCo limits on 22–48% of capture frames).
+fn euler_bounds(j: Joint) -> (vec3, vec3) {
+    if j.kind != Kind::Ball {
+        return (j.lo, j.hi)
+    }
+    let o = ball_order(j)
+    var lo = vec3(1.0e9)
+    var hi = vec3(-1.0e9)
+    for h in 0..3 {
+        let (_, k) = hinge(j, h)
+        lo[h] = j.lo[k]
+        hi[h] = j.hi[k]
+    }
+    for ix in 0..5 {
+        let ux = f32(ix) / 4.0
+        let qx = mix(j.lo.x, j.hi.x, ux)
+        for iy in 0..5 {
+            let uy = f32(iy) / 4.0
+            let qy = mix(j.lo.y, j.hi.y, uy)
+            for iz in 0..5 {
+                let uz = f32(iz) / 4.0
+                let qz = mix(j.lo.z, j.hi.z, uz)
+                let q = j.clamped(vec3(qx, qy, qz))
+                let e = euler(turn(Kind::Ball, q), o)
+                lo = min(lo, e)
+                hi = max(hi, e)
+            }
+        }
+    }
+    (lo, hi)
+}
+
+/// Mass of segment `s` plus all of its descendants (kg).
+fn subtree_masses<const S: u32>(b: Body<S>, masses: [Mass; S]) -> [f32; S] {
+    var out = [0.0; S]
+    for s in 0..S {
+        out[s] = masses[s].mass
+    }
+    let order = depth_first(b)
+    var i = order.len()
+    while i > 0 {
+        i -= 1
+        let s = order[i]
+        if s != 0 {
+            let p = b.segments[s].joint.parent
+            if p < S {
+                out[p] += out[s]
+            }
+        }
+    }
+    out
+}
+
 fn model<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, moves: [bool; S]) -> String {
     let b = def.body
     let at = b.places(def.rest)
+    let sub_mass = subtree_masses(b, def.masses)
     var x = String::new()
     x.push_str(f"<mujoco model=\"{def.name}\">\n")
     x.push_str(
@@ -221,11 +282,11 @@ fn model<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, moves: [bo
     )
     x.push_str("  <compiler angle=\"radian\" autolimits=\"true\"/>\n")
     x.push_str(
-        f"  <option timestep=\"{STEP}\" iterations=\"10\" solver=\"Newton\" integrator=\"implicitfast\" gravity=\"0 -9.81 0\"/>\n",
+        f"  <option timestep=\"{STEP}\" iterations=\"25\" solver=\"Newton\" integrator=\"implicitfast\" gravity=\"0 -9.81 0\"/>\n",
     )
-    x.push_str("  <default>\n    <joint damping=\"0.5\" armature=\"0.01\" limited=\"true\"/>\n")
+    x.push_str("  <default>\n    <joint limited=\"true\"/>\n")
     x.push_str(
-        "    <geom contype=\"1\" conaffinity=\"0\" condim=\"3\" friction=\"0.8 0.02 0.01\" density=\"0\"/>\n  </default>\n",
+        "    <geom contype=\"1\" conaffinity=\"0\" condim=\"3\" friction=\"1.0 0.02 0.01\" density=\"0\"/>\n  </default>\n",
     )
     x.push_str("  <worldbody>\n")
     x.push_str(
@@ -259,15 +320,21 @@ fn model<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, moves: [bo
                 f"{ind}  <inertial pos=\"0 0 0\" mass=\"{LEAST}\" diaginertia=\"{LEAST_INERTIA} {LEAST_INERTIA} {LEAST_INERTIA}\"/>\n",
             )
         }
+        let i_max = max(i[0].x, max(i[1].y, i[2].z))
+        let arm = clamp(0.1 * max(i_max, 0.005 * sub_mass[s]), 0.0005, 0.02)
+        let (elo, ehi) = euler_bounds(j)
         for h in 0..(if moves[s] { hinges(j.kind) } else { 0 }) {
             let (ax, k) = hinge(j, h)
-            let (lo, hi) = (j.lo[k], j.hi[k])
-            x.push_str(
-                f"{ind}  <joint name=\"s{s}h{h}\" type=\"hinge\" axis=\"{v3(ax)}\" range=\"{lo - 0.05} {hi + 0.05}\"/>\n",
-            )
+            let (lo, hi) = (elo[h], ehi[h])
             let st = max(j.strength[k], 0.1)
+            let damp = clamp(0.01 * st, 0.05, 2.0)
+            x.push_str(
+                f"{ind}  <joint name=\"s{s}h{h}\" type=\"hinge\" axis=\"{v3(ax)}\" range=\"{lo - 0.1} {hi + 0.1}\" armature=\"{arm}\" damping=\"{damp}\"/>\n",
+            )
+            // Control target range extends past the hard joint range so the PD servo can exert
+            // full isometric torque right up to a limit (e.g. a straight knee in stance).
             actuators.push_str(
-                f"    <position name=\"s{s}h{h}\" joint=\"s{s}h{h}\" kp=\"{STIFF * st}\" kv=\"{0.1 * STIFF * st}\" forcerange=\"{-st} {st}\" ctrlrange=\"{lo - 0.05} {hi + 0.05}\"/>\n",
+                f"    <position name=\"s{s}h{h}\" joint=\"s{s}h{h}\" kp=\"{STIFF * st}\" kv=\"{0.1 * STIFF * st}\" forcerange=\"{-st} {st}\" ctrlrange=\"{lo - 0.6} {hi + 0.6}\"/>\n",
             )
         }
         // The parts whose first end is on this segment, as capsules in its frame. A welded
@@ -320,9 +387,9 @@ fn qpos_size<const S: u32>(b: Body<S>, moves: [bool; S]) -> u32 {
     n
 }
 
-/// Which segments the clips `names` move: a segment none of whose numbers any frame takes more
-/// than a milliradian from rest (a finger, where no capture has fingers) is welded to its parent
-/// in the model, as the simulator need not step a joint nothing moves. With no clips, all move.
+/// Which segments the clips `names` move and that carry enough subtree mass to matter to
+/// whole-body dynamics (`DYNAMIC_SHARE` of total mass): a segment none of whose numbers move, or a
+/// featherweight distal digit (< 0.06% of body mass), is welded to its parent in the simulator.
 fn moving<const S: u32, const D: u32, const P: u32>(
     def: Def<S, D, P>,
     names: Vec<String>,
@@ -342,6 +409,13 @@ fn moving<const S: u32, const D: u32, const P: u32>(
                     out[s] = true
                 }
             }
+        }
+    }
+    let sub = subtree_masses(def.body, def.masses)
+    let cutoff = DYNAMIC_SHARE * sub[0]
+    for s in 1..S {
+        if out[s] && sub[s] < cutoff {
+            out[s] = false
         }
     }
     out

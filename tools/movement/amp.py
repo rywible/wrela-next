@@ -63,14 +63,15 @@ DAMAGES = [("faster", 1.25), ("faster", 1.5), ("faster", 2.0),
 
 
 class Kin:
-    """The simulator's kinematics on a data of its own: each segment's place for any qpos."""
+    """The simulator's kinematics on a data of its own: each active segment's place for any qpos."""
 
-    def __init__(self, mjm, batch):
+    def __init__(self, mjm, batch, active=None):
         mjd = mujoco.MjData(mjm)
         mujoco.mj_forward(mjm, mjd)
         self.m = mjw.put_model(mjm)
         self.d = mjw.put_data(mjm, mjd, nworld=batch, nconmax=64, njmax=256, njmax_nnz=256 * mjm.nv)
         self.n = batch
+        self.active = active
         self.qpos = wp.to_torch(self.d.qpos)
         self.xpos = wp.to_torch(self.d.xpos)
 
@@ -80,7 +81,10 @@ class Kin:
             k = min(self.n, q.shape[0] - i)
             self.qpos[:k] = q[i:i + k]
             mjw.kinematics(self.m, self.d)
-            out.append(self.xpos[:k].clone())
+            if self.active is not None:
+                out.append(self.xpos[:k, self.active].clone())
+            else:
+                out.append(self.xpos[:k, 1:].clone())
         return torch.cat(out)
 
 
@@ -107,9 +111,9 @@ FASTEST = 2.5
 
 def features(qs, xs, rate):
     """The discriminator's input for a stretch of frames `qs` (B, K, qpos) and `xs` (B, K, each
-    segment's place): the first frame's state in its root's heading frame, then for each frame
-    after it the rates of that state from the frame before, and the root's speed and turn, all in
-    the first frame's heading frame."""
+    active segment's place, root at index 0): the first frame's state in its root's heading frame,
+    then for each frame after it the rates of that state from the frame before, and the root's
+    speed and turn, all in the first frame's heading frame."""
     T = track
     B, K = qs.shape[0], qs.shape[1]
     hq = T.quat_conj(T.heading(qs[:, 0, 3:7]))
@@ -118,7 +122,7 @@ def features(qs, xs, rate):
     local = T.quat_mul(hk, r)
     ex = torch.tensor([1.0, 0.0, 0.0], device=qs.device).expand(B, K, 3)
     ey = torch.tensor([0.0, 1.0, 0.0], device=qs.device).expand(B, K, 3)
-    rel = xs[:, :, 2:] - xs[:, :, 1:2]
+    rel = xs[:, :, 1:] - xs[:, :, :1]
     rel = T.quat_rotate(hk[:, :, None].expand(-1, -1, rel.shape[2], -1), rel).reshape(B, K, -1)
     st = torch.cat([qs[:, :, 1:2], T.quat_rotate(local, ex), T.quat_rotate(local, ey), qs[:, :, 7:], rel], -1)
     hk1 = hk[:, 1:]
@@ -140,7 +144,7 @@ class Clips:
     """The clips' frames and the stretches of frames the discriminator reads, as they are and
     damaged."""
 
-    def __init__(self, head, refs, kin, device, gen, q=None, x=None):
+    def __init__(self, head, refs, kin, device, gen, q=None, x=None, active=None):
         self.q = torch.tensor(refs, device=device) if q is None else q
         self.starts = torch.tensor(head["starts"], device=device, dtype=torch.long)
         self.lengths = torch.tensor(head["lengths"], device=device, dtype=torch.long)
@@ -148,6 +152,7 @@ class Clips:
         self.kin = kin
         self.dev = device
         self.gen = gen
+        self.active = active
         self.x = kin.places(self.q) if x is None else x
         sets = head.get("sets") or ["training"] * len(head["names"])
         self.train = [i for i, s in enumerate(sets) if s == "training"] or list(range(len(sets)))
@@ -242,7 +247,7 @@ class Disc(object):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
         self.opt.step()
-        return float(loss), float(dp.mean()), float(dn.mean())
+        return float(loss.detach()), float(dp.mean().detach()), float(dn.mean().detach())
 
     def state(self):
         return {"net": {k: v.cpu() for k, v in self.net.state_dict().items()}, "norm": self.norm.state(),
@@ -282,16 +287,18 @@ def check(disc, clips):
 
 
 def observe(sim, task):
-    """The body's state in its heading's frame (as the tracker's, with no clip) and what the task
-    gives of its goal (`tasks`), in the same frame."""
+    """The body's state in its heading's frame (active bodies only, continuous 6D root orientation)
+    and what the task gives of its goal (`tasks`), in the same frame."""
     T = track
     root_q = sim.xquat[:, 1]
     root_x = sim.xpos[:, 1]
     hq = T.quat_conj(T.heading(root_q))
+    local = T.quat_mul(hq, root_q)
     n = sim.n
-    rel = sim.xpos[:, 2:] - root_x[:, None]
+    act_x = sim.xpos[:, sim.active]
+    rel = act_x[:, 1:] - root_x[:, None]
     return torch.cat([
-        root_x[:, 1:2], T.quat_mul(hq, root_q), T.quat_rotate(hq, sim.qvel[:, :3]), sim.qvel[:, 3:6],
+        root_x[:, 1:2], T.rot6d(local), T.quat_rotate(hq, sim.qvel[:, :3]), T.quat_rotate(local, sim.qvel[:, 3:6]),
         sim.qpos[:, 7:], 0.1 * sim.qvel[:, 6:],
         T.quat_rotate(hq[:, None].expand(-1, rel.shape[1], -1), rel).reshape(n, -1),
         task.observe(),
@@ -314,8 +321,9 @@ def remember(sim, clips, hist_q, hist_x, which):
 
 def offline(a, run, dev, gen, head, refs, mjm):
     """The discriminator alone against damaged training clips: the check of its input."""
-    kin = Kin(mjm, a.batch)
-    clips = Clips(head, refs, kin, dev, gen)
+    active = torch.tensor([b for b in range(1, mjm.nbody) if mjm.body_jntnum[b] > 0], device=dev, dtype=torch.long)
+    kin = Kin(mjm, a.batch, active=active)
+    clips = Clips(head, refs, kin, dev, gen, active=active)
     n_in = clips.windows(clips.sample(2)).shape[1]
     disc = Disc(n_in, [int(x) for x in a.disc_hidden.split(",")], dev, a.disc_lr)
     print(f"offline: {len(clips.train)} training clips, {len(clips.test)} test, input {n_in}", flush=True)
@@ -391,14 +399,15 @@ def goal_test(a, sim, agent, norm, clips, head, fall_height, frames=600, kept=16
     alive = torch.ones(sim.n, dtype=torch.bool, device=sim.dev)
     fell_at = torch.full((sim.n,), frames, dtype=torch.long, device=sim.dev)
     hist_q = sim.qpos[:, None].expand(-1, WINDOW, -1).clone()
-    reach = torch.maximum(sim.lo.abs(), sim.hi.abs())
+    mid = 0.5 * (sim.jnt_lo + sim.jnt_hi)
+    half = 0.5 * (sim.jnt_hi - sim.jnt_lo)
     record = [sim.qpos[:kept].float().cpu().clone()]
     never = torch.zeros(sim.n, dtype=torch.bool, device=sim.dev)
     for t in range(frames):
         with torch.no_grad():
             act = agent.pi(norm(observe(sim, task)))
-        # A world that fell stands still: its actions change nothing that is counted.
-        sim.step(act.clamp(-1, 1) * reach)
+        # Map [-1, 1] across each joint's actual range (avoids 50% dead zone on asymmetric joints).
+        sim.step(mid + act.clamp(-1, 1) * half)
         hist_q = torch.cat([hist_q[:, 1:], sim.qpos[:, None]], 1)
         task.reward(hist_q, clips.rate)
         fell = alive & (track.exploded(sim) | (sim.qpos[:, 1] < fall_height))
@@ -424,26 +433,27 @@ def train(a, run, dev, gen, head, refs, mjm):
     T = track
     t0 = time.time()
     sim = T.Sim(a.model, head, refs, a.worlds, dev, a.substeps, gen)
-    kin = Kin(mjm, a.batch)
-    clips = Clips(head, refs, kin, dev, gen, q=sim.ref_q, x=sim.ref_x)
+    kin = Kin(mjm, a.batch, active=sim.active)
+    clips = Clips(head, refs, kin, dev, gen, q=sim.ref_q, x=sim.ref_x, active=sim.active)
     fall_height = a.fall * clips.root_height
     print(f"sim: {a.worlds} worlds, {len(head['names'])} clips, root height {clips.root_height:.3f} m, "
           f"set up in {time.time() - t0:.0f} s", flush=True)
     sim.reset(torch.ones(a.worlds, dtype=torch.bool, device=dev))
-    mjw.kinematics(sim.m, sim.d)
     N, H = a.worlds, a.horizon
     hist_q = torch.zeros(N, WINDOW, sim.nq, device=dev)
-    hist_x = torch.zeros(N, WINDOW, sim.nb, 3, device=dev)
+    hist_x = torch.zeros(N, WINDOW, sim.active.numel(), 3, device=dev)
     remember(sim, clips, hist_q, hist_x, torch.ones(N, dtype=torch.bool, device=dev))
     task = tasks.make(a.task, sim, gen, a.fastest)
     age = torch.zeros(N, dtype=torch.long, device=dev)
     n_obs = observe(sim, task).shape[1]
     n_act = sim.mjm.nu
-    reach = torch.maximum(sim.lo.abs(), sim.hi.abs())
+    mid = 0.5 * (sim.jnt_lo + sim.jnt_hi)
+    half = 0.5 * (sim.jnt_hi - sim.jnt_lo)
     hidden = [int(x) for x in a.hidden.split(",")]
     agent = T.make_agent(n_obs, n_act, hidden).to(dev)
     opt = torch.optim.Adam(agent.parameters(), lr=a.lr)
     norm = T.Normal(n_obs, dev)
+    vnorm = T.ValNorm(dev)
     n_in = clips.windows(clips.sample(2)).shape[1]
     disc = Disc(n_in, [int(x) for x in a.disc_hidden.split(",")], dev, a.disc_lr)
     step, samples = 0, 0
@@ -452,6 +462,8 @@ def train(a, run, dev, gen, head, refs, mjm):
         agent.load_state_dict(state["agent"])
         opt.load_state_dict(state["opt"])
         norm.load(state["norm"], dev)
+        if "vnorm" in state:
+            vnorm.load(state["vnorm"], dev)
         disc.load(state["disc"], dev)
         step, samples = state["step"], state["samples"]
         gen.set_state(state["gen"].cpu())
@@ -478,14 +490,13 @@ def train(a, run, dev, gen, head, refs, mjm):
                 act = dist.sample()
                 obs_buf[h], act_buf[h] = o, act
                 logp_buf[h] = dist.log_prob(act).sum(-1)
-                val_buf[h] = agent.v(o).squeeze(-1)
-                # The servos' targets: the net's numbers about the body at rest, each to its
-                # joint's farther limit at 1.
-                sim.step(act.clamp(-1, 1) * reach)
+                val_buf[h] = vnorm.denorm(agent.v(o).squeeze(-1))
+                # Map [-1, 1] symmetrically across each joint's actual range.
+                sim.step(mid + act.clamp(-1, 1) * half)
                 bad = T.exploded(sim)
                 blown += int(bad.sum())
                 hist_q = torch.cat([hist_q[:, 1:], sim.qpos[:, None]], 1)
-                hist_x = torch.cat([hist_x[:, 1:], sim.xpos[:, None]], 1)
+                hist_x = torch.cat([hist_x[:, 1:], sim.xpos[:, sim.active][:, None]], 1)
                 feat_buf[h] = torch.nan_to_num(features(hist_q, hist_x, clips.rate), 0.0, 0.0, 0.0)
                 r_task = task.reward(hist_q, clips.rate)
                 fell = bad | (sim.qpos[:, 1] < fall_height) | ~torch.isfinite(r_task)
@@ -494,7 +505,7 @@ def train(a, run, dev, gen, head, refs, mjm):
                 ended = age >= a.episode
                 trunc_val[h] = 0.0
                 if ended.any():
-                    trunc_val[h] = torch.where(ended & ~fell, agent.v(norm(observe(sim, task))).squeeze(-1), 0.0)
+                    trunc_val[h] = torch.where(ended & ~fell, vnorm.denorm(agent.v(norm(observe(sim, task))).squeeze(-1)), 0.0)
                 task_buf[h] = r_task
                 done_buf[h] = (fell | ended).float()
                 fell_buf[h] = fell.float()
@@ -505,7 +516,7 @@ def train(a, run, dev, gen, head, refs, mjm):
                 remember(sim, clips, hist_q, hist_x, again)
                 age[again] = 0
                 task.after(again)
-            val_buf[H] = agent.v(norm(observe(sim, task))).squeeze(-1)
+            val_buf[H] = vnorm.denorm(agent.v(norm(observe(sim, task))).squeeze(-1))
             style = disc.reward(feat_buf.reshape(H * N, -1)).reshape(H, N)
             # A fall earns nothing.
             style = style * (1.0 - fell_buf)
@@ -531,7 +542,7 @@ def train(a, run, dev, gen, head, refs, mjm):
         b_obs, b_act = obs_buf.reshape(H * N, -1), act_buf.reshape(H * N, -1)
         b_logp, b_adv, b_ret = logp_buf.reshape(-1), adv.reshape(-1), ret.reshape(-1)
         b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
-        kl, clipped, vloss, epochs = T.ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, a.target_kl)
+        kl, clipped, vloss, epochs = T.ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, a.target_kl, vnorm=vnorm)
         skipped = kl[1]
         step += 1
         samples += H * N
@@ -553,7 +564,7 @@ def train(a, run, dev, gen, head, refs, mjm):
         if run.due() or step == a.steps:
             run.checkpoint(step, {
                 "agent": {k: v.cpu() for k, v in agent.state_dict().items()},
-                "opt": opt.state_dict(), "norm": norm.state(), "disc": disc.state(), "step": step,
+                "opt": opt.state_dict(), "norm": norm.state(), "vnorm": vnorm.state(), "disc": disc.state(), "step": step,
                 "samples": samples, "gen": gen.get_state().cpu(), "torch_rng": torch.get_rng_state(),
                 "n_obs": n_obs, "n_act": n_act, "hidden": hidden, "args": vars(a),
             })
