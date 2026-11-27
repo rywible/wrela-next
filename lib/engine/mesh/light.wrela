@@ -856,15 +856,31 @@ fn rad_inject_skin_many<M: Field<Substance>, S: Sky>(
     )
 }
 
-/// Merges the occupied coarse emissive bins, in bin order (so the same bins always give the same
-/// lights), into at most `MAX_EMITTERS` lights: a light straddling bins stays one light. Each
-/// bin's light is its mean carried radiance over the mean projected area of its samples' bounding
-/// box (a convex body's mean projected area is a quarter of its surface, Cauchy's formula; a box
-/// of half-extents `a, b, c` is taken as the ellipsoid inside it, surface `4π(ab + bc + ca) / 3`),
-/// and merged lights add their fluxes.
+/// The words of one merged light in `emit_merge`'s state (float bits): its position times its
+/// weight (3), its weight, its flux (3), its `r²`, and its box's low and high corners (3 each); and
+/// after `MAX_EMITTERS` of them, how many there are.
+const MERGE_WORDS: u32 = 14
+const MERGE_STATE: u32 = MAX_EMITTERS * MERGE_WORDS + 1
+
+/// The bins one `emit_merge` dispatch merges: the merge is in bin order, one light found at a
+/// time, so it runs as a few dispatches of a share each, its state kept between them (one of all
+/// 256, its lights in thread arrays, was 943,823 work: 39 ms at the Radeon's step).
+const MERGE_BINS: u32 = 32
+
+fn merge_load(state: Atomics<u32>, k: u32, w: u32) -> f32 {
+    bitcast_f32(state.load(i: k * MERGE_WORDS + w))
+}
+
+/// Merges the occupied coarse emissive bins `part · MERGE_BINS` on, in bin order (so the same bins
+/// always give the same lights), into the lights `state` holds (none at part 0), at most
+/// `MAX_EMITTERS`: a light straddling bins stays one light. Each bin's light is its mean carried
+/// radiance over the mean projected area of its samples' bounding box (a convex body's mean
+/// projected area is a quarter of its surface, Cauchy's formula; a box of half-extents `a, b, c`
+/// is taken as the ellipsoid inside it, surface `4π(ab + bc + ca) / 3`), and merged lights add
+/// their fluxes.
 @compute(1)
 @budget(work: 64000)
-fn emit_compact(emit_accum: [u32], grid: RadGrid, out: mut Append<Emitter>, id: GlobalId) {
+fn emit_merge(emit_accum: [u32], grid: RadGrid, part: u32, state: mut Atomics<u32>, id: GlobalId) {
     let _ = id
     let span = 1.0 / max(grid.inv_span, 1.0e-6)
     let to_m = span / EMIT_PLACES
@@ -877,9 +893,21 @@ fn emit_compact(emit_accum: [u32], grid: RadGrid, out: mut Append<Emitter>, id: 
     var w_acc = [0.0; 32]
     var lo_acc = [vec3(0.0); 32]
     var hi_acc = [vec3(0.0); 32]
-    var count: u32 = 0
+    var count: u32 = if part == 0 { 0 } else { min(state.load(i: MERGE_STATE - 1), MAX_EMITTERS) }
+    for k in 0..count {
+        pos_acc[k] = vec3(merge_load(state, k, 0), merge_load(state, k, 1), merge_load(state, k, 2))
+        w_acc[k] = merge_load(state, k, 3)
+        flux_acc[k] = vec3(merge_load(state, k, 4), merge_load(state, k, 5), merge_load(state, k, 6))
+        r2_acc[k] = merge_load(state, k, 7)
+        lo_acc[k] = vec3(merge_load(state, k, 8), merge_load(state, k, 9), merge_load(state, k, 10))
+        hi_acc[k] = vec3(merge_load(state, k, 11), merge_load(state, k, 12), merge_load(state, k, 13))
+    }
 
-    for cell in 0..EMIT_CELLS {
+    for j in 0..MERGE_BINS {
+        let cell = part * MERGE_BINS + j
+        if cell >= EMIT_CELLS {
+            break
+        }
         let base = cell * EMIT_STRIDE
         let cnt = emit_accum[base + 6]
         if cnt == 0 {
@@ -940,12 +968,35 @@ fn emit_compact(emit_accum: [u32], grid: RadGrid, out: mut Append<Emitter>, id: 
     }
 
     for k in 0..count {
-        let pos = pos_acc[k] / max(w_acc[k], 1.0e-12)
-        let bound = length(max(hi_acc[k] - pos, pos - lo_acc[k]))
+        let at = k * MERGE_WORDS
+        let words = [
+            pos_acc[k].x, pos_acc[k].y, pos_acc[k].z, w_acc[k],
+            flux_acc[k].x, flux_acc[k].y, flux_acc[k].z, r2_acc[k],
+            lo_acc[k].x, lo_acc[k].y, lo_acc[k].z, hi_acc[k].x, hi_acc[k].y, hi_acc[k].z,
+        ]
+        for w in 0..MERGE_WORDS {
+            state.store(i: at + w, value: bitcast_u32(words[w]))
+        }
+    }
+    state.store(i: MERGE_STATE - 1, value: count)
+}
+
+/// The lights `emit_merge`'s state holds, into `out`.
+@compute(1)
+fn emit_lights(state: [u32], out: mut Append<Emitter>, id: GlobalId) {
+    let _ = id
+    let count = min(state[MERGE_STATE - 1], MAX_EMITTERS)
+    for k in 0..count {
+        let at = k * MERGE_WORDS
+        let w = bitcast_f32(state[at + 3])
+        let pos = vec3(bitcast_f32(state[at]), bitcast_f32(state[at + 1]), bitcast_f32(state[at + 2])) / max(w, 1.0e-12)
+        let lo = vec3(bitcast_f32(state[at + 8]), bitcast_f32(state[at + 9]), bitcast_f32(state[at + 10]))
+        let hi = vec3(bitcast_f32(state[at + 11]), bitcast_f32(state[at + 12]), bitcast_f32(state[at + 13]))
+        let bound = length(max(hi - pos, pos - lo))
         let _ = out.push(
             Emitter {
-                pos_r: vec4(pos, sqrt(r2_acc[k])),
-                flux_w: vec4(flux_acc[k], bound),
+                pos_r: vec4(pos, sqrt(bitcast_f32(state[at + 7]))),
+                flux_w: vec4(bitcast_f32(state[at + 4]), bitcast_f32(state[at + 5]), bitcast_f32(state[at + 6]), bound),
             },
         )
     }
@@ -1429,6 +1480,8 @@ pub struct RadianceCache {
     pub static_accum: GpuBuffer<u32>,
     pub static_emit_accum: GpuBuffer<u32>,
     pub emitters: AppendBuffer<Emitter>,
+    /// The lights `emit_merge` has merged so far this frame (`MERGE_STATE` words).
+    pub emit_state: GpuBuffer<u32>,
     pub tile_masks: GpuBuffer<u32>,
     pub tiles_x: u32,
     pub tiles_y: u32,
@@ -1452,6 +1505,7 @@ pub fn radiance_cache() -> RadianceCache {
         static_accum: buffer(RAD_VOXELS * 4),
         static_emit_accum: buffer(EMIT_CELLS * EMIT_STRIDE),
         emitters: append_buffer(MAX_EMITTERS),
+        emit_state: buffer(MERGE_STATE),
         tile_masks: buffer(1),
         tiles_x: 1,
         tiles_y: 1,
@@ -1826,14 +1880,18 @@ impl RadianceCache {
             rad_mip.bind(src: self.rad1, dst_side: s2, out: mut self.rad2),
             over: (s2, s2, s2),
         )
-        dispatch(
-            emit_compact.bind(
-                emit_accum: self.emit_accum.items(),
-                grid: self.grid,
-                out: mut self.emitters,
-            ),
-            over: 1,
-        )
+        for part in 0..(EMIT_CELLS + MERGE_BINS - 1) / MERGE_BINS {
+            dispatch(
+                emit_merge.bind(
+                    emit_accum: self.emit_accum.items(),
+                    grid: self.grid,
+                    part: part,
+                    state: mut self.emit_state,
+                ),
+                over: 1,
+            )
+        }
+        dispatch(emit_lights.bind(state: self.emit_state.items(), out: mut self.emitters), over: 1)
         self.rad1_grid = self.grid
     }
 }
