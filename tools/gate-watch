@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Keeps this machine's gate run on each pushed head of a branch, so nobody waits for it. Usage:
+
+    tools/gate-watch [--branch B] [--every S] [--here] [--once] [--args "..."]
+    tools/gate-watch --said [--branch B]
+
+A commit's gate is asked for with `tools/gate --seen REV` (what this machine saw of it, at once);
+this is what makes the gate see every pushed commit. It looks at `origin/B` (this checkout's
+branch unless `--branch` names one) every `--every` seconds (30), and when its head is one this
+machine's gate has not seen whole, runs `tools/gate --full --all` on it (`--args` gives others)
+and keeps what it printed.
+
+WHERE IT RUNS. Not in a working checkout: the files there are somebody's work under way. It keeps
+a checkout of its own, a git worktree at `~/.wrela/gate-tree/<repository>-<branch>` (detached at
+the head it is gating, its own toolchain built there once, about 5 GB), and runs the gate in it.
+`--here` runs it in this checkout instead, after `git pull --ff-only`: for a checkout that is
+nobody's working copy (the Linux machine's, which `tools/radeon` keeps at the pushed head).
+
+WHAT IT KEEPS, under `~/.wrela/gate/<machine>/` (beside the gate's own records, which `--seen`
+reads):
+
+  watch-<branch>.json   the last head gated: its commit, whether it passed, when, how long.
+  watch-<branch>.log    what the last gate printed, whole.
+  watch-<branch>.said   one line a gate, newest last: `2026-11-27 21:04 99acbc9 FAILED 337 s: ...`
+                        with the rows that failed. `--said` prints its last lines and exits.
+
+It takes the GPU as every run does (tools/gpu's lock, a run at a time), so a run started by hand
+while it gates waits a run's length, not the gate's. One watch a branch a machine: a second one
+started for the same branch says so and exits. `--once` gates the head if it is not seen, and
+exits (0 passed or already seen to pass, 1 failed).
+"""
+
+import fcntl
+import json
+import os
+import platform
+import subprocess
+import sys
+import time
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+MACHINE = "m4" if platform.system() == "Darwin" else "radeon"
+KEPT = os.path.join(os.path.expanduser("~"), ".wrela", "gate", MACHINE)
+
+
+def git(root, *args, check=True):
+    p = subprocess.run(["git", "-C", root, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args[:3])}: {p.stderr.strip()[:300]}")
+    return p.stdout.strip()
+
+
+def say(msg):
+    print(f"gate-watch: {msg}", file=sys.stderr, flush=True)
+
+
+def tree_for(branch):
+    """This machine's checkout for gating `branch`: a worktree of this repository, made once."""
+    name = f"{os.path.basename(ROOT)}-{branch.replace('/', '-')}"
+    tree = os.path.join(os.path.expanduser("~"), ".wrela", "gate-tree", name)
+    if not os.path.isdir(os.path.join(tree, "tools")):
+        os.makedirs(os.path.dirname(tree), exist_ok=True)
+        git(ROOT, "worktree", "prune")
+        git(ROOT, "worktree", "add", "--detach", tree, f"origin/{branch}")
+        say(f"made its checkout at {tree}")
+    return tree
+
+
+def gate(tree, head, branch, args):
+    """Runs the gate in `tree` at `head`; what it kept of it."""
+    began = time.monotonic()
+    log = os.path.join(KEPT, f"watch-{branch.replace('/', '-')}.log")
+    with open(log, "w") as f:
+        p = subprocess.run([os.path.join(tree, "tools", "gate"), *args], stdout=f, stderr=subprocess.STDOUT, cwd=tree)
+    took = time.monotonic() - began
+    with open(log) as f:
+        out = f.read()
+    # A failed row's name: what stands between `FAIL` and the columns after it.
+    failed = [l[len("  FAIL "):].split("   ")[0].strip() for l in out.splitlines() if l.startswith("  FAIL ")]
+    rec = {"commit": head, "passed": p.returncode == 0, "when": time.strftime("%Y-%m-%d %H:%M"),
+           "seconds": round(took), "failed": failed}
+    base = os.path.join(KEPT, f"watch-{branch.replace('/', '-')}")
+    with open(base + ".json", "w") as f:
+        json.dump(rec, f, indent=1)
+        f.write("\n")
+    with open(base + ".said", "a") as f:
+        what = "passed" if rec["passed"] else "FAILED"
+        rows = "" if rec["passed"] else ": " + "; ".join(failed[:12]) + (" ..." if len(failed) > 12 else "")
+        f.write(f"{rec['when']} {head[:7]} {what} {rec['seconds']} s{rows}\n")
+    return rec
+
+
+def main():
+    opts = {"branch": None, "every": 30.0, "here": False, "once": False, "said": False,
+            "args": ["--full", "--all"]}
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        if a in ("--here", "--once", "--said"):
+            opts[a[2:]] = True
+        elif a in ("--branch", "--every", "--args") and i + 1 < len(argv):
+            i += 1
+            opts[a[2:]] = argv[i].split() if a == "--args" else (float(argv[i]) if a == "--every" else argv[i])
+        else:
+            print(f"gate-watch: unknown argument `{a}`\n{__doc__}", file=sys.stderr)
+            return 2
+        i += 1
+    branch = opts["branch"] or git(ROOT, "branch", "--show-current")
+    if not branch:
+        print("gate-watch: this checkout is on no branch: name one with --branch", file=sys.stderr)
+        return 2
+    os.makedirs(KEPT, exist_ok=True)
+    base = os.path.join(KEPT, f"watch-{branch.replace('/', '-')}")
+    if opts["said"]:
+        try:
+            with open(base + ".said") as f:
+                print("".join(f.readlines()[-10:]), end="")
+        except OSError:
+            print(f"gate-watch: nothing gated of {branch} on this machine yet")
+        return 0
+    lock = open(base + ".lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"gate-watch: {branch} is watched on this machine already", file=sys.stderr)
+        return 2
+    last = None
+    try:
+        with open(base + ".json") as f:
+            last = json.load(f).get("commit")
+    except (OSError, ValueError):
+        pass
+    say(f"watching origin/{branch} on {MACHINE}" + (", here" if opts["here"] else ""))
+    while True:
+        try:
+            git(ROOT, "fetch", "--quiet", "origin", branch)
+            head = git(ROOT, "rev-parse", f"origin/{branch}")
+            if head != last:
+                if opts["here"]:
+                    tree = ROOT
+                    git(tree, "pull", "--quiet", "--ff-only", "origin", branch)
+                else:
+                    tree = tree_for(branch)
+                    git(tree, "checkout", "--quiet", "--detach", head)
+                say(f"gating {head[:7]}")
+                rec = gate(tree, head, branch, opts["args"])
+                say(f"{head[:7]} {'passed' if rec['passed'] else 'FAILED'} in {rec['seconds']} s")
+                last = head
+                if opts["once"]:
+                    return 0 if rec["passed"] else 1
+            elif opts["once"]:
+                with open(base + ".json") as f:
+                    return 0 if json.load(f).get("passed") else 1
+        except RuntimeError as e:
+            say(str(e))
+        except OSError as e:
+            say(str(e))
+        time.sleep(opts["every"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
