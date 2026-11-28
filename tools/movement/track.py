@@ -222,6 +222,11 @@ class Sim:
         # some 15 ms rising, 50 falling). 0: none, the command applied at once.
         self.applied = torch.zeros(worlds, self.mjm.nu, device=device)
         self.activation_ms = 0.0
+        # The joints' numbers a frame ago and two (`accel_weight`: the reward falls with the
+        # joints' acceleration's distance from the clip's, which is what a tremor is made of).
+        self.joints_1 = torch.zeros(worlds, self.mjm.nq - 7, device=device)
+        self.joints_2 = torch.zeros(worlds, self.mjm.nq - 7, device=device)
+        self.accel_weight = 0.0
         self.read_last = False
         self.rate_weight = 0.0
         # The soles: the feet and the toes (segments 9, 10, 13 and 14 of the human), as places in
@@ -308,6 +313,7 @@ class Sim:
         self.warm[idx] = 0.0
         self.last_act[idx] = 0.0
         self.applied[idx] = 0.0
+        self.joints_1[idx] = self.ref_q[torch.maximum(g - 1, self.starts[c])][:, 7:]
         mjw.kinematics(self.m, self.d)
 
     def weigh(self, results):
@@ -328,6 +334,8 @@ class Sim:
     def step(self, targets):
         # The soles' places before the step: how far they slide in it (`reward`).
         self.sole_before = self.xpos[:, self.active[self.soles]].clone() if self.soles.numel() else None
+        self.joints_2 = self.joints_1
+        self.joints_1 = self.qpos[:, 7:].clone()
         self.ctrl[:] = torch.maximum(torch.minimum(targets, self.hi), self.lo)
         if self.graph is None and self.dev.startswith("cuda"):
             with wp.ScopedCapture() as cap:
@@ -499,6 +507,16 @@ def reward(sim, act_clamped=None):
             # A change of the action from the last costs (the shake's cure).
             d = act_clamped - sim.last_act
             r = (r - sim.rate_weight * (d * d).mean(-1)).clamp(min=0.0)
+    if sim.accel_weight > 0.0:
+        # The joints' acceleration over the last two frames against the clip's over the same
+        # (rad a frame squared): a body that shakes about its clip's path has the first without
+        # the second.
+        lo = sim.starts[sim.clip]
+        mine = sim.qpos[:, 7:] - 2.0 * sim.joints_1 + sim.joints_2
+        theirs = sim.ref_q[g][:, 7:] - 2.0 * sim.ref_q[torch.maximum(g - 1, lo)][:, 7:] + \
+            sim.ref_q[torch.maximum(g - 2, lo)][:, 7:]
+        d = mine - theirs
+        r = r * torch.exp(-sim.accel_weight * (d * d).mean(-1))
     if sim.range_weight > 0.0:
         # The body's ranges, which the simulator's hinges do not hold (`range_excess`).
         r = r * torch.exp(-sim.range_weight * range_excess(sim))
@@ -761,6 +779,7 @@ def play(sim, agent, norm, clips, most_frames=None, record=False, push=None):
         mjw.kinematics(sim.m, sim.d)
         sim.last_act[:] = 0.0
         sim.applied[:] = 0.0
+        sim.joints_1[:] = sim.ref_q[g][:, 7:]
         alive = torch.ones(sim.n, dtype=torch.bool, device=sim.dev)
         fell_at = sim.lengths[c].clone()
         dist = torch.zeros(sim.n, device=sim.dev)
@@ -1051,6 +1070,9 @@ def main():
     p.add_argument("--start-share", type=float, default=0.25,
                    help="the share of worlds started at their clip's first frame (the evaluation plays each "
                         "clip from there)")
+    p.add_argument("--accel-weight", type=float, default=0.0,
+                   help="the reward times e^-(this times the mean square of the joints' acceleration's distance "
+                        "from the clip's, rad a frame squared): 1000 halves it at 0.026")
     p.add_argument("--activation-ms", type=float, default=0.0,
                    help="the muscles' activation: the servos apply the net's command through a lag of this "
                         "time constant (ms; 0: at once)")
@@ -1095,6 +1117,7 @@ def main():
         sim.range_weight = a.range_weight
         sim.read_last = a.read_last
         sim.activation_ms = a.activation_ms
+        sim.accel_weight = a.accel_weight
         sim.rate_weight = a.rate_weight
         sim.sole_weight = a.sole_weight
         print(f"sim: {a.worlds} worlds, {len(head['names'])} clips, {refs.shape[0]} frames, "
