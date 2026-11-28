@@ -259,6 +259,8 @@ class Builds:
         self.sources = None  # the sources' key (`known`)
         self.unbuilt = {}  # out -> settings, of builds taken as known
         self.made = []  # (out, settings) of builds made
+        self.futures = {}  # out -> its build, being made beside the steps
+        self.pool = None
 
     def add(self, out, settings):
         self.want.append((out, settings))
@@ -327,38 +329,42 @@ class Builds:
         self.known()
         if not self.want:
             return
-        began = time.monotonic()
-        # Build one representative of each unique SCENE first (each uses all cores to populate the
-        # pipeline cache without redundant misses across placements/views), then run the remaining
-        # cache-hitting builds in parallel.
-        seen_scenes = set()
-        first_wave, rest_wave = [], []
-        for item in self.want:
-            scene = item[1].get("SCENE")
-            if scene not in seen_scenes:
-                seen_scenes.add(scene)
-                first_wave.append(item)
-            else:
-                rest_wave.append(item)
-        say(f"{len(self.want)} builds ({len(first_wave)} scenes sequentially to warm cache, then {len(rest_wave)} at {jobs} at a time)")
+        # The builds are made beside the steps, in the order the steps use them (a step waits
+        # for its own, `need`): the compiler has the cores while the GPU has the first steps'
+        # runs, where the builds all came first and the GPU stood idle through them.
+        say(f"{len(self.want)} builds, {jobs} at a time, beside the steps")
         # The toolchain first, once: a build is `tools/wrela`, which builds it when it is stale.
         p = run([os.path.join(TOOLS, "built"), "wrela"])
         if p.returncode != 0:
             for out, _ in self.want:
                 self.failed[out] = "the toolchain didn't build:\n" + p.stdout[-2000:]
             return
-        for item in first_wave:
-            self.one(*item)
-        if rest_wave:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-                list(pool.map(lambda w: self.one(*w), rest_wave))
-        self.remember()
-        self.seconds = time.monotonic() - began
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs))
+        for out, settings in self.want:
+            self.futures[out] = self.pool.submit(self.timed, out, settings)
+
+    def timed(self, out, settings):
+        began = time.monotonic()
+        self.one(out, settings)
+        self.seconds += time.monotonic() - began
+
+    def broke(self, out):
+        """Whether `out` didn't build, once its build is done."""
+        f = self.futures.get(out)
+        if f is not None:
+            f.result()
+        return out in self.failed
 
     def need(self, out):
         """Raises why, if `out` didn't build."""
-        if out in self.failed:
+        if self.broke(out):
             raise RuntimeError(self.failed[out])
+
+    def done(self):
+        """Every build made, and each one's name kept (`remember`)."""
+        for f in list(self.futures.values()):
+            f.result()
+        self.remember()
 
 
 def audit_dir(tmp, what):
@@ -592,7 +598,7 @@ def step_sun(res, base, opts, tmp, builds):
         key = f"{scene}/{view}"
         seen, untraced, failed = [], [], None
         out = sun_dir(tmp, scene, view, 0, 2.5)
-        if out in builds.failed:
+        if builds.broke(out):
             failed = builds.failed[out].splitlines()[-1][:140]
         else:
             say(f"sun judge, SCENE {scene} VIEW {view}, {len(SUN_RUNS)} placements and cell widths")
@@ -645,13 +651,15 @@ def coarse_of(stdout):
 
 
 def step_frames(res, base, opts, tmp, builds):
+    # (A span is read on a quiet machine: every build is made first.)
+    builds.done()
     b = base.get("frames", {})
     bc = base.get("coarse", {})
     for scene in FRAME_SCENES:
         spans, coarse, failed = [], [], None
         for place in FRAME_PLACES:
             out = frame_dir(tmp, scene, place)
-            if out in builds.failed:
+            if builds.broke(out):
                 failed = builds.failed[out].splitlines()[-1][:140]
                 break
             say(f"frame's span, SCENE {scene} at {FRAME_SIZE}, placement {place}")
@@ -689,7 +697,7 @@ def step_frames(res, base, opts, tmp, builds):
         again, shorts, runs, unasked = [], [], [], []
         for place in FRAME_PLACES:
             out = moving_dir(tmp, scene, view, place)
-            if out in builds.failed:
+            if builds.broke(out):
                 failed = builds.failed[out].splitlines()[-1][:140]
                 break
             say(f"frame's span with the eye moving, SCENE {scene} VIEW {view} at {FRAME_SIZE}, "
@@ -975,8 +983,6 @@ def main():
         except ValueError:
             jobs = 3
         builds.make(jobs)
-        if builds.want:
-            times["builds"] = builds.seconds
         # The tests beside the GPU's steps (they use none of it), their rows put after `layers`'.
         tests_res, tests_job = Result(), None
         if "tests" in steps:
@@ -1003,12 +1009,15 @@ def main():
                     res.row(s, "runs", "did not run", False, str(e).splitlines()[-1][:140])
                 times[s] = time.monotonic() - step_began
                 say(f"{s}: {times[s]:.0f} s" + (f" ({KEPT['taken'] - taken} runs kept)" if KEPT["taken"] > taken else ""))
+        builds.done()
         if tests_job is not None:
             tests_job.result()
             at = 1 if res.rows and res.rows[0][0] == "layers" else 0
             res.rows[at:at] = tests_res.rows
             res.failed = res.failed or tests_res.failed
             res.measured.update(tests_res.measured)
+        if builds.made:
+            times["builds"] = builds.seconds
         times["whole"] = time.monotonic() - began
     finally:
         if not opts["keep"]:
