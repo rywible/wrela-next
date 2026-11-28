@@ -400,6 +400,10 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-27 | `amp-walk2` (L4): phase 5 step 14: calibrated AMP walk with 200k replay buffer, logit reg, gp=10, and upright athletic style-caster prior (120 clips, 2.10 h), 1200 updates, done | 2.93 |
 | 2026-11-27 | `p4h-13` (L4): phase 4 on sim-human5 (joints held to the body's ranges, cones collided as the judge measures them, 1/240 s steps with 10 ms contacts): fine-tune of p4h-12 with its last action read and its change paid for (the 7 Hz shake), the soles held where planted, the ball joints held to their cones, 1500 updates; the filtered capture with actions, servo and contact forces; training clips followed for 20 s 95.3% and test 90.0%, the shake halved, penetration 1.95 mm on average, done | 7.99 |
 | 2026-11-27 | `p4h-14` (L4): phase 4 on sim-human5: fine-tune of p4h-13 with each muscle's activation (30 ms), the ball joints' weight 20, and ACCAD's clips (2300 clips, 26.3 h), 2000 updates; the filtered capture with actions, servo forces, contacts and momentum; flat from update 250 (training clips followed for 20 s 90.4% at update 1,000: 100STYLE 88.4%, CeTI 97.8%, ACCAD 55.5%; the ball joints 0.0042 rad past their ranges): stopped at update 1,151 when the retarget's faults were found (the clips it followed are to be imported again) | 5.18 |
+| 2026-11-27 | `b1` (A100): the benchmark (144 clips of the new import): p4h-14's weights at update 1151, 300 updates, on an A100 to time it against the L4, done | 4.76 |
+| 2026-11-27 | `b2` (L4): the benchmark: b1's weights, 200 updates with the joints' acceleration held to the clip's (weight 1000), for the tremor, stopped by a signal | 0.91 |
+| 2026-11-27 | `b3` (L4): the benchmark: b1's weights, 200 updates with the actions' means held smooth in time and in place (Mysore et al. 2021, weights 10 and 10), for the tremor, done | 1.70 |
+| 2026-11-27 | `b4` (L4): the benchmark, its clips low-passed at 6 Hz: b3's weights, 300 updates with the actions' means held smooth (weights 30 and 30), stopped by a signal | 0.55 |
 
 #### A new machine
 
@@ -1012,6 +1016,30 @@ removes the faults of the retarget: slide, penetration and forces that cannot oc
     judge's calibration and the solver's poses follow from that import. `p4h-14` (the muscles'
     activation, ACCAD's clips), flat from its update 250 on the clips of the import before
     (training 90.4% followed for 20 s, ACCAD 55.5%), was stopped at update 1,151 (5.18 units).
+- The rule of speed (2026-11-27): each gate ran on every clip (2,600 clips, 26 h of movement), so
+  each fault cost half a day to find (an import 4 h, a run of the tracker 4 to 5 h, the check 1 h).
+  Every gate now runs first on a fixed benchmark (`tools/movement/split/benchmark`: 148 clips, 116
+  of training and 32 of test, the hard ones put in) and the whole sets only confirm what it
+  passes: its import 19 minutes (`tools/movement/import-clips`), its export 14 s, the check of its
+  references 20 s (`tools/movement/refs_check.py`: in the floor, unbalanced, far from the capture,
+  before any training), a run of the tracker of 200 to 300 updates 20 to 40 minutes on the L4 (the
+  A100: 1.7 times the samples a second at 3.5 times the units an hour), the phase's check 82 s.
+  The tracker's evaluations give the check's measures as it trains (tremor, the power at 4 to
+  7.5 Hz, the clips in the range's target), the training and test clips in one pass.
+- What the benchmark found, in a night: the capture now stands each frame on the floor its stance
+  keeps within a second (one height a clip left a third of ACCAD's clips starting 10 to 50 mm in
+  it); it low-passes each clip at the judge's 6 Hz with the judge's filter (a Gaussian of 0.8
+  frames left 4.0 to 4.6% of the joints' speed's power above 6 Hz, a quarter to two fifths of the
+  clips past the tremor's target before any tracker); the filtered capture's poses are put into
+  the body's ranges as they are read back (the clips in range's target 4% to 100%); and the shake
+  was not gone but slowed under the 6 Hz line. The actions' means held smooth (`--smooth-time`,
+  `--smooth-place`, Mysore et al. 2021) took the tremor above 6 Hz from 18.4 to 11.0% in 200
+  updates (`b3`; the acceleration's reward, `b2`, 14.0% in 150 and its segments 11 mm further), but
+  `b3`'s knees kept two thirds of their speed's power at 4.5 to 7.5 Hz (its clips 6%): a servo's
+  damping of 0.04 of its stiffness, critical for a shank that swings, was an eighth of critical
+  for a knee that holds the body up. The servos now damp as muscles do (`MUSCLE_DAMPING`, Hill
+  1938: 0.2 s times the strength, twice before); the same net untrained for it rang a fifth as
+  much (15.5% of its power at 4.5 to 7.5 Hz from 48.9%). `b5` trains on it.
 - The filtered capture back as poses (`tools/movement/export -- human unfilter`, `--read
   filtered=` the run's outputs, `--read sim=` its export, `--write out=.movement/poses-filtered`):
   each clip's qpos up to its fall as the body's numbers (a welded segment at rest), so the solver
