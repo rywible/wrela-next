@@ -24,12 +24,12 @@ use mesh::outline::{
     SLOT_BESIDE, SLOT_BRICK_WORDS, SLOT_LINE,
     SLOT_WORDS, cert_due, certify_watched, forget_frame, keep_slots, outline_quads,
     stale_beside, thin_due, thin_watched,
-    thin_watched_octants, uncertified, zero_words,
+    thin_watched_octants, uncertified, watch_tally, zero_words,
 }
 use mesh::rings::{build_ring_grids, grid_reached, ring_reach}
 use mesh::pool::{BrickPool, COMPACT_GROUPS, COMPACT_PER_GROUP, CUT_ROOM, GATE_WORDS, brick_pool}
 use mesh::grid::{
-    ActiveBrick, BrickBound, CAP_EXACT_MAX, CAP_SEAM, CAP_SURF, CERT_SLICE,
+    ActiveBrick, BrickBound, CAP_EXACT_MAX, CAP_SEAM, CAP_SURF, CERT_SLICE, TALLY_WORDS,
     CHUNK_BRICKS, COLD_CREASE_SLICES, CORNERS_BRICK, CREASE_SLICE, CREASE_SLICE_LEAST, CULL_CHUNK, CUT_BRICKS,
     DEFORM_SLICE, FrustumCull, GridSpec, MAX_LOD_LEVELS, MOST_INDICES_PER_BRICK, NONE, PATCH_MOST,
     SEAM_SLICE, SEAM_SLICES, SLICES_MOST, START_INDICES_PER_BRICK, START_TRANS_PER_BRICK,
@@ -191,6 +191,12 @@ pub struct ExtractScratch {
     /// refuses a frame's 4,097th, so every batch's chunks draw on one budget, and a batch whose
     /// chunks don't fit meshes the rest a frame later (`MeshBatch::settled` says when it has).
     pub indirect_left: u32,
+    /// The indirect dispatches the outlines' watches may still make this frame (`WATCH_INDIRECT`).
+    pub watch_left: u32,
+    /// What the gate counts of a run of frames (`grid::TALLY_*`, `MeshSight::reset_lateness` empties
+    /// them): keys a pool meshed that it held and keys its hash lost, and the watches run, those
+    /// short of their lists, and the cells those left unasked.
+    pub tally: GpuBuffer<u32>,
     /// Where the world's lattice of cells stands (`grid::placement`): every grid made here is on
     /// it.
     pub lattice: vec3,
@@ -215,6 +221,9 @@ pub(package) fn zero_u32_buf(buf: mut GpuBuffer<u32>, count: u32) {
         off += n
     }
 }
+
+/// The most reads of a watch's counts put up at once (a read is back a few frames on).
+const WATCH_READS: u32 = 8
 
 /// Whether the eye `v` is cut to from one at `at` looking along `fwd`: it jumped further than
 /// a third of its distance `near` to what it sees, or turned by more than about 25 degrees.
@@ -243,6 +252,13 @@ fn snapped_level(h: f32, prev: f32) -> f32 {
 /// The indirect dispatches extraction may make in a frame, of the host's 16,384: the rest are left
 /// to the swarm, skinning and the passes that follow.
 pub const EXTRACT_INDIRECT: u32 = 12288
+
+/// The indirect dispatches kept for the outlines' watches in a frame, of the same 16,384: a watch
+/// takes these, then what extraction has not yet taken of its own (they were held to nothing: a
+/// frame of whole extractions and watches sized for whole lists made the Radeon's 16,385th, and
+/// the run stopped). A watch they run out for takes the slices left, is not settled, and is run
+/// again the next frame.
+pub const WATCH_INDIRECT: u32 = 2048
 
 /// How one chunk of bricks is meshed (`MeshBatch::mesh_chunk_cells`, `mesh_chunk_quads`): its
 /// first brick in the list and how many, the list's cap, whether its grids are nested
@@ -273,6 +289,28 @@ impl ExtractScratch {
     /// Begins a frame's extraction: its whole indirect-dispatch budget.
     pub fn begin_frame(mut self) {
         self.indirect_left = EXTRACT_INDIRECT
+        self.watch_left = WATCH_INDIRECT
+    }
+
+    /// As many of the `want` slices a watch's pass asks (each `each` indirect dispatches) as the
+    /// frame's watches still have (no fewer than one), taken from them.
+    pub(package) fn watch_take(mut self, want: u32, each: u32) -> u32 {
+        let n = min(want, max(self.watch_room() / each, 1))
+        self.watch_spend(n * each)
+        n
+    }
+
+    /// The indirect dispatches a watch may still take this frame: the watches' own, and what
+    /// extraction has not taken.
+    pub(package) fn watch_room(self) -> u32 {
+        self.watch_left + self.indirect_left
+    }
+
+    /// Takes `n` of them: the watches' own first.
+    pub(package) fn watch_spend(mut self, n: u32) {
+        let own = min(self.watch_left, n)
+        self.watch_left -= own
+        self.indirect_left -= min(self.indirect_left, n - own)
     }
 }
 
@@ -332,6 +370,8 @@ pub fn extract_scratch(max_bricks: u32, lattice: vec3, cell_px: f32 = CELL_PX) -
         max_bricks,
         grids_cap,
         indirect_left: EXTRACT_INDIRECT,
+        watch_left: WATCH_INDIRECT,
+        tally: buffer_of(Vec::filled(TALLY_WORDS, 0)),
         lattice,
         cell_px,
         origin0: vec3(0.0),
@@ -676,7 +716,23 @@ pub struct MeshBatch {
     /// watch's slices are sized by; whether a watch had more than its slices took (its exact
     /// cells not all found: the mesh isn't settled until one has all).
     pub(package) watch_counts: GpuBuffer<u32>,
-    pub(package) watch_poll: Option<Pending<u32>>,
+    /// The reads put up, a run's each (`queue_watch_poll`), oldest first, and the last run one was
+    /// put up for.
+    pub(package) watch_polls: Vec<Pending<u32>>,
+    pub(package) watch_polled: u32,
+    /// The first run whose counts may size a watch's slices: the first since the eye was last cut
+    /// to (a read of a run before the cut says nothing of the view after it).
+    pub(package) watch_from: u32,
+    /// Whether the last run took fewer slices than it asked, the frame's watches' dispatches spent
+    /// (`ExtractScratch::watch_take`): it is run again.
+    pub(package) watch_capped: bool,
+    /// The runs read that were short of their lists, and the cells they left unasked (since
+    /// `MeshSight::reset_lateness`): which batch's, where the gate's count is of them all.
+    pub watch_short_runs: u32,
+    pub watch_unasked: u32,
+    /// The eye's distance to the surface at the last sync (`sync_one_lod`'s), what a jump is
+    /// measured against (`view_cut`).
+    pub(package) eye_near: f32,
     pub watch_hint: vec3u,
     pub(package) watch_hint_cands: u32,
     /// The exact cells the last watch read back had, the extraction's and its own.
@@ -1089,8 +1145,14 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         watch_eye: vec4(0.0),
         watch_fwd: vec3(0.0, 0.0, -1.0),
         watch_gen: 0,
-        watch_counts: buffer(9),
-        watch_poll: None,
+        watch_counts: buffer(14),
+        watch_polls: Vec::new(),
+        watch_polled: 0,
+        watch_from: 0,
+        watch_capped: false,
+        watch_short_runs: 0,
+        watch_unasked: 0,
+        eye_near: 0.0,
         watch_hint: vec3u(0, 0, 0),
         watch_hint_cands: 0,
         watch_exact: 0,
@@ -1214,8 +1276,8 @@ impl MeshBatch {
 
     /// Grows what a held mesh keeps for its outline each frame (`watch`) to its slots, quads and
     /// vertices: a slot's bricks and bits for each brick slot, a record for each opaque quad its
-    /// indices can hold, a certificate and a thin cell's proof for each vertex, and the place-keyed
-    /// certificate cache. Returns `true` if any watch buffer was reallocated.
+    /// indices can hold, and a certificate and a thin cell's proof for each vertex. Returns `true`
+    /// if any watch buffer was reallocated.
     pub(package) fn ensure_watch(mut self, need_slots: u32 = 0) -> bool {
         var grew = false
         let want_slots = max(self.cap_brick_draws, need_slots)
@@ -1284,7 +1346,7 @@ impl MeshBatch {
             self.polled_gen == self.gen &&
             self.overflowed() == 0 &&
             !self.budget_short &&
-            (!self.watched || (!self.watch_short && self.watch_read == self.watch_run))
+            (!self.watched || (!self.watch_short && !self.watch_capped && self.watch_read == self.watch_run))
     }
 
     /// Why `settled` doesn't hold, in words (`""` when it does): what the audit says of an eye it
@@ -1297,7 +1359,7 @@ impl MeshBatch {
             Some(_) => false,
             None => true,
         }
-        f"built {self.built}, read back {read}, generation read {self.polled_gen} of {self.gen}, overflow bits {self.overflowed()}, budget short {self.budget_short} (wanted {self.last_wanted} bricks, a frame alone meshes {self.last_alone}, {self.last_per_chunk} dispatches a chunk), outline short {self.watch_short}, its run {self.watch_run} read {self.watch_read} (last counts {self.watch_hint.x}, {self.watch_hint.y}, {self.watch_hint.z} of {self.watch_taken.x}, {self.watch_taken.y}, {self.watch_taken.z} taken)"
+        f"built {self.built}, read back {read}, generation read {self.polled_gen} of {self.gen}, overflow bits {self.overflowed()}, budget short {self.budget_short} (wanted {self.last_wanted} bricks, a frame alone meshes {self.last_alone}, {self.last_per_chunk} dispatches a chunk), outline short {self.watch_short} (its dispatches spent {self.watch_capped}), its run {self.watch_run} read {self.watch_read} (last counts {self.watch_hint.x}, {self.watch_hint.y}, {self.watch_hint.z} of {self.watch_taken.x}, {self.watch_taken.y}, {self.watch_taken.z} taken)"
     }
 
     /// Draws nothing until synced again, and forgets what it meshed, so the next sync meshes its
@@ -1392,16 +1454,20 @@ impl MeshBatch {
         if eye == self.watch_eye &&
             v.forward == self.watch_fwd &&
             self.watch_gen == self.gen &&
-            !self.watch_short {
+            !self.watch_short &&
+            !self.watch_capped {
             return
         }
         // An eye cut to (jumped far or turned sharply, `view_cut`) is a view the last run's counts
         // say nothing of, though its extraction holds (rings by distance alone keep their cut
         // through a turn): its slices are all the lists may need (a citadel's eye turned in place,
         // sized by the counts before it, left 7596 of its kept thin cells unasked).
-        let near = max(length(v.at - self.bound.xyz) - self.bound.w, 0.0)
-        if view_cut(self.watch_eye.xyz, self.watch_fwd, v, near) {
+        // (The jump against the eye's distance to the surface, as the extraction's cut: against
+        // its distance to the thing's bound, none inside it, every step in a courtyard was a
+        // cut, and its watch was sized for whole lists each frame.)
+        if view_cut(self.watch_eye.xyz, self.watch_fwd, v, self.eye_near) {
             self.watch_known = false
+            self.watch_from = self.watch_run.wrapping_add(1)
         }
         self.watch_eye = eye
         self.watch_fwd = v.forward
@@ -1410,8 +1476,7 @@ impl MeshBatch {
         // till this one's are read, ran the watch again each frame, each read a run behind).
         self.watch_run = self.watch_run.wrapping_add(1)
         self.watch_short = false
-        // (A read put up for a run before it is let go: its own is put up at this frame's end.)
-        self.watch_poll = None
+        self.watch_capped = false
         let fc = frustum_cull_view(v, margin: 1.08)
         label("mesh_watch")
         let fbuf = buffer_of([field])
@@ -1456,7 +1521,9 @@ impl MeshBatch {
             thin_cands: mut scratch.thin_cands,
         )
         let quad_slice = lane_slice(kernel_work(quads_k), most: self.watch_quads_cap)
-        let quad_slices = thin_most(quad_slice, self.watch_quads_cap)
+        let quad_want = thin_most(quad_slice, self.watch_quads_cap)
+        let quad_slices = scratch.watch_take(quad_want, 1)
+        var capped = quad_slices < quad_want
         dispatch(
             prep_slices.bind(
                 count: self.quad_recs.count(),
@@ -1511,7 +1578,9 @@ impl MeshBatch {
         let cert_w = kernel_work(cert_k)
         let certifies = cert_w <= limits().lane_work
         let cert_slice = lane_slice(cert_w, most: CERT_SLICE)
-        let cert_slices = if certifies { self.watch_slices(self.watch_hint.x, cert_slice, CAP_SURF) } else { 0 }
+        let cert_want = if certifies { self.watch_slices(self.watch_hint.x, cert_slice, CAP_SURF) } else { 0 }
+        let cert_slices = if certifies { scratch.watch_take(cert_want, 1) } else { 0 }
+        capped = capped || cert_slices < cert_want
         // The candidates read in slices as their kernels' bounds let a dispatch hold (each may
         // give an exact cell, whose live parts are asked of the field).
         let read_k = cert_due.bind(
@@ -1530,7 +1599,9 @@ impl MeshBatch {
             due: mut self.cert_due,
         )
         let read_slice = lane_slice(kernel_work(read_k), most: CAP_SURF)
-        let read_slices = self.watch_slices(self.watch_hint_cands, read_slice, CAP_SURF)
+        let read_want = self.watch_slices(self.watch_hint_cands, read_slice, CAP_SURF)
+        let read_slices = scratch.watch_take(read_want, 1)
+        capped = capped || read_slices < read_want
         dispatch(
             prep_slices.bind(
                 count: scratch.cert_cands.count(),
@@ -1642,8 +1713,27 @@ impl MeshBatch {
         copy(from: self.thin_due.count().sub(start: 0, count: 1), to: self.watch_counts.span_mut(start: 2, count: 1))
         copy(from: self.exact_cells.count().sub(start: 0, count: 1), to: self.watch_counts.span_mut(start: 3, count: 1))
         write(mut self.watch_counts, 8, [self.watch_run])
+        write(
+            mut self.watch_counts,
+            10,
+            [if certifies { cert_slices * cert_slice } else { CAP_SURF }, dilated, kept, read_slices * read_slice],
+        )
+        copy(from: self.thin_keep.count().sub(start: 0, count: 1), to: self.watch_counts.span_mut(start: 9, count: 1))
         self.watch_taken = vec3u(if certifies { cert_slices * cert_slice } else { CAP_SURF }, dilated, kept)
         self.watch_taken_cands = read_slices * read_slice
+        if capped {
+            self.watch_capped = true
+        }
+        // The run counted, and whether its lists held more than its slices took (the gate's count
+        // of short runs: a moving eye's are never read back in time to be done again).
+        dispatch(
+            watch_tally.bind(
+                counts: self.watch_counts.items(),
+                taken: vec4u(self.watch_taken.x, self.watch_taken.y, self.watch_taken.z, self.watch_taken_cands),
+                tally: mut scratch.tally,
+            ),
+            over: 1,
+        )
         self.has_exact = true
     }
 
@@ -1689,7 +1779,11 @@ impl MeshBatch {
                 due: mut self.thin_due,
             )
             let due_slice = lane_slice(kernel_work(due_k), most: self.watch_verts_cap)
-            let due_slices = thin_most(due_slice, self.watch_verts_cap)
+            let due_want = thin_most(due_slice, self.watch_verts_cap)
+            let due_slices = scratch.watch_take(due_want, 1)
+            if due_slices < due_want {
+                self.watch_capped = true
+            }
             dispatch(
                 prep_slices.bind(
                     count: self.thin_keep.count(),
@@ -1721,6 +1815,9 @@ impl MeshBatch {
                 )
             }
         }
+        // (What the frame's watches have left, read before the lists are borrowed, taken at the
+        // end.)
+        let left = scratch.watch_room()
         let cands = if keep { self.thin_keep.items() } else { scratch.thin_cands.items() }
         let order = if keep { self.thin_due.items() } else { scratch.thin_cands.items() }
         let count = if keep { self.thin_due.count() } else { scratch.thin_cands.count() }
@@ -1767,7 +1864,11 @@ impl MeshBatch {
             lane_slice(whole_w, most: THIN_SLICE),
             max((lane_slice(kernel_work(oct_k), most: 8 * THIN_SLICE) / 512) * 64, 64),
         )
-        let slices = self.watch_slices(hint, slice, cap)
+        let want = self.watch_slices(hint, slice, cap)
+        let slices = min(want, max(left / 2, 1))
+        if slices < want {
+            self.watch_capped = true
+        }
         dispatch(
             prep_slices.bind(
                 count: count,
@@ -1834,53 +1935,79 @@ impl MeshBatch {
                 most: slice / 8,
             )
         }
+        scratch.watch_spend(slices * 2)
         slices * slice
     }
 
-    /// Reads the last watch's counts (`watch`), once the GPU has them: the next watch's slices
-    /// are sized by them, and a watch whose lists held more than its slices took is done again.
+    /// Reads the watches' counts (`watch`) the GPU has, oldest first: the next watch's slices are
+    /// sized by them, and a watch whose lists held more than its slices took is done again.
     fn finish_watch_poll(mut self) {
-        match mut self.watch_poll {
-            Some(p) => match p.poll() {
+        // (Each is asked: a read is brought on by the asking, and one asked only once those
+        // before it were in came in a read's time after them, three reads twelve frames.)
+        var i: u32 = 0
+        while i < self.watch_polls.len() {
+            match self.watch_polls[i].poll() {
                 Some(Ok(c)) => {
-                    self.watch_hint = vec3u(c[0], c[1], c[2])
-                    self.watch_hint_cands = c[7]
-                    self.watch_exact = c[3]
-                    self.watch_split = vec3u(c[4], c[5], c[6])
-                    self.watch_known = true
-                    // Only the last run's counts say whether it was short (`watch_taken` is its).
-                    if c[8] == self.watch_run {
-                        self.watch_read = c[8]
-                        self.watch_short = c[0] > self.watch_taken.x || c[1] > self.watch_taken.y ||
-                            c[2] > self.watch_taken.z || c[7] > self.watch_taken_cands
-                    }
-                    // Exact cells past what the list holds are drawn none of: the list grows, the
-                    // batch extracts again to fill its own part, and the watch is done again; at
-                    // its most, the overflow is said (`OVERFLOW_EXACT`), never silent.
-                    if c[3] > self.cap_exact {
-                        if self.cap_exact < CAP_EXACT_MAX {
-                            self.ensure_exact_cap(min(c[3] + c[3] / 2, CAP_EXACT_MAX))
-                            self.built = false
-                            self.watch_short = true
-                        } else {
-                            self.overflow_flags |= OVERFLOW_EXACT
-                        }
-                    }
-                    self.watch_poll = None
+                    let _ = self.watch_polls.remove(i)
+                    self.took_watch_counts(c)
                 },
                 Some(Err(_)) => {
-                    self.watch_poll = None
+                    let _ = self.watch_polls.remove(i)
                 },
-                None => {},
-            },
-            None => {},
+                None => {
+                    i += 1
+                },
+            }
         }
     }
 
-    /// Queues the read of this frame's watch counts, settled (at the frame's end).
+    /// A run's counts, read (`c[8]` says which run's).
+    fn took_watch_counts(mut self, c: Vec<u32>) {
+        // A run since the eye was last cut to sizes the next (a moving eye's are each read a few
+        // frames on, while later runs are made).
+        if c[8].wrapping_sub(self.watch_from) < 2147483648 {
+            self.watch_hint = vec3u(c[0], c[1], c[2])
+            self.watch_hint_cands = c[7]
+            self.watch_known = true
+        }
+        self.watch_exact = c[3]
+        self.watch_split = vec3u(c[4], c[5], c[6])
+        // Whether the run was short: its lists against what its slices took (`c[10..14]`, written
+        // with its number). Only the last run's verdict has the watch done again.
+        let over = (if c[0] > c[10] { c[0] - c[10] } else { 0 }) + (if c[1] > c[11] { c[1] - c[11] } else { 0 }) +
+            (if c[2] > c[12] { c[2] - c[12] } else { 0 }) + (if c[7] > c[13] { c[7] - c[13] } else { 0 })
+        if over > 0 {
+            self.watch_short_runs += 1
+            self.watch_unasked += over
+        }
+        if c[8] == self.watch_run {
+            self.watch_read = c[8]
+            self.watch_short = over > 0
+        }
+        // Kept thin cells past their list's room (a cell a vertex's) are asked none of: said,
+        // never silent. Exact cells past what the list holds are drawn none of: the list grows,
+        // the batch extracts again to fill it, and the watch is done again; at its most, the
+        // overflow is said.
+        if c[9] > self.watch_verts_cap {
+            self.overflow_flags |= OVERFLOW_THIN
+        }
+        if c[3] > self.cap_exact {
+            if self.cap_exact < CAP_EXACT_MAX {
+                self.ensure_exact_cap(min(c[3] + c[3] / 2, CAP_EXACT_MAX))
+                self.built = false
+                self.watch_short = true
+            } else {
+                self.overflow_flags |= OVERFLOW_EXACT
+            }
+        }
+    }
+
+    /// Queues the read of this frame's watch counts, settled (at the frame's end): one a run.
     pub fn queue_watch_poll(mut self) {
-        if self.watched && self.watch_poll.is_none() && self.watch_gen == self.gen {
-            self.watch_poll = Some(read_settled(self.watch_counts.items()))
+        if self.watched && self.watch_gen == self.gen && self.watch_polled != self.watch_run &&
+            self.watch_polls.len() < WATCH_READS {
+            self.watch_polls.push(read_settled(self.watch_counts.items()))
+            self.watch_polled = self.watch_run
         }
     }
 
@@ -2741,6 +2868,7 @@ impl MeshBatch {
         let eff_top = max(h_top * self.cell_scale, eff_near)
         let lip = field.lipschitz(1.0)
         let z_near = d_surf
+        self.eye_near = d_surf
         // The rule: a cell no wider than `cell_px` pixels where it is seen (`STEEP_CELLS` times
         // finer for a steep field, `cell_rule`), each ring out to where the next coarser level is fine enough
         // (`rings::build_ring_grids`), scaled by `cell_scale` when the cut's bricks pass what the
@@ -2882,6 +3010,7 @@ impl MeshBatch {
         self.lod_cut = self.active_hint > 0 && view_cut(self.lod_view_at, self.lod_view_fwd, v, z_near)
         if self.lod_cut {
             self.watch_known = false
+            self.watch_from = self.watch_run.wrapping_add(1)
             self.cut_gen = self.gen + 1
         }
         self.lod_view_at = v.at

@@ -26,7 +26,7 @@ use mesh::extract::{ChunkMesh, EXTRACT_INDIRECT, ExtractScratch, MeshBatch, TRI_
 use mesh::grid::{
     ActiveBrick, BRICK, CAP_EXACT_MAX, CHUNK_BRICKS, CUT_BRICKS, ExactCell, GridSpec, MeshVertex, NONE,
     OVERFLOW_BRICKS, OVERFLOW_CREASES, OVERFLOW_CUT, OVERFLOW_EXACT, OVERFLOW_INDICES, OVERFLOW_THIN,
-    OVERFLOW_TRANS, OVERFLOW_UNLOCAL, SLICES_MOST, brick_in_hole, frustum_cull_none,
+    OVERFLOW_TRANS, OVERFLOW_UNLOCAL, SLICES_MOST, TALLY_DOUBLED, TALLY_LOST, brick_in_hole, frustum_cull_none,
 }
 use mesh::outline::{SLOT_BRICK_WORDS, SLOT_WORDS, zero_words}
 use std::collections::{Vec, swap}
@@ -403,6 +403,7 @@ pub(package) fn pool_insert(
     hash_mask: u32,
     keys: [u32],
     hash_slots: mut Atomics<u32>,
+    tally: mut Atomics<u32>,
     id: GlobalId,
 ) {
     if id.x >= min(active_count[0], cap_bricks) {
@@ -424,9 +425,19 @@ pub(package) fn pool_insert(
             return
         }
         if prev != NONE {
+            // A key the pool holds already, meshed again (`grid::TALLY_DOUBLED`): none, if the
+            // probe finds every key it holds.
+            let pb = prev * 4
+            if keys[pb] == key.x && keys[pb + 1] == key.y && keys[pb + 2] == key.z && keys[pb + 3] == key.w {
+                let _ = tally.add(i: TALLY_DOUBLED, value: 1)
+                return
+            }
             idx = (idx + 1) & hash_mask
         }
     }
+    // No place within the probe's reach: a key the pool holds and can't find (`TALLY_LOST`), meshed
+    // again each cut it is in.
+    let _ = tally.add(i: TALLY_LOST, value: 1)
 }
 
 /// The slots, the index arena and the exact arena taken once the misses are meshed.
@@ -793,6 +804,11 @@ pub struct BrickPool {
     /// The rebases made (`MeshBatch::rebase_pool`), and one asked for next update (`judge::pool`).
     pub rebases: u32,
     pub(package) rebase_next: bool,
+    /// The times the pool was emptied while it held bricks of the thing and lattice it is then
+    /// filled for again (its buffers grown, or jammed), and the bricks it held then: resident
+    /// bricks let go to be meshed again, which the plan wants none of along a path.
+    pub colds: u32,
+    pub cold_dropped: u32,
     /// Whether the last update read drew nothing new with every slot taken: if the drawn cut leaves
     /// too little to free (`run_pool_update`), the next update starts the pool afresh.
     pub(package) jammed: bool,
@@ -932,6 +948,8 @@ pub fn brick_pool() -> BrickPool {
         exact_slots: buffer(1),
         stamp: buffer(1),
         rebases: 0,
+        colds: 0,
+        cold_dropped: 0,
         rebase_next: false,
         jammed: false,
         cut_kept: 0,
@@ -1389,6 +1407,7 @@ impl MeshBatch {
                 alive: self.brick_alive.items(),
                 hash_slots: mut self.pool.hash,
                 draw_slots: mut scratch.draw_slots,
+                tally: mut scratch.tally,
             ),
             over: cap,
         )
@@ -1710,6 +1729,11 @@ impl MeshBatch {
         self.extract_limit = min(total_bricks, self.pool.cap)
 
         if !warm {
+            if self.pooled && self.pool.used_slots > 0 && self.pool.field_key == field_key &&
+                self.pool.origin == scratch.origin0 && self.pool.shift == scratch.lattice {
+                self.pool.colds += 1
+                self.pool.cold_dropped += self.pool.used_slots
+            }
             dispatch(reset_pool_hash.bind(hash_slots: self.pool.hash.items_mut()), over: self.pool.hash_cap)
             write(mut self.pool.marks, 0, Vec::filled(POOL_MARK_WORDS, 0))
             write(mut self.pool.tri_count, 0, Vec::filled(16, 0))
@@ -1867,6 +1891,7 @@ impl MeshBatch {
                 hash_mask: self.pool.hash_cap - 1,
                 keys: self.pool.keys.items(),
                 hash_slots: mut self.pool.hash,
+                tally: mut scratch.tally,
             ),
             groups: scratch.surf_args.at(0),
             most: (miss_limit + 63) / 64,
@@ -2425,6 +2450,7 @@ pub(package) fn rebase_insert(
     alive: [u32],
     hash_slots: mut Atomics<u32>,
     draw_slots: mut Append<u32>,
+    tally: mut Atomics<u32>,
     id: GlobalId,
 ) {
     let slot = id.x
@@ -2445,6 +2471,8 @@ pub(package) fn rebase_insert(
             idx = (idx + 1) & hash_mask
         }
     }
+    // (A kept key with no place within the probe's reach: `grid::TALLY_LOST`.)
+    let _ = tally.add(i: TALLY_LOST, value: 1)
 }
 
 /// After a rebase: the slots taken, the index arena's cursor, and the commit's gate (the drawn cut

@@ -482,11 +482,17 @@ paid ~5 ms an update in chunks that found nothing (21 dispatches a chunk, most o
 each).
 
 The judge (step 1): `judge::pool`, the gate's `pool` step, a run at the game's fastest and a turn,
-a rebase forced a quarter of the way: the arena's courtyard (1,523,902 triangles, 1,566 exact
-cells, 759,644 outline records), the study's room (845,448) and its table close up (597,134), each
-the cold extraction of its cut bit for bit (exact cells compared as a set: the seam's
-`first_seam_sight` boxes a coarse cell twice when its slots are taken). A key that ignores the hole
-mask fails it (1,524,398 triangles against 1,523,902).
+a rebase forced a quarter of the way: the arena's courtyard (946,202 triangles, 1,654 exact cells,
+470,660 outline records, 54,423 kept thin cells), the study's room (1,356,024) and its table close
+up (329,590), the citadel after a walk and a turn (1,394,450), and the citadel cut to eyes round it
+(1,182,894: a camera cut each eight frames, the pool full and freed as it goes), each the cold
+extraction of its cut bit for bit (exact cells compared as a set: the seam's `first_seam_sight`
+boxes a coarse cell twice when its slots are taken; kept thin cells compared as a set by place).
+A key that ignores the hole mask fails it (1,524,398 triangles against 1,523,902), and so does a
+brick that draws no triangle marked dead in a mesh made in place (its kept thin cells dropped from
+the watch: the judge's cold extraction kept 51,085 of the courtyard's 54,423, and the walking
+creature, meshed in place, lost 61 pixels at its outline; measured again with the rule put back,
+under which the citadel's audit, a pool's, still passes).
 
 M4, SCENE 10 VIEW 4 (running), 1080p, frames 30 to 269, the pool's passes a frame (means): cull
 0.024, probe 0.015, misses 0.150, compaction 0.281 ms, no rebase in the run: 0.47 ms over still,
@@ -524,12 +530,29 @@ The pool after step 2: an update that found the pool full and drew nothing new m
 the next starts it afresh if no eighth of its slots is free of the drawn cut. The pool is sized for
 the incoming cut by the measured share, not only the last drawn cut.
 
+The outline's watch (its certificates and thin cells, done again each frame its eye moves) is
+settled only once its own run's counts are read: each run writes its number beside its counts,
+and a read put up before a run says nothing of it. The citadel's sixth eye stands where its fifth
+stood, turned 45 degrees; its rings (by distance alone) kept their cut, its watch ran sized by
+the fifth eye's counts, and with the fifth eye's counts read the frame was taken as settled with
+454 pixels of its floor (a slab thinner than a far cell, drawn by its kept thin cells alone) as
+sky. Now a sharp turn or a jump (`view_cut`, the test the extraction's cut uses) sizes the
+watch's slices for its whole lists, a short verdict is its own run's (a verdict kept until the
+next run was read ran the watch each frame, each read a run behind, and ten eyes never settled),
+and a new run lets an older read go so its own is put up that frame (settling went from 5 frames
+to 9 without). Every batch grows its reach as far as its share predicts (a step a readback, the
+unpooled rule, held a falling piece of the branch past the audit's 12 frames to settle: from 0.71,
+a readback and a watch a step). An exact list the watch overflows grows, and at its most the
+overflow is said.
+
 The small hole audit (160 × 90, 12 eyes, 20 kinds) passes, after these engine repairs it found:
 an outline certificate held to the hole's width (`HOLE_PX` pixels across its slab, not twice it:
 the crowd's near body lost a pixel at its outline); a thin cell skipped only beside a sheet across
 its face (a neighbour with only some far corners inside may hold a feature thinner than a cell
-going on into it: the bolt lost three pixels); place-keyed certificates emptied whenever the field
-changes (a moving field kept certificates of its earlier shapes); and the audit measures a hole's
+going on into it: the bolt lost three pixels); no place-keyed certificates (a static citadel's far
+floor, its cells taken as certified from earlier eyes, drew 203 pixels of sky; a certificate is
+kept by its vertex alone, and a thin cell's proof by its place in the kept list, emptied with it);
+and the audit measures a hole's
 depth to the outline of the thing it is of (matter twice as far behind counts as past it), so a
 near thing's outline pixel before a far thing is not a crack.
 
