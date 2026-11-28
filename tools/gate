@@ -2,7 +2,7 @@
 """The gate a change to how anything is drawn passes before it is called done. Usage:
 
     tools/gate [--quick] [--full] [--only layers,tests,audit,pool,sun,frames] [--update]
-               [--machine NAME] [--keep DIR]
+               [--machine NAME] [--keep DIR] [--fresh] [--all]
     tools/gate --seen [REV | REV..REV] [--machine NAME]
 
 Runs, in turn, each through the tools that already hold the machine's rules (tools/wrela,
@@ -61,6 +61,16 @@ whose files are those has that result whether the gate ran before or after it wa
 Results are under `~/.wrela/gate/<machine>/` (`WRELA_GATE_SEEN` names another directory). A run
 whose files changed while it ran is not kept.
 
+A RUN IS KEPT BY WHAT IT RAN. Each of the gate's runs (an audit, the pool's judge, a sun judging,
+a bench, a package's tests) is a tool run on a build: what it printed is kept under
+`~/.wrela/gate-runs/<machine>/`, named by the build's bytes (its manifest, shaders and program), the
+tools' and the host's own bytes, and the run's arguments, and a later gate whose build and tools
+are the same takes it without running anything (its step says `kept`). So a change costs the gate
+only the rows it changes: none for a change to a document or a baseline, the rows of one scene
+for a change to it. Only runs that ended well are kept, so a failure is run again. `--fresh`
+keeps nothing and takes nothing kept. The tests run beside the GPU's steps (they use no GPU), and
+the gate stops at the first step that fails: `--all` runs every step whatever fails.
+
 Exit status: 0 when everything run held its line; 1 when something didn't; 2 for a usage error.
 `--seen REV`: 0 when the commit was seen to pass, 1 seen to fail, 3 not seen.
 """
@@ -84,10 +94,11 @@ BASELINE = os.path.join(TOOLS, "gate.json")
 # (scene, view) the sun's judge holds, and the scenes whose frame is timed.
 SUN_VIEWS = [(13, 0), (13, 1), (13, 2)]
 FRAME_SCENES = [10, 11, 13, 14, 16]
-# The placements of the world's lattice each is a mean over (the scenes' `PLACE`).
+# The placement of the world's lattice a frame's span is read at (the scenes' `PLACE`; three, and
+# their mean, were two thirds of the frames' five minutes and moved a span by a few tenths).
 # The sun's judge's runs: (placement, the cells' width in pixels).
 SUN_RUNS = [(p, 2.5) for p in range(8)] + [(0, 2.25), (0, 2.75)]
-FRAME_PLACES = [0, 1, 2]
+FRAME_PLACES = [0]
 FRAME_SIZE = "1920x1080"
 FRAME_RANGE = "30-89"
 # (scene, view) whose frame is timed with the eye moving, and the frames read: the arena's walk
@@ -133,6 +144,106 @@ def run(cmd, **kw):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **kw)
 
 
+# Runs kept by what they ran (the doc's "A RUN IS KEPT BY WHAT IT RAN").
+KEPT = {"on": True, "machine": None, "tools": None, "builds": {}, "taken": 0, "ran": 0, "build_now": None}
+
+
+class Kept:
+    """A kept run, as `subprocess.run` gives one."""
+
+    def __init__(self, stdout):
+        self.stdout = stdout
+        self.returncode = 0
+        self.kept = True
+
+
+def file_hash(h, path):
+    try:
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+    except OSError:
+        h.update(b"(missing)")
+
+
+def tools_hash():
+    """The bytes of what runs a build: the tools and the host."""
+    if KEPT["tools"] is None:
+        h = hashlib.sha256()
+        for name in ("gpu", "audit", "bench", "gpulock.py", "wrela-host"):
+            file_hash(h, os.path.join(TOOLS, name))
+        file_hash(h, os.path.join(ROOT, "toolchain", "target", "release", "wrela-host"))
+        KEPT["tools"] = h.hexdigest()
+    return KEPT["tools"]
+
+
+def build_hash(out):
+    """The bytes of the build in `out`: its manifest and what the manifest names."""
+    if out not in KEPT["builds"]:
+        h = hashlib.sha256()
+        try:
+            with open(os.path.join(out, "manifest.json"), "rb") as f:
+                raw = f.read()
+            h.update(raw)
+            m = json.loads(raw)
+            names = sorted({p["shader"] for p in m.get("pipelines", [])} | {str(m.get("wasm"))})
+            for name in names:
+                h.update(name.encode())
+                file_hash(h, os.path.join(out, name))
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        KEPT["builds"][out] = h.hexdigest()
+    return KEPT["builds"][out]
+
+
+def kept_path(key):
+    base = os.environ.get("WRELA_GATE_RUNS") or os.path.expanduser("~/.wrela/gate-runs")
+    return os.path.join(base, KEPT["machine"] or "any", key + ".json")
+
+
+def run_kept(cmd, out, tmp, files=(), env=None, extra=""):
+    """Runs `cmd` on the build in `out`, or takes what the same run printed before (and the
+    `files` it wrote): the same build, tools, host and arguments (with `tmp`, where this gate's
+    builds are, left out of them)."""
+    bh = build_hash(out) if KEPT["on"] else None
+    key = None
+    if bh is not None:
+        h = hashlib.sha256()
+        h.update(bh.encode())
+        h.update(tools_hash().encode())
+        h.update(json.dumps([a.replace(tmp, "@") for a in cmd]).encode())
+        h.update(extra.encode())
+        key = h.hexdigest()[:40]
+        try:
+            with open(kept_path(key)) as f:
+                rec = json.load(f)
+            for path, text in zip(files, rec["files"]):
+                with open(path, "w") as f:
+                    f.write(text)
+            KEPT["taken"] += 1
+            return Kept(rec["stdout"])
+        except (OSError, ValueError, KeyError):
+            pass
+    if KEPT["build_now"] is not None:
+        KEPT["build_now"](out)
+    p = run(cmd, env=env)
+    KEPT["ran"] += 1
+    if key is not None and p.returncode == 0:
+        try:
+            texts = []
+            for path in files:
+                with open(path) as f:
+                    texts.append(f.read())
+            os.makedirs(os.path.dirname(kept_path(key)), exist_ok=True)
+            part = kept_path(key) + f".{os.getpid()}"
+            with open(part, "w") as f:
+                json.dump({"stdout": p.stdout, "files": texts, "cmd": cmd[1:]}, f)
+            os.replace(part, kept_path(key))
+        except OSError:
+            pass
+    return p
+
+
 def say(msg):
     print(f"gate: {msg}", file=sys.stderr, flush=True)
 
@@ -145,6 +256,9 @@ class Builds:
         self.want = []  # (out, settings), in the order the steps use them
         self.failed = {}  # out -> why
         self.seconds = 0.0
+        self.sources = None  # the sources' key (`known`)
+        self.unbuilt = {}  # out -> settings, of builds taken as known
+        self.made = []  # (out, settings) of builds made
 
     def add(self, out, settings):
         self.want.append((out, settings))
@@ -159,9 +273,58 @@ class Builds:
         if p.returncode != 0:
             tail = "\n".join(l for l in p.stdout.splitlines() if l.startswith("error"))
             self.failed[out] = f"the build of {settings} failed:\n{tail or p.stdout[-2000:]}"
+        self.made.append((out, settings))
         say(f"built {os.path.basename(out)} in {took:.0f} s" + (" (FAILED)" if out in self.failed else ""))
 
+    def known(self):
+        """Takes each wanted build's bytes' name from what the same sources and settings built
+        before (the doc's "A RUN IS KEPT BY WHAT IT RAN"): such a build is not made, unless a run
+        on it turns out not to be kept (`now`). The rest are left wanted."""
+        if not KEPT["on"]:
+            return
+        try:
+            listed = git("ls-files", "-c", "-o", "--exclude-standard", "-z", "--", "lib", "game", "toolchain").split("\0")
+            files = sorted({f for f in listed if f and os.path.isfile(os.path.join(ROOT, f))})
+            blobs = git("hash-object", "--stdin-paths", stdin="".join(f + "\n" for f in files)).split()
+            self.sources = key_of(zip(files, blobs))
+        except RuntimeError:
+            return
+        left = []
+        for out, settings in self.want:
+            try:
+                with open(kept_path(self.memo(settings))) as f:
+                    KEPT["builds"][out] = json.load(f)["hash"]
+                self.unbuilt[out] = settings
+            except (OSError, ValueError, KeyError):
+                left.append((out, settings))
+        self.want = left
+
+    def memo(self, settings):
+        return "build-" + hashlib.sha256((self.sources + json.dumps(settings, sort_keys=True)).encode()).hexdigest()[:34]
+
+    def now(self, out):
+        """Makes a build `known` took as known, a run on it not being kept."""
+        settings = self.unbuilt.pop(out, None)
+        if settings is not None:
+            p = run([os.path.join(TOOLS, "built"), "wrela"])
+            self.one(out, settings)
+
+    def remember(self):
+        """Keeps each build's bytes' name by its sources and settings."""
+        if not KEPT["on"] or self.sources is None:
+            return
+        for out, settings in self.made:
+            bh = build_hash(out)
+            if bh is not None and out not in self.failed:
+                try:
+                    os.makedirs(os.path.dirname(kept_path("x")), exist_ok=True)
+                    with open(kept_path(self.memo(settings)), "w") as f:
+                        json.dump({"hash": bh}, f)
+                except OSError:
+                    pass
+
     def make(self, jobs):
+        self.known()
         if not self.want:
             return
         began = time.monotonic()
@@ -189,6 +352,7 @@ class Builds:
         if rest_wave:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
                 list(pool.map(lambda w: self.one(*w), rest_wave))
+        self.remember()
         self.seconds = time.monotonic() - began
 
     def need(self, out):
@@ -229,11 +393,11 @@ def plan(builds, steps, opts, tmp):
     if "pool" in steps:
         builds.add(pool_dir(tmp), {"POOLJUDGE": "true"})
     if "sun" in steps:
+        # One build and one run a view: its judgings (`SUN_RUNS`) one after another in it
+        # (the scenes' `SUN_ROUND`).
         for scene, view in SUN_VIEWS:
-            for place, cell_px in SUN_RUNS:
-                builds.add(sun_dir(tmp, scene, view, place, cell_px),
-                           {"SCENE": scene, "VIEW": view, "SUNJUDGE": "true", "PLACE": place,
-                            "CELL_PX": cell_px})
+            builds.add(sun_dir(tmp, scene, view, 0, 2.5),
+                       {"SCENE": scene, "VIEW": view, "SUNJUDGE": "true", "SUN_ROUND": "true"})
     if "frames" in steps:
         for scene in FRAME_SCENES:
             for place in FRAME_PLACES:
@@ -290,7 +454,7 @@ def step_layers(res, base, opts, tmp, builds):
 def step_tests(res, base, opts, tmp, builds):
     pkgs = ["lib/engine"] if opts["quick"] else ["lib/engine", "lib/kit", "game/world"]
     for pkg in pkgs:
-        p = run([os.path.join(TOOLS, "wrela"), "test", os.path.join(ROOT, pkg)])
+        p = tests_kept(pkg)
         m = re.findall(r"(\d+) passed, (\d+) failed", p.stdout)
         passed, failed = (int(m[-1][0]), int(m[-1][1])) if m else (0, 1)
         ok = p.returncode == 0 and failed == 0 and passed > 0
@@ -301,10 +465,50 @@ def step_tests(res, base, opts, tmp, builds):
         res.row(f"tests {pkg}", "all pass", f"{passed} passed, {failed} failed", ok, note)
 
 
+def JUDGE_ENV():
+    """A judge's run: each readback answered the frame after it is asked (the host's
+    `WRELA_READS_AFTER`), so its meshes settle in as few frames as their extractions take and the
+    run is the same every time. (The frames' benches run as a game does: no such thing.)"""
+    return dict(os.environ, WRELA_READS_AFTER="1")
+
+
+# The readbacks' lateness the small audit is run again at: what a game's are, about (a mesh that
+# trusts a readback to be the last run's is found only where it comes late: the citadel's floor).
+LATE_READS = 4
+
+
+def tests_kept(pkg):
+    """A package's tests, or what they said of the same sources (every file under lib/, game/ and
+    toolchain/, as git names its bytes) before."""
+    key = None
+    if KEPT["on"]:
+        try:
+            listed = git("ls-files", "-c", "-o", "--exclude-standard", "-z", "--", "lib", "game", "toolchain").split("\0")
+            files = sorted({f for f in listed if f and os.path.isfile(os.path.join(ROOT, f))})
+            blobs = git("hash-object", "--stdin-paths", stdin="".join(f + "\n" for f in files)).split()
+            key = "tests-" + hashlib.sha256((pkg + key_of(zip(files, blobs))).encode()).hexdigest()[:34]
+            with open(kept_path(key)) as f:
+                rec = json.load(f)
+            KEPT["taken"] += 1
+            return Kept(rec["stdout"])
+        except (OSError, ValueError, KeyError, RuntimeError):
+            pass
+    p = run([os.path.join(TOOLS, "wrela"), "test", os.path.join(ROOT, pkg)])
+    KEPT["ran"] += 1
+    if key is not None and p.returncode == 0:
+        try:
+            os.makedirs(os.path.dirname(kept_path(key)), exist_ok=True)
+            with open(kept_path(key), "w") as f:
+                json.dump({"stdout": p.stdout, "files": []}, f)
+        except OSError:
+            pass
+    return p
+
+
 AUDIT_FAIL = re.compile(r"^\s+- (?P<kind>.+?)(?:,|:) ")
 
 
-def audit(res, base, what, tmp, builds, unit_fs=None):
+def audit(res, base, what, tmp, builds, unit_fs=None, reads=None):
     eyes, size, timeout = AUDITS[what]
     out = audit_dir(tmp, what)
     builds.need(out)
@@ -312,9 +516,12 @@ def audit(res, base, what, tmp, builds, unit_fs=None):
     if unit_fs is not None:
         env = dict(os.environ, WRELA_GPU_UNIT_FS=str(unit_fs))
         what = f"{what} at {unit_fs} fs"
+    if reads is not None:
+        env = dict(env or os.environ, WRELA_READS_AFTER=str(reads))
+        what = f"{what}, readbacks {reads} frames late"
     say(f"hole audit, {what}")
-    p = run([os.path.join(TOOLS, "audit"), "--built", out, "--size", size, "--eyes", str(eyes),
-             "--timeout", str(timeout)], env=env)
+    p = run_kept([os.path.join(TOOLS, "audit"), "--built", out, "--size", size, "--eyes", str(eyes),
+                  "--timeout", str(timeout)], out, tmp, env=env, extra=f"{unit_fs} {reads}")
     kinds = sorted({m.group("kind") for l in p.stdout.splitlines() if (m := AUDIT_FAIL.match(l))})
     host_died = "host exited" in p.stdout or "error: GPU error" in p.stdout
     known = sorted((base or {}).get("failing", []))
@@ -348,15 +555,20 @@ def step_audit(res, base, opts, tmp, builds):
             audit(res, b.get(f"small at {SLOWEST_UNIT_FS} fs"), "small", tmp, builds, unit_fs=SLOWEST_UNIT_FS)
         except RuntimeError as e:
             res.row(f"audit small at {SLOWEST_UNIT_FS} fs", "passes", "did not run", False, str(e).splitlines()[-1][:140])
+    late = f"small, readbacks {LATE_READS} frames late"
+    try:
+        audit(res, b.get(late), "small", tmp, builds, reads=LATE_READS)
+    except RuntimeError as e:
+        res.row(f"audit {late}", "passes", "did not run", False, str(e).splitlines()[-1][:140])
 
 
 def step_pool(res, base, opts, tmp, builds):
     out = pool_dir(tmp)
     builds.need(out)
     say("the pool's judge")
-    p = run([os.path.join(TOOLS, "gpu"), "--timeout", "900", out, "--size", POOL_SIZE,
-             "--frames", str(POOL_FRAMES), "--until", "scene: done",
-             "--png", os.path.join(out, "pool.png")])
+    p = run_kept([os.path.join(TOOLS, "gpu"), "--timeout", "900", out, "--size", POOL_SIZE,
+                  "--frames", str(POOL_FRAMES), "--until", "scene: done",
+                  "--png", os.path.join(out, "pool.png")], out, tmp, env=JUDGE_ENV(), extra="reads 1")
     held = [l.split("wrela: ", 1)[-1] for l in p.stdout.splitlines() if "judge pool:" in l]
     m = POOL_HELD.search(p.stdout)
     if p.returncode != 0 or not m:
@@ -379,24 +591,20 @@ def step_sun(res, base, opts, tmp, builds):
     for scene, view in SUN_VIEWS:
         key = f"{scene}/{view}"
         seen, untraced, failed = [], [], None
-        for place, cell_px in SUN_RUNS:
-            out = sun_dir(tmp, scene, view, place, cell_px)
-            if out in builds.failed:
-                failed = builds.failed[out].splitlines()[-1][:140]
-                break
-            say(f"sun judge, SCENE {scene} VIEW {view}, placement {place}, cells {cell_px} px")
-            p = run([os.path.join(TOOLS, "gpu"), "--timeout", "600", out, "--size", SUN_SIZE,
-                     "--frames", str(SUN_FRAMES), "--until", "scene: done",
-                     "--png", os.path.join(out, "sun.png")])
-            m = SUN_LINE.search(p.stdout)
-            if not m:
+        out = sun_dir(tmp, scene, view, 0, 2.5)
+        if out in builds.failed:
+            failed = builds.failed[out].splitlines()[-1][:140]
+        else:
+            say(f"sun judge, SCENE {scene} VIEW {view}, {len(SUN_RUNS)} placements and cell widths")
+            p = run_kept([os.path.join(TOOLS, "gpu"), "--timeout", "900", out, "--size", SUN_SIZE,
+                          "--frames", str(SUN_FRAMES * len(SUN_RUNS)), "--until", "scene: done",
+                          "--png", os.path.join(out, "sun.png")], out, tmp, env=JUDGE_ENV(), extra="reads 1")
+            for m in SUN_LINE.finditer(p.stdout):
+                seen.append((int(m.group(4)), int(m.group(5)), float(m.group(6)), float(m.group(7))))
+            untraced = [int(u) for u in re.findall(r"fields untraced (\d+)", p.stdout)]
+            if len(seen) != len(SUN_RUNS):
                 err = [l for l in p.stdout.splitlines() if "error" in l]
-                failed = (err[0] if err else f"the judge said nothing at placement {place}, cells {cell_px} px")[:140]
-                break
-            seen.append((int(m.group(4)), int(m.group(5)), float(m.group(6)), float(m.group(7))))
-            u = re.search(r"fields untraced (\d+)", p.stdout)
-            if u:
-                untraced.append(int(u.group(1)))
+                failed = (err[0] if err else f"the judge said {len(seen)} of its {len(SUN_RUNS)} judgings")[:140]
         if failed is not None:
             res.row(f"sun {key}", "judged", "no verdict", False, failed)
             continue
@@ -448,8 +656,9 @@ def step_frames(res, base, opts, tmp, builds):
                 break
             say(f"frame's span, SCENE {scene} at {FRAME_SIZE}, placement {place}")
             js = os.path.join(tmp, f"bench_{scene}_p{place}.json")
-            p = run([os.path.join(TOOLS, "bench"), out, "--size", FRAME_SIZE, "--frames", FRAME_RANGE,
-                     "--runs", "1", "--no-passes", "--no-cpu", "--json", js, "--timeout", "600"])
+            p = run_kept([os.path.join(TOOLS, "bench"), out, "--size", FRAME_SIZE, "--frames", FRAME_RANGE,
+                          "--runs", "1", "--no-passes", "--no-cpu", "--json", js, "--timeout", "600"],
+                         out, tmp, files=[js])
             try:
                 with open(js) as f:
                     spans.append(json.load(f)["span_runs"][0]["span"]["median"])
@@ -486,9 +695,9 @@ def step_frames(res, base, opts, tmp, builds):
             say(f"frame's span with the eye moving, SCENE {scene} VIEW {view} at {FRAME_SIZE}, "
                 f"placement {place}")
             js = os.path.join(tmp, f"bench_{scene}_{view}_p{place}.json")
-            p = run([os.path.join(TOOLS, "bench"), out, "--size", FRAME_SIZE, "--frames",
-                     MOVING_RANGE, "--runs", "1", "--no-passes", "--no-cpu", "--json", js,
-                     "--timeout", "600"])
+            p = run_kept([os.path.join(TOOLS, "bench"), out, "--size", FRAME_SIZE, "--frames",
+                          MOVING_RANGE, "--runs", "1", "--no-passes", "--no-cpu", "--json", js,
+                          "--timeout", "600"], out, tmp, files=[js])
             try:
                 with open(js) as f:
                     each = sorted(json.load(f)["span_runs"][0]["spans"])
@@ -704,7 +913,7 @@ def times_line(times):
 
 def main():
     opts = {"quick": False, "full": False, "update": False, "only": None, "machine": None,
-            "keep": None, "seen": None}
+            "keep": None, "seen": None, "fresh": False, "all": False}
     argv = sys.argv[1:]
     i = 0
     while i < len(argv):
@@ -712,7 +921,7 @@ def main():
         if a in ("-h", "--help"):
             print(__doc__)
             return 0
-        if a in ("--quick", "--full", "--update"):
+        if a in ("--quick", "--full", "--update", "--fresh", "--all"):
             opts[a[2:]] = True
         elif a in ("--only", "--machine", "--keep") and i + 1 < len(argv):
             i += 1
@@ -727,6 +936,8 @@ def main():
             return 2
         i += 1
     machine = opts["machine"] or ("m4" if platform.system() == "Darwin" else "radeon")
+    KEPT["machine"] = machine
+    KEPT["on"] = not opts["fresh"]
     if opts["seen"] is not None:
         return seen(machine, opts["seen"])
     steps = STEPS if opts["only"] is None else opts["only"].split(",")
@@ -757,6 +968,7 @@ def main():
     try:
         times = {}
         builds = Builds()
+        KEPT["build_now"] = lambda out: (builds.now(out), builds.remember())
         plan(builds, steps, opts, tmp)
         try:
             jobs = int(os.environ.get("WRELA_GATE_JOBS", "3"))
@@ -765,15 +977,38 @@ def main():
         builds.make(jobs)
         if builds.want:
             times["builds"] = builds.seconds
+        # The tests beside the GPU's steps (they use none of it), their rows put after `layers`'.
+        tests_res, tests_job = Result(), None
+        if "tests" in steps:
+            def tests():
+                t = time.monotonic()
+                try:
+                    step_tests(tests_res, base, opts, tmp, builds)
+                except RuntimeError as e:
+                    tests_res.row("tests", "run", "did not run", False, str(e).splitlines()[-1][:140])
+                times["tests"] = time.monotonic() - t
+            tests_job = concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(tests)
+        stopped = None
         for s in STEPS:
-            if s in steps:
+            if s in steps and s != "tests":
+                if res.failed and not opts["all"] and not opts["update"]:
+                    stopped = stopped or s
+                    res.row(s, "runs", "not run", False, "an earlier step failed: --all runs every step")
+                    continue
                 step_began = time.monotonic()
+                taken = KEPT["taken"]
                 try:
                     fns[s](res, base, opts, tmp, builds)
                 except RuntimeError as e:
                     res.row(s, "runs", "did not run", False, str(e).splitlines()[-1][:140])
                 times[s] = time.monotonic() - step_began
-                say(f"{s}: {times[s]:.0f} s")
+                say(f"{s}: {times[s]:.0f} s" + (f" ({KEPT['taken'] - taken} runs kept)" if KEPT["taken"] > taken else ""))
+        if tests_job is not None:
+            tests_job.result()
+            at = 1 if res.rows and res.rows[0][0] == "layers" else 0
+            res.rows[at:at] = tests_res.rows
+            res.failed = res.failed or tests_res.failed
+            res.measured.update(tests_res.measured)
         times["whole"] = time.monotonic() - began
     finally:
         if not opts["keep"]:
@@ -781,7 +1016,7 @@ def main():
 
     print(f"gate on {machine}:")
     table(res.rows)
-    print("gate: times: " + times_line(times))
+    print("gate: times: " + times_line(times) + f"; {KEPT['ran']} runs made, {KEPT['taken']} taken as kept")
     if key is not None:
         try:
             still = tree_key() == key

@@ -461,8 +461,9 @@ radiance error rather than point-sampled sub-cell tessellation noise.
 Purpose: make a moving or turning eye cost little more than a still one, by keeping every brick
 it extracted, and prove the kept mesh is the mesh a cold extraction makes.
 
-**State (2026-11-27, `26eebf1`): steps 1, 2 and 3 built; the full gates on both machines
-next.** A static, opaque mesh of
+**State (2026-11-27): steps 1, 2 and 3 built; of the three conditions, no resident brick is
+meshed again on the M4's six views, the pool's passes are within 2 ms on five of them, and the
+full gate has not yet passed on either machine (below: what is open).** A static, opaque mesh of
 nested rings is a `BrickPool` (`mesh::pool`). Its bricks are keyed by what their mesh reads
 (`brick_key`: lattice brick, level, seam faces, hole mask, thing), every brick of a cut kept,
 seam faces' too: a brick on a 2:1 seam face keeps six indices of its own slice for each quad of
@@ -517,10 +518,21 @@ any: a first cut at the rule's reach was the stack's 8.6 million candidates and 
 
 The rule's count (`rings::coarse_pixels`, the gate's `coarse` rows): one pixel in each 4 × 4
 block of the frame held to its batch's drawn cut (16 per pixel cost 4.7 ms of SCENE 10's frame,
-inside the frames the gate times; 0.3 ms now). Distance-only against view-fitted with retention,
-by that count (M4, 1080p, frames 30 to 86): the same count on SCENE 10 still (547 of 1,000 against
-547), and view-fitted turning 41.1 ms with 120 late frames against distance-only's 22.3 ms with
-none: distance-only rings are kept, and view-fitted rings are not built.
+inside the frames the gate times; 0.3 ms now). The number held is the levels a judged pixel is
+drawn coarser than the rule, on average (how many times its cell halves to meet the rule's): how
+many pixels are coarser at all read 877 to 1,000 of 1,000 on every scene and could show no change.
+M4, 1080p: SCENE 10 still 0.96 levels (the courtyard 1.67, the near things 0.13, the arc and the
+rest 0), SCENE 13 2.15 (the study's room, its reach 0.09 of the rule's, 2 to 3 levels over most
+of its pixels), the Radeon's the same but SCENE 11 1.84, 14 2.09, 16 1.88. The room is what holds
+them there: a cut keeps 32,768 bricks, and the rule at 1080p wants several times that of rings
+that reach the same every way.
+
+Distance-only against view-fitted with retention was decided by the old count (M4, 1080p, frames
+30 to 86): the same on SCENE 10 still (547 of 1,000 against 547), and view-fitted turning 41.1 ms
+with 120 late frames against distance-only's 22.3 ms with none: distance-only rings are kept, and
+view-fitted rings are not built. **Open: the count that decided it could not tell the two apart;
+by levels, a cut fitted to the view would stand nearer the rule (the rings' share out of view is
+most of the room). It has not been measured again by levels.**
 
 What the rule costs: SCENE 10's parry arc moves, so it is meshed every frame, and the rule wants
 all 2.9 m of it at 7.8 mm (9,300 bricks, 8.6 ms on the M4, against the 4,125 the old caps let it
@@ -529,6 +541,43 @@ have). Phase 4's chart for the arc's clipped shell (no DC at all) is what pays i
 The pool after step 2: an update that found the pool full and drew nothing new marks it jammed;
 the next starts it afresh if no eighth of its slots is free of the drawn cut. The pool is sized for
 the incoming cut by the measured share, not only the last drawn cut.
+
+What the phase's three conditions read, each now a number a moving view says (`pool:`, `watch:`
+and the pass table; the gate holds the first two):
+
+- **Resident bricks meshed again** (`grid::TALLY_DOUBLED`, `TALLY_LOST`, `BrickPool::colds`): the
+  bricks a pool held when it was emptied for the thing it was then filled for again, the keys it
+  meshed while it held them, and the keys its hash lost. The count found the pool emptied on
+  SCENE 13's moving views (59,664 bricks on view 4 and 2,760 on view 3, each run): its arenas grew
+  in place (the vertices a brick doubled after an overflow; the slots and the index arena grew
+  with the cut), and what is made anew is empty. Now a pool has every slot and its whole index
+  arena from the first, grows its vertices' arena by a rebase into a larger one (`rebase_pool`'s
+  `grow_to`), and voids an update whose misses outgrow an arena (`pool_void`: none of its bricks
+  kept, its lists as it began, the reason said, and room made by age or by growth before they are
+  meshed again), so no brick with a part missing is held and none is let go to be rid of one. The
+  judge holds each of its five kinds through a growth and a voided update, bit for bit. M4, all
+  six views: 0.
+- **The pool's passes over still** (the bench's pass table, means a frame, M4, 1080p, frames 30 to
+  269; still 0 on both scenes): SCENE 10 view 3 0.70 ms, view 4 1.42, view 5 0; SCENE 13 view 3
+  5.08 (3.40 of it the misses' chunks: 5 to 11 chunks dispatched an update for the 0.5 to 1.2 its
+  misses fill), view 4 1.91, view 5 0. **Open: view 3 of SCENE 13 is over the 2 ms.** Before the
+  reach was held still (below) the still frame itself paid 19 ms.
+- **The reach held still.** A reach grew a step where its share said none fit and came back the
+  next frame, out and back for as long as the eye stood (the arena's near things: an update a
+  frame, 43 chunks dispatched for 4 of misses, 42 extractions in frames 30 to 120 of a still eye),
+  and the share was held to no less than a 64th where the cull kept 0.7%. Now a reach grows only
+  as far as its share predicts fits, the share is as read, and that batch stands at the rule's
+  reach with no extraction once settled.
+- **Watch runs short of their lists** (`grid::TALLY_SHORT`, each run's counts read with what its
+  slices took): M4, of 948 runs a view (474 or 630 on SCENE 13), 2 to 30 short on SCENE 10's views
+  and 1 to 25 on SCENE 13's, leaving 1,600 to 2.7 million cells unasked; the Radeon 31 to 67.
+  They follow a pool's commits, not the eye (view 4 never turns): the thin cells of the slots a
+  commit newly draws all come due at once (100,000 and more against a slice of 8,192), and the
+  count that would size the next run is read three frames later. A watch's dispatches are taken
+  from the frame's (`ExtractScratch::watch_take`), so a frame of whole lists is cut short and run
+  again, not refused by the host. **Open: the gate wants none short. What ends it is proofs made
+  where the cells are made (a thin cell proven in the chunk that meshes its brick, and kept while
+  the brick is resident, drawn or not), so a commit brings none due.**
 
 The outline's watch (its certificates and thin cells, done again each frame its eye moves) is
 settled only once its own run's counts are read: each run writes its number beside its counts,

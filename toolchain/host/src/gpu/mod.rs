@@ -528,6 +528,8 @@ struct Settling {
     done_at: Option<wrela_gpu::SubmissionIndex>,
     /// The device it was copied on was lost.
     lost: bool,
+    /// The frame it was asked in.
+    frame: usize,
 }
 
 /// A program's ask for a label's time (`std::gpu::timed`).
@@ -964,6 +966,11 @@ pub(crate) struct Gpu {
     /// The program's settled reads (`std::gpu::read_settled`) not yet answered, in the order
     /// asked.
     settling: Vec<Settling>,
+    /// `WRELA_READS_AFTER`: a settled read is answered this many frames after the frame that
+    /// asked it, no sooner and no later (its work waited for), so a run's readbacks fall on the
+    /// same frames every time and a judge's meshes settle in as few frames as it says; `None`
+    /// (unset) answers each once the GPU has done its work, as a game's run does.
+    reads_after: Option<usize>,
     /// The calls ended so far: a timing's call, and an ask's.
     calls: usize,
     /// The display's guard: how far behind the GPU is on this run's frames.
@@ -1258,6 +1265,10 @@ impl Gpu {
             labelled_order: Vec::new(),
             asked: Vec::new(),
             settling: Vec::new(),
+            reads_after: std::env::var("WRELA_READS_AFTER")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0),
             calls: 0,
             behind: Behind::new(),
             indirect,
@@ -4112,11 +4123,27 @@ impl Executor for Gpu {
             size: u64::from(size),
             done_at: None,
             lost: false,
+            frame: self.frame,
         });
         None
     }
 
     fn settled(&mut self) -> Vec<(u32, std::result::Result<Vec<u8>, String>)> {
+        // At a fixed number of frames (`reads_after`): the reads due are waited for, the rest
+        // held back though their work is done.
+        let frame = self.frame;
+        if let Some(after) = self.reads_after {
+            let due = self
+                .settling
+                .iter()
+                .filter(|s| !s.lost && frame >= s.frame + after)
+                .filter_map(|s| s.done_at)
+                .max();
+            if let Some(at) = due {
+                self.device.wait(at);
+            }
+        }
+        let after = self.reads_after;
         let done = self.device.completed();
         let mut answered = Vec::new();
         self.settling.retain(|s| {
@@ -4124,7 +4151,7 @@ impl Executor for Gpu {
                 Err("the device was lost before the read's work was done".to_string())
             } else {
                 match s.done_at {
-                    Some(at) if at <= done => {
+                    Some(at) if at <= done && after.is_none_or(|n| frame >= s.frame + n) => {
                         // Its submission is done: mapping it doesn't wait.
                         let mapped = align_to(s.size, wrela_gpu::COPY_BUFFER_ALIGNMENT)
                             .clamp(4, s.staging.size());

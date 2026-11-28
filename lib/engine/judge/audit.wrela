@@ -31,10 +31,11 @@ use reference::traced::{FAR, HALVINGS, LEAST, LEAST_FAR}
 use std::field::{Field, Union, UnionAll}
 use std::gpu::{
     Atomics, GlobalId, GpuBuffer, Rgba32Float, Slots, Texture, buffer_of, copy_texture, dispatch,
-    label, limits, read, texture,
+    label, limits, read, texture, write,
 }
 use std::collections::Vec
-use std::io::{Pending, print}
+use std::hash::{Hasher, StateHash}
+use std::io::{Pending, load, print, store}
 
 /// Counts kept: pixels, pixels the field met, holes, extras, offs, rays out of steps; then whether
 /// an off pixel has been named (claimed once, so the three words after it are of one pixel), and
@@ -221,6 +222,9 @@ pub trait Marched: Copy {
     type Field: Field<Substance> + GpuData
     fn field(self) -> Self::Field
 
+    /// Its fields' state into `h`: what its march is kept under (`Auditing`'s `kept_name`).
+    fn state(self, h: mut Hasher)
+
     /// Rays `first` to `last` of the `n` of a picture `w` wide through `v` (`ray_at`) marched
     /// into `hits`: joined with what it holds (`keep`), or replacing it.
     fn march(
@@ -242,15 +246,19 @@ pub struct Whole<M>: Copy {
 }
 
 /// `field`, marched whole.
-pub fn whole<M: Field<Substance>>(field: M) -> Whole<M> {
+pub fn whole<M: Field<Substance> + StateHash>(field: M) -> Whole<M> {
     Whole { field }
 }
 
-impl<M: Field<Substance>> Marched for Whole<M> {
+impl<M: Field<Substance> + StateHash> Marched for Whole<M> {
     type Field = M
 
     fn field(self) -> M {
         self.field
+    }
+
+    fn state(self, h: mut Hasher) {
+        self.field.state_hash(mut h)
     }
 
     fn march(
@@ -359,11 +367,17 @@ pub fn each<M: Field<Substance>, const N: u32>(parts: [M; N]) -> Each<M, N> {
     Each { parts }
 }
 
-impl<M: Field<Substance>, const N: u32> Marched for Each<M, N> {
+impl<M: Field<Substance> + StateHash, const N: u32> Marched for Each<M, N> {
     type Field = UnionAll<M, N>
 
     fn field(self) -> UnionAll<M, N> {
         self.parts.union()
+    }
+
+    fn state(self, h: mut Hasher) {
+        for i in 0..N {
+            self.parts[i].state_hash(mut h)
+        }
     }
 
     fn march(
@@ -408,6 +422,11 @@ impl<A: Marched, B: Marched> Marched for Both<A, B> {
 
     fn field(self) -> Union<A::Field, B::Field> {
         Union { a: self.a.field(), b: self.b.field() }
+    }
+
+    fn state(self, h: mut Hasher) {
+        self.a.state(mut h)
+        self.b.state(mut h)
     }
 
     fn march(
@@ -786,6 +805,41 @@ pub struct Auditing {
     /// (`judge::bits`): under way, and the thing (its place, plus one) last held.
     bits: Option<CornerBits>,
     bits_held: u32,
+    /// The eye's march kept from run to run (`kept_march`): the name it is kept under, its
+    /// pieces being read, how it stands (`MARCH_*`), and the marches read back to be kept and the
+    /// pieces being written.
+    kept_name: u64,
+    kept_loads: Vec<Pending<u8>>,
+    kept_next: u32,
+    kept_words: Vec<u32>,
+    kept_whole: bool,
+    kept_state: u32,
+    kept_reads: Vec<(u64, Pending<u32>)>,
+    kept_stores: Vec<Pending<u8>>,
+}
+
+// ---- an eye's march, kept ------------------------------------------------------------------------
+//
+// An eye's march is what its field is, seen from it: the same every run until the field, the eye
+// or the march's own kernels change, and most of an audit's frames (18 to 70 of an eye's, at
+// 640 × 360, to the 5 its mesh settles in). So each is kept in the program's storage, under a
+// name made of the thing's place in the scene's list, its eye, the picture's size, the eye itself
+// and the field's state (`StateHash`), and read back where it is there; `tools/audit` gives the
+// storage a directory named by the build's march kernels (the field's code is in them), so a
+// march is never read for kernels that did not make it.
+
+/// How an eye's kept march stands: to be marched (none kept, or one that would not read), its
+/// pieces being read, read whole, and marched and put up to be kept.
+const MARCH_FRESH: u32 = 0
+const MARCH_READING: u32 = 1
+const MARCH_READ: u32 = 2
+const MARCH_KEPT: u32 = 3
+
+/// The words of a march a piece of its storage holds (a request carries a mebibyte at most).
+const MARCH_PIECE: u32 = 250000
+
+fn march_path(name: u64, piece: u32) -> String {
+    f"audit/{name}.{piece}"
 }
 
 /// An audit run, at its first thing.
@@ -815,10 +869,103 @@ pub fn auditing() -> Auditing {
         pair_eye: Eye { at: vec3(0.0), toward: vec3(0.0, 0.0, -1.0), wide: 1.0 },
         bits: None,
         bits_held: 0,
+        kept_name: 0,
+        kept_loads: Vec::new(),
+        kept_next: 0,
+        kept_words: Vec::new(),
+        kept_whole: true,
+        kept_state: MARCH_FRESH,
+        kept_reads: Vec::new(),
+        kept_stores: Vec::new(),
     }
 }
 
 impl Auditing {
+    /// The eye's kept march once its pieces are in: the whole of it into `hits` (the eye is
+    /// marched no further), or, a piece missing or not its length, the eye marched afresh.
+    fn read_march(mut self, n: u32) {
+        // (Each piece in its turn, as it comes.)
+        while self.kept_next < self.kept_loads.len() {
+            match self.kept_loads[self.kept_next].poll() {
+                Some(Ok(bytes)) => {
+                    if bytes.len() % 4 != 0 {
+                        self.kept_whole = false
+                    }
+                    for i in 0..bytes.len() / 4 {
+                        self.kept_words.push(
+                            u32(bytes[4 * i]) | (u32(bytes[4 * i + 1]) << 8) | (u32(bytes[4 * i + 2]) << 16) |
+                                (u32(bytes[4 * i + 3]) << 24),
+                        )
+                    }
+                },
+                Some(Err(_)) => {
+                    self.kept_whole = false
+                },
+                None => {
+                    return
+                },
+            }
+            self.kept_next += 1
+        }
+        self.kept_loads = Vec::new()
+        if self.kept_whole && self.kept_words.len() == n {
+            write(mut self.hits, 0, self.kept_words)
+            self.marched = n
+            self.kept_state = MARCH_READ
+        } else {
+            self.kept_state = MARCH_FRESH
+        }
+        self.kept_words = Vec::new()
+    }
+
+    /// The marches read back are put in storage, a piece a request; true once none is still to
+    /// be read back or written (`audited` says the scene is done only then).
+    pub fn keep_marches(mut self) -> bool {
+        var i: u32 = 0
+        while i < self.kept_reads.len() {
+            match self.kept_reads[i].1.poll() {
+                Some(Ok(words)) => {
+                    let name = self.kept_reads[i].0
+                    let _ = self.kept_reads.remove(i)
+                    var piece: u32 = 0
+                    var at: u32 = 0
+                    while at < words.len() {
+                        let m = min(words.len() - at, MARCH_PIECE)
+                        var bytes: Vec<u8> = Vec::new()
+                        for j in 0..m {
+                            let x = words[at + j]
+                            bytes.push(u8(x & 255))
+                            bytes.push(u8((x >> 8) & 255))
+                            bytes.push(u8((x >> 16) & 255))
+                            bytes.push(u8(x >> 24))
+                        }
+                        self.kept_stores.push(store(march_path(name, piece), bytes))
+                        piece += 1
+                        at += m
+                    }
+                },
+                Some(Err(_)) => {
+                    let _ = self.kept_reads.remove(i)
+                },
+                None => {
+                    i += 1
+                },
+            }
+        }
+        var j: u32 = 0
+        while j < self.kept_stores.len() {
+            match self.kept_stores[j].poll() {
+                Some(_) => {
+                    let _ = self.kept_stores.remove(j)
+                },
+                None => {
+                    j += 1
+                },
+            }
+        }
+        self.kept_reads.len() == 0 && self.kept_stores.len() == 0
+    }
+
     /// The thing being audited (its place in the scene's list; past its end, all are said).
     pub fn thing(self) -> u32 {
         self.thing
@@ -946,7 +1093,7 @@ impl Auditing {
             self.cut_place = texture(width: width, height: height)
             return
         }
-        mesh.drawn_only(world, sky, look, eye, width, height)
+        mesh.drawn_only(world, sky, look, eye, width, height, subframes: 1)
         if self.moving > 0 && self.eye_k % 2 == 1 && self.moved + 1 < self.moving {
             // A frame of the thing's motion: drawn, not held.
             self.moved += 1
@@ -958,8 +1105,32 @@ impl Auditing {
         if self.drawn == 1 {
             copy_texture(from: mesh.drawn.place.level(0), to: self.cut_place.level_mut(0))
             self.marched = 0
+            // Its march as it was kept, asked for (`kept_march`).
+            var h = Hasher::new()
+            self.thing.state_hash(mut h)
+            self.eye_k.state_hash(mut h)
+            width.state_hash(mut h)
+            height.state_hash(mut h)
+            eye.at.state_hash(mut h)
+            eye.toward.state_hash(mut h)
+            eye.wide.state_hash(mut h)
+            thing.state(mut h)
+            self.kept_name = h.finish()
+            var loads: Vec<Pending<u8>> = Vec::new()
+            for k in 0..(n + MARCH_PIECE - 1) / MARCH_PIECE {
+                loads.push(load(march_path(self.kept_name, k)))
+            }
+            self.kept_loads = take loads
+            self.kept_next = 0
+            self.kept_words = Vec::new()
+            self.kept_whole = true
+            self.kept_state = MARCH_READING
         }
-        if self.marched < n {
+        if self.kept_state == MARCH_READING {
+            self.read_march(n)
+        }
+        self.keep_marches()
+        if self.marched < n && self.kept_state != MARCH_READING {
             label("audit")
             let last = min(self.marched + march_frame(thing.field()), n)
             thing.march(
@@ -973,6 +1144,10 @@ impl Auditing {
                 hits: mut self.hits,
             )
             self.marched = last
+            if last == n && self.kept_state == MARCH_FRESH {
+                self.kept_reads.push((self.kept_name, read(self.hits.items())))
+                self.kept_state = MARCH_KEPT
+            }
         }
         if self.settle_drawn == 0 {
             let settled = mesh.settled()

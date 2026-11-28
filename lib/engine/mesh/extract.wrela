@@ -702,6 +702,10 @@ pub struct MeshBatch {
     pub(package) kept_gen: u32,
     /// The most any cut of this batch was read to keep of its candidates (`ring_density`).
     pub(package) density_most: f32,
+    /// The least reach a cut for this eye was read to keep more than the room at (2 where none
+    /// was since the eye's last jump): a reach grows to less (`ring_reach`), so a growth its
+    /// model had wrong is not tried again each readback.
+    pub(package) reach_over: f32,
 
     pub(package) watch_slots_cap: u32,
     pub(package) watch_quads_cap: u32,
@@ -726,6 +730,10 @@ pub struct MeshBatch {
     /// Whether the last run took fewer slices than it asked, the frame's watches' dispatches spent
     /// (`ExtractScratch::watch_take`): it is run again.
     pub(package) watch_capped: bool,
+    /// Whether the mesh has not settled since the eye was last cut to: its watches are sized for
+    /// whole lists till it has (each extraction of a cut's first frames changes the lists by more
+    /// than the last counts say, and a run's counts are four frames coming).
+    pub(package) watch_settling: bool,
     /// The runs read that were short of their lists, and the cells they left unasked (since
     /// `MeshSight::reset_lateness`): which batch's, where the gate's count is of them all.
     pub watch_short_runs: u32,
@@ -1136,6 +1144,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         kept_read: 0,
         kept_gen: 0,
         density_most: 0.0,
+        reach_over: 2.0,
 
         watch_slots_cap: 1,
         watch_quads_cap: 1,
@@ -1150,6 +1159,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         watch_polled: 0,
         watch_from: 0,
         watch_capped: false,
+        watch_settling: false,
         watch_short_runs: 0,
         watch_unasked: 0,
         eye_near: 0.0,
@@ -1450,6 +1460,9 @@ impl MeshBatch {
         if !self.watched || !self.built || self.cpu_brick_slots == 0 {
             return
         }
+        if self.watch_settling && self.settled() {
+            self.watch_settling = false
+        }
         let eye = vec4(v.at, v.pixel())
         if eye == self.watch_eye &&
             v.forward == self.watch_fwd &&
@@ -1468,6 +1481,7 @@ impl MeshBatch {
         if view_cut(self.watch_eye.xyz, self.watch_fwd, v, self.eye_near) {
             self.watch_known = false
             self.watch_from = self.watch_run.wrapping_add(1)
+            self.watch_settling = true
         }
         self.watch_eye = eye
         self.watch_fwd = v.forward
@@ -1724,6 +1738,15 @@ impl MeshBatch {
         if capped {
             self.watch_capped = true
         }
+        // A run whose slices took every list whole is not short, whatever its counts: it is
+        // read as it is run (a cut's first runs, each settled without the four frames its counts
+        // take).
+        let whole = !self.watch_capped && dilated >= CAP_SURF && kept >= self.watch_verts_cap &&
+            read_slices * read_slice >= CAP_SURF && (!certifies || cert_slices * cert_slice >= CAP_SURF) &&
+            quad_slices * quad_slice >= self.watch_quads_cap
+        if whole {
+            self.watch_read = self.watch_run
+        }
         // The run counted, and whether its lists held more than its slices took (the gate's count
         // of short runs: a moving eye's are never read back in time to be done again).
         dispatch(
@@ -1742,7 +1765,7 @@ impl MeshBatch {
     /// before any count is read.
     fn watch_slices(self, hint: u32, slice: u32, cap: u32) -> u32 {
         let most = thin_most(slice, cap)
-        if !self.watch_known {
+        if !self.watch_known || self.watch_settling {
             return most
         }
         let want = hint + hint / 4 + slice / 16
@@ -2252,6 +2275,9 @@ impl MeshBatch {
             self.kept_read = kept
             self.kept_gen = self.poll_gen
             self.density_most = max(self.density_most, self.ring_density)
+            if kept > CUT_ROOM {
+                self.reach_over = min(self.reach_over, self.poll_reach)
+            }
         }
         self.crease_hint = creases
         self.seam_hint = self.seam_read
@@ -2896,6 +2922,9 @@ impl MeshBatch {
                 dot(v.forward, self.lod_view_fwd) < 0.90)
         let share_read = if self.ring_density > 0.0 { self.ring_density } else { scratch.density_prior }
         let share = if jumped && !self.pooled { max(share_read, self.density_most) } else { share_read }
+        if jumped {
+            self.reach_over = 2.0
+        }
         let (reach, reach_room) = ring_reach(
             aabb,
             v.at,
@@ -2908,6 +2937,7 @@ impl MeshBatch {
             clear: d_surf,
             last: self.ring_reach,
             kept_last: if !jumped && self.density_reach == self.ring_reach && self.kept_gen >= self.cut_gen { f32(self.kept_read) } else { -1.0 },
+            over: self.reach_over,
         )
         if self.ring_density > 0.0 {
             scratch.density_prior = 0.9 * scratch.density_prior + 0.1 * self.ring_density
@@ -3018,6 +3048,7 @@ impl MeshBatch {
         if self.lod_cut {
             self.watch_known = false
             self.watch_from = self.watch_run.wrapping_add(1)
+            self.watch_settling = true
             self.cut_gen = self.gen + 1
         }
         self.lod_view_at = v.at

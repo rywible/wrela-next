@@ -32,7 +32,7 @@ use std::collections::Vec
 use std::field::{Field, hash_u32}
 use std::gpu::{
     Atomics, GlobalId, GpuBuffer, R8, Rg32Float, Rgba16Float, Rgba32Float, Slots, Texels, Texture, buffer_of, copy,
-    dispatch, label, read, writable_texture,
+    dispatch, label, limits, read, writable_texture,
 }
 use std::io::{Pending, print}
 
@@ -203,10 +203,11 @@ pub fn sun_rays<M: Field<Substance>, S: Sky>(
     first: u32,
     count: u32,
     pass: u32,
+    span: u32,
     next: mut Slots<f32>,
     id: GlobalId,
 ) {
-    if id.x >= SUN_SPAN {
+    if id.x >= span {
         return
     }
     let r = first + id.x
@@ -383,6 +384,19 @@ pub struct SunJudge {
     /// The most fields a judged frame's exact rays left untraced (`SunExact::untraced`): their
     /// near band was taken as open, an estimate the judge's counts include.
     untraced: u32,
+    /// The rays a marching dispatch takes (`sun_span`).
+    span: u32,
+}
+
+/// The rays a marching dispatch takes of `field`: as many as half a dispatch's most work
+/// (`limits().step_work`) holds at `SUN_PASS_STEPS` steps each, in whole `SUN_SPAN`s, 64 of them
+/// at most. (A fixed `SUN_SPAN` was 8,100 dispatches a judging, each a few thousand lanes: 51
+/// frames of 160, most of a judging's seconds.)
+fn sun_span<M: Field<Substance>>(field: M) -> u32 {
+    let m = matter(field)
+    let step = f64(max(std::derive::work(|p: vec3| m.far(p)), 1)) * 1.2 + 16.0
+    let rays = 0.5 * f64(limits().step_work) * 1000.0 / (f64(SUN_PASS_STEPS) * step)
+    u32(clamp(rays / f64(SUN_SPAN), 1.0, 64.0)) * SUN_SPAN
 }
 
 pub fn sun_judge() -> SunJudge {
@@ -402,6 +416,7 @@ pub fn sun_judge() -> SunJudge {
         asked: Vec::new(),
         said: false,
         untraced: 0,
+        span: SUN_SPAN,
     }
 }
 
@@ -440,6 +455,8 @@ impl SunJudge {
             self.state = buffer_of(Vec::filled(n * SUN_RAYS, 0.0))
             self.out = buffer_of(Vec::filled(SUN_COUNTS + SUN_HISTOGRAM, 0))
             self.marks = writable_texture(width: w, height: h, levels: 1)
+            self.span = sun_span(world.field())
+            self.state_part = buffer_of(Vec::filled(self.span, 0.0))
             print(
                 f"sun judge: {what}: {w}x{h} (drawn at {picture.width()}x{picture.height()}), {SUN_RAYS} rays to the sun's disc a pixel from {rc} points of its footprint, at most {SUN_PASS_STEPS * SUN_PASSES} steps a ray, the field itself",
             )
@@ -479,13 +496,14 @@ impl SunJudge {
                     first: self.rayed,
                     count: rays,
                     pass: self.pass,
+                    span: self.span,
                     next: mut self.state_part,
                 ),
-                over: SUN_SPAN,
+                over: self.span,
             )
-            let len = min(SUN_SPAN, rays - self.rayed)
+            let len = min(self.span, rays - self.rayed)
             copy(from: self.state_part.span(0, len), to: self.state.span_mut(self.rayed, len))
-            self.rayed += SUN_SPAN
+            self.rayed += self.span
             if self.rayed >= rays {
                 self.rayed = 0
                 self.pass += 1
