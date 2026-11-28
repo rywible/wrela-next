@@ -854,6 +854,8 @@ pub struct BrickPool {
     pub(package) hash_cap: u32,
     pub(package) idx_cap: u32,
     pub(package) exact_cap: u32,
+    /// Whether the counts last read were of an update of the pool (`took_pool_counts`).
+    pub(package) counts_read: bool,
     pub used_slots: u32,
     pub(package) used_idx: u32,
     pub(package) used_exact: u32,
@@ -1022,6 +1024,7 @@ pub fn brick_pool() -> BrickPool {
         hash_cap: 0,
         idx_cap: 0,
         exact_cap: 0,
+        counts_read: false,
         used_slots: 0,
         used_idx: 0,
         used_exact: 0,
@@ -1117,6 +1120,15 @@ impl MeshBatch {
         gpu_ovf: u32,
     ) {
         let commit = c[17]
+        // Counts no update of the pool wrote (no update says commit 0: the batch's last
+        // extraction in place, read once it was a pool) say nothing of its cut. (Taken as a cut
+        // that kept nothing, they put a study's book's share of its candidates at 0.0000039, its
+        // reach grew to 1,290,240 of them, and the next update found 54,271 misses where it
+        // dispatched for 1,033: drawn two frames late.)
+        self.pool.counts_read = commit != 0
+        if !self.pool.counts_read {
+            return
+        }
         // (`GATE_NONE`: the test was of 0, which no update says, and no pool was ever found
         // jammed.)
         self.pool.jammed = commit == GATE_NONE && c[14] >= self.pool.cap
@@ -1871,7 +1883,10 @@ impl MeshBatch {
         let fixed = 8 + seam_indirect + cull.indirect
         let avail = if scratch.indirect_left > fixed { scratch.indirect_left - fixed } else { 0 }
         let fit_chunks = max(avail / per_chunk, 1)
-        var miss_bound = min(cut_bounds(if warm { self.pool.held.clone() } else { Vec::new() }, cut.clone()), min(total_bricks, self.pool.cap))
+        // The candidates of the cut the pool doesn't hold (`cut_bounds`, by boxes), and the most of
+        // them an update may mesh: no more than the cut's candidates or the pool's slots.
+        var new_cands = cut_bounds(if warm { self.pool.held.clone() } else { Vec::new() }, cut.clone())
+        var miss_bound = min(new_cands, min(total_bricks, self.pool.cap))
         // Room kept by freeing slots by age (`rebase_pool`), never by emptying the pool: when what
         // the pool may hold once this update is done (the slots, indices and vertices the last
         // readback found, and the most every update since it and this one may add) passes its
@@ -1891,16 +1906,20 @@ impl MeshBatch {
             self.rebase_pool(mut scratch, use_exact, uses_kept, target: self.pool.cap / 4, grow_to: grow_to)
             self.pool.rebase_next = false
             self.pool.grow_next = false
-            miss_bound = min(cut_bounds(Vec::new(), cut.clone()), min(total_bricks, self.pool.cap))
+            new_cands = cut_bounds(Vec::new(), cut.clone())
+            miss_bound = min(new_cands, min(total_bricks, self.pool.cap))
         }
-        // Chunks for what the last readbacks found missed, twice over and a chunk more, and no
-        // fewer than the share of the cut's candidates its cull is expected to keep
-        // (`cut_predicted`) of those its boxes bound against the cut the pool holds (a ring's
-        // step after a run of updates that missed nothing brought 1,333 misses to an update of
-        // one chunk, and it was drawn a frame late), but never more than the bound (a cold
-        // pool, or none read yet, takes the bound): an update short of its misses meshes what it
-        // dispatched for, draws nothing new, and the next takes up the rest; a miss beyond the
-        // bound is none.
+        // Chunks for twice the misses predicted and a chunk more, never more than the bound (a
+        // cold pool, or none read yet, takes the bound): twice the most the last readbacks found
+        // missed (a ring's step after a run of updates that missed nothing brought 1,333 misses to
+        // an update of one chunk, and it was drawn a frame late), and no fewer than twice the
+        // share of the cut's candidates its cull is expected to keep (`cut_predicted`) of all
+        // those its boxes bound against the cut the pool holds (not the most an update may mesh:
+        // a reach's step brought 535,040 new candidates, their share of the pool's 65,536 slots
+        // said 1,305 misses, and 10,424 drew SCENE 10 VIEW 4's cut a frame late; and twice, as the
+        // misses read: the share is the cut's whole, and the new candidates' was 23% above it on
+        // SCENE 13 VIEW 3). An update short of its misses meshes what it dispatched for, draws
+        // nothing new, and the next takes up the rest; a miss beyond the bound is none.
         // (A cut to another eye takes the bound too: its misses are the new cut's, not the last
         // few updates', and an update short of them drew the cut a readback late.)
         let expect = if warm && self.pool.recent_misses.len() > 0 && !self.lod_cut {
@@ -1909,7 +1928,7 @@ impl MeshBatch {
                 most = max(most, self.pool.recent_misses[k])
             }
             let share = f32(self.cut_predicted) / f32(max(total_bricks, 1))
-            min(miss_bound, max(2 * most + CHUNK_BRICKS, u32(share * f32(miss_bound))))
+            min(miss_bound, max(2 * most, u32(2.0 * share * f32(new_cands))) + CHUNK_BRICKS)
         } else {
             miss_bound
         }
