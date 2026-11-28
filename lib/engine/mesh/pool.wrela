@@ -21,7 +21,7 @@
 // extraction of its cut, bit for bit (the gate's `pool` step).
 
 use matter::substance::Substance
-use mesh::dc::{lane_slice, prep_chunk, prep_slices, prep_super_sub}
+use mesh::dc::{lane_slice, mark_first, prep_chunk, prep_slices, prep_super_sub}
 use mesh::extract::{ChunkMesh, EXTRACT_INDIRECT, ExtractScratch, MeshBatch, TRI_WORDS, bucket_bricks, cull_cut, cull_plan, zero_u32_buf}
 use mesh::grid::{
     ActiveBrick, BRICK, CAP_EXACT_MAX, CHUNK_BRICKS, CUT_BRICKS, ExactCell, GridSpec, MeshVertex, NONE,
@@ -1878,7 +1878,7 @@ impl MeshBatch {
         // as far as the frame's budget goes.
         let fc = frustum_cull_none()
         let cull = cull_plan(mut scratch, fields, total_bricks, fc)
-        let per_chunk = self.chunk_indirect(uses_kept: uses_kept, use_exact: use_exact, inherit: has_seams, pooled: true)
+        let per_chunk = self.chunk_indirect(uses_kept: uses_kept, use_exact: use_exact, inherit: has_seams)
         let seam_indirect = if has_seams { self.seam_indirect(use_exact: use_exact, uses_kept: uses_kept) } else { 0 }
         let fixed = 8 + seam_indirect + cull.indirect
         let avail = if scratch.indirect_left > fixed { scratch.indirect_left - fixed } else { 0 }
@@ -1945,6 +1945,10 @@ impl MeshBatch {
             return
         }
         scratch.indirect_left -= min(scratch.indirect_left, fixed + miss_chunks * per_chunk)
+        // The update's kept thin cells' tests (`prove_meshed_thin`), two dispatches a slice, as
+        // the frame's budget has left for them; the rest are the watch's.
+        let thin_slices = if use_exact { min(self.thin_slices(min(expect, miss_limit)), scratch.indirect_left / 2) } else { 0 }
+        scratch.indirect_left -= 2 * thin_slices
         self.pool.updates += 1
         self.pool.chunks += miss_chunks
         // What the pool holds once this update is done: its cut, when every miss it can have is
@@ -2055,6 +2059,16 @@ impl MeshBatch {
         copy(from: self.thin_keep.count().sub(start: 0, count: 1), to: self.pool.counts.span_mut(start: COUNT_THIN, count: 1))
 
         label("mesh_extract_miss")
+        if thin_slices > 0 {
+            dispatch(
+                mark_first.bind(
+                    vert_count: self.thin_keep.count(),
+                    cap_verts: self.thin_proof.len(),
+                    first: mut self.thin_first,
+                ),
+                over: 1,
+            )
+        }
         var chunk_start: u32 = 0
         while chunk_start < miss_limit {
             let chunk_n = min(miss_limit - chunk_start, CHUNK_BRICKS)
@@ -2086,11 +2100,8 @@ impl MeshBatch {
                 uses_kept,
                 max_slots: self.pool.cap,
                 crease_slices: self.crease_slices(chunk_n),
-                eye: exact_eye,
-                thin_slices: if use_exact { self.thin_slices(chunk_n) } else { 0 },
             }
             self.mesh_chunk_cells(mut scratch, fields, c: c, pooled: true)
-            label("mesh_extract_miss")
             dispatch(
                 pool_write_meta.bind(
                     grids: scratch.grids.items(),
@@ -2113,6 +2124,10 @@ impl MeshBatch {
             )
             self.mesh_chunk_quads(mut scratch, c: c, pooled: true)
             chunk_start += chunk_n
+        }
+        if thin_slices > 0 {
+            self.prove_meshed_thin(mut scratch, fields, exact_eye, thin_slices)
+            label("mesh_extract_miss")
         }
         if has_seams {
             self.stitch_seams(mut scratch, fields, held: use_exact, uses_kept: uses_kept, pooled: true)

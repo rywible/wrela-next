@@ -461,10 +461,11 @@ radiance error rather than point-sampled sub-cell tessellation noise.
 Purpose: make a moving or turning eye cost little more than a still one, by keeping every brick
 it extracted, and prove the kept mesh is the mesh a cold extraction makes.
 
-**State (2026-11-27): steps 1, 2 and 3 built; of the three conditions, no resident brick is
-meshed again on the M4's six views, the pool's passes are within 2 ms on five of them, and the
-full gate has not yet passed on either machine (below: what is open).** A static, opaque mesh of
-nested rings is a `BrickPool` (`mesh::pool`). Its bricks are keyed by what their mesh reads
+**State (2026-11-28): steps 1, 2 and 3 built; on the M4 no resident brick is meshed again, no
+watch runs short, no view is drawn late, the full audit passes and the pool judge holds 5 kinds;
+the pool's passes are within 2 ms over still on four of the six views (SCENE 10 VIEW 4 2.57 ms,
+SCENE 13 VIEW 3 4.4: below), and the Radeon is not run (this round of work is the M4's alone).**
+A static, opaque mesh of nested rings is a `BrickPool` (`mesh::pool`). Its bricks are keyed by what their mesh reads
 (`brick_key`: lattice brick, level, seam faces, hole mask, thing), every brick of a cut kept,
 seam faces' too: a brick on a 2:1 seam face keeps six indices of its own slice for each quad of
 the stitch across it (`count_lod_edge`, `emit_tris_lod`), and the stitch writes them there
@@ -558,26 +559,31 @@ and the pass table; the gate holds the first two):
   judge holds each of its five kinds through a growth and a voided update, bit for bit. M4, all
   six views: 0.
 - **The pool's passes over still** (the bench's pass table, means a frame, M4, 1080p, frames 30 to
-  269; still 0 on both scenes): SCENE 10 view 3 0.70 ms, view 4 1.42, view 5 0; SCENE 13 view 3
-  5.08 (3.40 of it the misses' chunks: 5 to 11 chunks dispatched an update for the 0.5 to 1.2 its
-  misses fill), view 4 1.91, view 5 0. **Open: view 3 of SCENE 13 is over the 2 ms.** Before the
-  reach was held still (below) the still frame itself paid 19 ms.
+  269; still 0 on both scenes; at `724de08` and after): SCENE 10 view 3 0.98 ms, view 4 2.57 (cull
+  0.61, probe 0.04, misses 0.86, the update's thin proofs 0.25, compaction 0.80: of it the cut's
+  indices copied into the draw each commit, 0.53), view 5 0; SCENE 13 view 3 4.41 (its misses 2.13
+  a frame after frame 120, 1.7 ms of it meshing the table's bricks, the rest of its dispatches
+  under 10 µs each; frames 30 to 72 the cut still growing from cold, to 47.6 ms in one), view 4
+  1.44, view 5 0. **Open: SCENE 10 VIEW 4 and SCENE 13 VIEW 3 over the 2 ms.** What is left there
+  is work, not waiting: the cull and the compaction of a whole cut each update (a level whose
+  grid did not move culls the same; a commit copies every drawn slot's indices, not the new
+  ones'), and meshing a heavy field's bricks (phase 5's specialization, phase 4's motion by
+  structure).
 - **The reach held still.** A reach grew a step where its share said none fit and came back the
   next frame, out and back for as long as the eye stood (the arena's near things: an update a
   frame, 43 chunks dispatched for 4 of misses, 42 extractions in frames 30 to 120 of a still eye),
   and the share was held to no less than a 64th where the cull kept 0.7%. Now a reach grows only
   as far as its share predicts fits, the share is as read, and that batch stands at the rule's
   reach with no extraction once settled.
-- **Watch runs short of their lists** (`grid::TALLY_SHORT`, each run's counts read with what its
-  slices took): M4, of 948 runs a view (474 or 630 on SCENE 13), 2 to 30 short on SCENE 10's views
-  and 1 to 25 on SCENE 13's, leaving 1,600 to 2.7 million cells unasked; the Radeon 31 to 67.
-  They follow a pool's commits, not the eye (view 4 never turns): the thin cells of the slots a
-  commit newly draws all come due at once (100,000 and more against a slice of 8,192), and the
-  count that would size the next run is read three frames later. A watch's dispatches are taken
-  from the frame's (`ExtractScratch::watch_take`), so a frame of whole lists is cut short and run
-  again, not refused by the host. **Open: the gate wants none short. What ends it is proofs made
-  where the cells are made (a thin cell proven in the chunk that meshes its brick, and kept while
-  the brick is resident, drawn or not), so a commit brings none due.**
+- **Watch runs short of their lists** (`grid::TALLY_SHORT`): none on the M4's six views (they
+  were 2 to 30 a view, leaving up to 2.7 million cells unasked). Three changes ended it. A pool's
+  update proves its kept thin cells for its own eye after its chunks (`prove_meshed_thin`), so a
+  commit brings none due. A kept cell whose proof failed at a margin no finer than the eye's is
+  given its exact cell by `thin_due` at once (7.5 million of SCENE 13 VIEW 3's 8.1 million due
+  cells were such, asked each frame they were in view). And each list's slices are decided before
+  its passes, so a cell put up past its list's room is given an exact cell (the watch's debt,
+  `TALLY_ROOMLESS_*`, the slow exact path). A run is short now only where quads or kept cells went
+  unexamined, which only the frame's dispatches running out does.
 
 The outline's watch (its certificates and thin cells, done again each frame its eye moves) is
 settled only once its own run's counts are read: each run writes its number beside its counts,

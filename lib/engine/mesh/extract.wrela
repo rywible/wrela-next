@@ -267,8 +267,7 @@ pub const WATCH_INDIRECT: u32 = 2048
 /// first brick in the list and how many, the list's cap, whether its grids are nested
 /// (`lod`: the LOD kernels) with 2:1 seams (`inherit`: a seam face's corners the coarser
 /// level's), the extraction's `held` and steepness, whether its vertices keep parts, the slots
-/// its bricks may take, its crease slices, and the eye its kept thin cells are proven for and
-/// their slices (`thin_slices`, none where the mesh is not held).
+/// its bricks may take, and its crease slices.
 pub(package) struct ChunkMesh: Copy {
     pub(package) chunk_start: u32,
     pub(package) chunk_n: u32,
@@ -280,8 +279,6 @@ pub(package) struct ChunkMesh: Copy {
     pub(package) uses_kept: bool,
     pub(package) max_slots: u32,
     pub(package) crease_slices: u32,
-    pub(package) eye: vec4,
-    pub(package) thin_slices: u32,
 }
 
 /// The words of a batch's `tri_count` (`mesh::pool::finish_pool_draw` says what each is), all read
@@ -460,12 +457,12 @@ pub struct MeshBatch {
     pub(package) keep_slice: u32,
     pub(package) keep_args: GpuBuffer<DispatchArgs>,
     pub(package) keep_first: GpuBuffer<u32>,
-    /// Where a chunk's kept thin cells begin in `thin_keep` (`mark_first` before it classifies
-    /// its cells), the cells a slice of their tests takes (`thin_slice_for`), and the most a
-    /// chunk of the latest read extraction kept (`thin_slices`).
+    /// Where a pool's update's kept thin cells begin in `thin_keep` (`mark_first` before its
+    /// chunks), the cells a slice of their tests takes (`thin_slice_for`), and the thin cells an
+    /// update of the latest readbacks kept for each brick it meshed (`thin_slices`; 0 before any).
     pub(package) thin_first: GpuBuffer<u32>,
     pub(package) thin_slice: u32,
-    pub(package) thin_hint: u32,
+    pub(package) thin_per_brick: f32,
     /// Packed 8-byte per-vertex skin weights (`[bones_u32, weights_u32]` per vertex); allocated
     /// ONLY when `is_skinned` is true (dummy 2-u32 buffer otherwise).
     pub skin_verts: GpuBuffer<u32>,
@@ -985,7 +982,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         keep_first: buffer(1),
         thin_first: buffer(1),
         thin_slice: THIN_SLICE,
-        thin_hint: 0,
+        thin_per_brick: 0.0,
         skin_verts: buffer_of([0, 255]),
         skin_cap: 1,
         deformed_verts: buffer_of([MeshVertex { px: 0.0, py: 0.0, pz: 0.0, packed: 0 }]),
@@ -2187,7 +2184,9 @@ impl MeshBatch {
                     counts = vec4u(c[0], c[1], c[2], c[3])
                     creases = c[4]
                     uncovered = c[5]
-                    self.thin_hint = c[16]
+                    if self.pooled && c[17] != 0 && c[11] > 0 {
+                        self.thin_per_brick = f32(c[16]) / f32(c[11])
+                    }
                     cut_indices = c[6]
                     gpu_ovf = c[7]
                     exact_count = c[8]
@@ -2502,23 +2501,25 @@ impl MeshBatch {
         clamp((want + slice - 1) / slice, 1, most)
     }
 
-    /// The slices a chunk of `chunk_n` bricks tests its just-kept thin cells in (`thin_slice`
-    /// each, `mesh_chunk_cells`): as `crease_slices`, by the most a chunk of the last readback
-    /// kept (`thin_hint`), as many as a cold chunk's creases are given with none to go by, and no
-    /// more dispatches than meshing the chunk takes (`chunk_mesh_indirect`: a heavy field's slices
-    /// are a few cells, and its cold chunks asked 704 of a frame's 16,384, past what the frame's
-    /// extraction and watches had). A chunk that keeps more leaves the rest unproven, for the
-    /// watch (`thin_due`).
-    pub(package) fn thin_slices(self, chunk_n: u32) -> u32 {
+    /// The slices a pool's update meshing `bricks` misses tests its just-kept thin cells in
+    /// (`thin_slice` each, `prove_meshed_thin`): as many as the thin cells an update of the last
+    /// readbacks kept a brick (`thin_per_brick`) say, with a quarter and a sixteenth of a slice
+    /// more, or as many as a cold chunk's creases are given each of its chunks with none to go by,
+    /// and no more dispatches than meshing its chunks takes (`chunk_mesh_indirect`: a heavy
+    /// field's slices are a few cells, and its cold chunks asked 704 of a frame's 16,384, past
+    /// what the frame's extraction and watches had). An update that keeps more leaves the rest
+    /// unproven, for the watch (`thin_due`).
+    pub(package) fn thin_slices(self, bricks: u32) -> u32 {
         let slice = max(self.thin_slice, 64)
-        let most = min(min((chunk_n * VERTS_BRICK + slice - 1) / slice, SLICES_MOST), max(self.chunk_mesh_indirect(chunk_n) / 2, 1))
-        let cold = max(COLD_CREASE_SLICES, (65536 + slice - 1) / slice)
-        if self.active_hint == 0 ||
-            self.lod_cut ||
-            self.extract_total > self.hint_total + self.hint_total / 4 {
-            return min(most, cold)
+        let chunks = max((bricks + CHUNK_BRICKS - 1) / CHUNK_BRICKS, 1)
+        let most = min(
+            min((bricks * VERTS_BRICK + slice - 1) / slice, SLICES_MOST),
+            max(chunks * self.chunk_mesh_indirect(CHUNK_BRICKS) / 2, 1),
+        )
+        if !(self.thin_per_brick > 0.0) || self.lod_cut {
+            return min(most, chunks * max(COLD_CREASE_SLICES, (65536 + slice - 1) / slice))
         }
-        let want = self.thin_hint + self.thin_hint / 4 + slice / 16
+        let want = u32(self.thin_per_brick * f32(bricks) * 1.25) + slice / 16
         clamp((want + slice - 1) / slice, 1, most)
     }
 
@@ -4249,7 +4250,7 @@ impl MeshBatch {
     /// The indirect dispatches a chunk of `CHUNK_BRICKS` takes of a frame's (`mesh_chunk_cells` and
     /// `mesh_chunk_quads`): its fixed ones, its slices of vertices, corners and quads, of kept
     /// parts, of exact cells' copies, and of creases.
-    pub(package) fn chunk_indirect(self, uses_kept: bool, use_exact: bool, inherit: bool, pooled: bool) -> u32 {
+    pub(package) fn chunk_indirect(self, uses_kept: bool, use_exact: bool, inherit: bool) -> u32 {
         let surf_per_chunk = min((CHUNK_BRICKS * VERTS_BRICK + self.surf_slice - 1) / self.surf_slice, SLICES_MOST)
         let keep_per_chunk = if uses_kept {
             min((CHUNK_BRICKS * VERTS_BRICK + self.keep_slice - 1) / self.keep_slice, SLICES_MOST)
@@ -4261,7 +4262,7 @@ impl MeshBatch {
         let quad_per_chunk = (CHUNK_BRICKS + self.quad_slice - 1) / self.quad_slice
         CHUNK_INDIRECT + (surf_per_chunk - 1) + (if inherit { 2 * eval_per_chunk - 1 } else { eval_per_chunk - 1 }) +
             2 * (quad_per_chunk - 1) +
-            keep_per_chunk + (if use_exact { 2 } else { 0 }) + (if use_exact && pooled { 2 * self.thin_slices(CHUNK_BRICKS) } else { 0 }) +
+            keep_per_chunk + (if use_exact { 2 } else { 0 }) +
             self.crease_slices(CHUNK_BRICKS) * self.crease_passes
     }
 
@@ -4390,16 +4391,6 @@ impl MeshBatch {
                 over: chunk_n,
             )
         }
-        if c.thin_slices > 0 {
-            dispatch(
-                mark_first.bind(
-                    vert_count: self.thin_keep.count(),
-                    cap_verts: self.thin_proof.len(),
-                    first: mut self.thin_first,
-                ),
-                over: 1,
-            )
-        }
         dispatch(
             classify_cells.bind(
                 grids: grids,
@@ -4502,77 +4493,6 @@ impl MeshBatch {
         if c.uses_kept {
             self.keep_since_first(fields, min((chunk_n * VERTS_BRICK + self.keep_slice - 1) / self.keep_slice, SLICES_MOST))
         }
-        // The thin cells this chunk of a pool kept (`thin_keep` from `thin_first`), each proven for
-        // the eye of its update (`c.eye`) as the watch proves a kept cell for its frame's
-        // (`mesh::outline::thin_watched`, its octants, `THIN_MESHED`), in `c.thin_slices` slices:
-        // a brick's cells are proven while it is meshed, and kept while it is resident, so the
-        // commit that draws its slot brings none due (SCENE 10 VIEW 4's commits left 826,249 kept
-        // cells unasked, of the 843,055 its watches left).
-        if c.thin_slices > 0 {
-            label("mesh_extract_thin")
-            let slice = self.thin_slice
-            dispatch(
-                prep_meshed_thin.bind(
-                    count: self.thin_keep.count(),
-                    cap: self.thin_proof.len(),
-                    first: self.thin_first.items(),
-                    most: slice,
-                    slices: c.thin_slices,
-                    whole: scratch.crease_args.span_mut(start: 0, count: c.thin_slices),
-                    octs: scratch.thin_args.span_mut(start: 0, count: c.thin_slices),
-                    seen: mut self.tri_count,
-                    tally: mut scratch.tally,
-                ),
-                over: c.thin_slices,
-            )
-            for k in 0..c.thin_slices {
-                dispatch(
-                    thin_watched.bind(
-                        fields: fields,
-                        slots: self.slot_bricks.items(),
-                        alive: self.brick_alive.items(),
-                        cands: self.thin_keep.items(),
-                        order: self.thin_keep.items(),
-                        count: self.thin_keep.count(),
-                        cap: self.thin_proof.len(),
-                        from: self.thin_first.items(),
-                        first: k * slice,
-                        origin: self.watch_origin,
-                        shift: self.watch_shift,
-                        eye: c.eye,
-                        keep: THIN_MESHED,
-                        thin_proof: mut self.thin_proof,
-                        bits: mut self.watch_bits,
-                        thin_masks: scratch.thin_masks.span_mut(start: 0, count: slice),
-                    ),
-                    groups: scratch.crease_args.at(k),
-                    most: slice / 64,
-                )
-                dispatch(
-                    thin_watched_octants.bind(
-                        fields: fields,
-                        slots: self.slot_bricks.items(),
-                        alive: self.brick_alive.items(),
-                        cands: self.thin_keep.items(),
-                        order: self.thin_keep.items(),
-                        count: self.thin_keep.count(),
-                        cap: self.thin_proof.len(),
-                        thin_masks: scratch.thin_masks.items(),
-                        from: self.thin_first.items(),
-                        first: k * slice,
-                        origin: self.watch_origin,
-                        shift: self.watch_shift,
-                        eye: c.eye,
-                        keep: THIN_MESHED,
-                        thin_proof: mut self.thin_proof,
-                        bits: mut self.watch_bits,
-                        exact_cells: mut self.exact_cells,
-                    ),
-                    groups: scratch.thin_args.at(k),
-                    most: slice / 8,
-                )
-            }
-        }
         dispatch(
             zero_chunk_counts.bind(
                 counts: scratch.brick_idx_counts.span_mut(start: 0, count: chunk_n),
@@ -4638,6 +4558,87 @@ impl MeshBatch {
                 cap_bricks: c.cap_bricks,
                 chunk_start: chunk_start,
                 chunk_n: chunk_n,
+            )
+        }
+    }
+
+    /// The thin cells a pool's update kept (`thin_keep` from `thin_first`, marked before its
+    /// chunks), each proven for the update's eye `eye` as the watch proves a kept cell for its
+    /// frame's (`mesh::outline::thin_watched`, its octants, `THIN_MESHED`), in `slices` slices
+    /// (`thin_slices`): a brick's cells are proven as it is meshed, and kept while it is resident,
+    /// so the commit that draws its slot brings none due (SCENE 10 VIEW 4's commits left 826,249
+    /// kept cells unasked, of the 843,055 its watches left). An update's at once, not a chunk's
+    /// each (a chunk's slices, most of them empty, cost SCENE 10 VIEW 4 0.65 ms a frame); a mesh
+    /// made in place is made again for each eye that moves it, and the watch asks its cells in
+    /// view (proven, SCENE 10's ward and flames, meshed each frame, took 4.82 ms a frame).
+    pub(package) fn prove_meshed_thin<M: Field<Substance>>(
+        mut self,
+        scratch: mut ExtractScratch,
+        fields: GpuSpan<M>,
+        eye: vec4,
+        slices: u32,
+    ) {
+        label("mesh_extract_thin")
+        let slice = self.thin_slice
+        dispatch(
+            prep_meshed_thin.bind(
+                count: self.thin_keep.count(),
+                cap: self.thin_proof.len(),
+                first: self.thin_first.items(),
+                most: slice,
+                slices: slices,
+                whole: scratch.crease_args.span_mut(start: 0, count: slices),
+                octs: scratch.thin_args.span_mut(start: 0, count: slices),
+                seen: mut self.tri_count,
+                tally: mut scratch.tally,
+            ),
+            over: slices,
+        )
+        for k in 0..slices {
+            dispatch(
+                thin_watched.bind(
+                    fields: fields,
+                    slots: self.slot_bricks.items(),
+                    alive: self.brick_alive.items(),
+                    cands: self.thin_keep.items(),
+                    order: self.thin_keep.items(),
+                    count: self.thin_keep.count(),
+                    cap: self.thin_proof.len(),
+                    from: self.thin_first.items(),
+                    first: k * slice,
+                    origin: self.watch_origin,
+                    shift: self.watch_shift,
+                    eye: eye,
+                    keep: THIN_MESHED,
+                    thin_proof: mut self.thin_proof,
+                    bits: mut self.watch_bits,
+                    thin_masks: scratch.thin_masks.span_mut(start: 0, count: slice),
+                ),
+                groups: scratch.crease_args.at(k),
+                most: slice / 64,
+            )
+            dispatch(
+                thin_watched_octants.bind(
+                    fields: fields,
+                    slots: self.slot_bricks.items(),
+                    alive: self.brick_alive.items(),
+                    cands: self.thin_keep.items(),
+                    order: self.thin_keep.items(),
+                    count: self.thin_keep.count(),
+                    cap: self.thin_proof.len(),
+                    thin_masks: scratch.thin_masks.items(),
+                    from: self.thin_first.items(),
+                    first: k * slice,
+                    origin: self.watch_origin,
+                    shift: self.watch_shift,
+                    eye: eye,
+                    keep: THIN_MESHED,
+                    thin_proof: mut self.thin_proof,
+                    bits: mut self.watch_bits,
+                    exact_cells: mut self.exact_cells,
+                ),
+                groups: scratch.thin_args.at(k),
+                most: slice / 8,
             )
         }
     }
@@ -5234,7 +5235,7 @@ impl MeshBatch {
         let wanted = self.chunk_limit(total_bricks, min(est_cap, total_bricks))
         // A chunk's slots are written (`keep_slots`, and its cells' bits cleared, `clear_slot_out`)
         // where the mesh is held; its outline is found each frame (`watch`).
-        let per_chunk = self.chunk_indirect(uses_kept: uses_kept, use_exact: use_exact, inherit: has_seams, pooled: false)
+        let per_chunk = self.chunk_indirect(uses_kept: uses_kept, use_exact: use_exact, inherit: has_seams)
         let seam_indirect = if has_seams { self.seam_indirect(use_exact: use_exact, uses_kept: uses_kept) } else { 0 }
         let cert_indirect: u32 = 0
         let cull = cull_plan(mut scratch, fields, total_bricks, fc)
@@ -5345,11 +5346,6 @@ impl MeshBatch {
                 uses_kept,
                 max_slots: self.watch_slots_cap,
                 crease_slices: self.crease_slices(chunk_n),
-                eye: exact_eye,
-                // (A mesh made in place is made again for each eye that moves it: its thin cells
-                // are asked by the watch, for the cells in view. Proven in its chunks, SCENE 10's
-                // ward and flames, meshed each frame, took 4.82 ms a frame at the median.)
-                thin_slices: 0,
             }
             self.mesh_chunk_cells(mut scratch, fields, c: c, pooled: false)
             label("mesh_extract")
