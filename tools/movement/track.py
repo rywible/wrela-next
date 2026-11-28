@@ -228,6 +228,10 @@ class Sim:
         self.joints_2 = torch.zeros(worlds, self.mjm.nq - 7, device=device)
         self.accel_weight = 0.0
         self.vel_scale = 0.05
+        # Each servo's damping over its stiffness (s): `command`'s feed forward of the clip's speed.
+        self.kv_over_kp = torch.tensor(-self.mjm.actuator_biasprm[:, 2] / np.maximum(self.mjm.actuator_gainprm[:, 0], 1e-9),
+                                       device=device, dtype=torch.float32)
+        self.feed_forward = False
         self.read_last = False
         self.rate_weight = 0.0
         # The soles: the feet and the toes (segments 9, 10, 13 and 14 of the human), as places in
@@ -247,7 +251,15 @@ class Sim:
             self.applied = self.applied + k * (a - self.applied)
         else:
             self.applied = a
-        return self.ref_q[self.global_frame(1)][:, 7:] + self.act_scale * self.applied
+        g = self.global_frame(1)
+        target = self.ref_q[g][:, 7:] + self.act_scale * self.applied
+        if self.feed_forward:
+            # The servo damps toward no speed (kp (q* - q) - kv q'); its target moved on by kv / kp
+            # of the clip's speed makes it kp (q* - q) + kv (q*' - q'), damping toward the clip's
+            # speed, as a tracking servo does. Without it a fast movement is braked and the net
+            # pushes against the brake with a gain that rings.
+            target = target + self.kv_over_kp * self.ref_vel(g)[:, 6:]
+        return target
 
     def tilt(self, g):
         """Each world's own gravity (`g`, worlds by 3): a floor tilted under the body is a slope.
@@ -1137,6 +1149,8 @@ def main():
     p.add_argument("--smooth-place", type=float, default=0.0,
                    help="the weight of the actions' means' change for an observation `--smooth-noise` off")
     p.add_argument("--smooth-noise", type=float, default=0.05)
+    p.add_argument("--feed-forward", action="store_true",
+                   help="the servos damp toward the clip's speed, not toward none (their targets moved on by kv/kp of it)")
     p.add_argument("--vel-scale", type=float, default=0.05,
                    help="the joints' speeds' term exp(-this times their mean square error, rad/s): DeepMimic's 6.2")
     p.add_argument("--accel-weight", type=float, default=0.0,
@@ -1188,6 +1202,7 @@ def main():
         sim.activation_ms = a.activation_ms
         sim.accel_weight = a.accel_weight
         sim.vel_scale = a.vel_scale
+        sim.feed_forward = a.feed_forward
         sim.rate_weight = a.rate_weight
         sim.sole_weight = a.sole_weight
         print(f"sim: {a.worlds} worlds, {len(head['names'])} clips, {refs.shape[0]} frames, "
