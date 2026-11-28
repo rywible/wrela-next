@@ -652,11 +652,15 @@ LEAST_LOG_STD = -3.0
 BOUND = 1.1
 
 
-def ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, target_kl, bounds=0.01, vnorm=None):
+def ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, target_kl, bounds=0.01, vnorm=None, smooth=None):
     """PPO's epochs over the rollout (clipped at 0.2, 4 minibatches of 32,768 an epoch), actor and
     critic gradients clipped to 1 apart, value targets normalized by `vnorm` when given, actions'
     means held within `BOUND` (weight `bounds`), and smooth KL-adaptive learning rate using
-    per-action-dimension KL so high-DOF bodies (62+ actuators) are not throttled 60x too hard."""
+    per-action-dimension KL so high-DOF bodies (62+ actuators) are not throttled 60x too hard.
+    With `smooth` (each sample's next observation, whether it has one, and the weights and the
+    noise), the actions' means are held smooth as Mysore et al. 2021 hold them: near the mean of
+    the next observation, and near the mean of an observation a little off (a net that changes
+    its action much for a little change of what it reads shakes the body it moves)."""
     dev = b_obs.device
     n = b_obs.shape[0]
     n_act = b_act.shape[-1]
@@ -683,6 +687,12 @@ def ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, target_kl, bounds=0
             mu = dist.mean
             bl = (torch.relu(mu - BOUND) ** 2 + torch.relu(-BOUND - mu) ** 2).sum(-1).mean()
             loss = pg + vl + bounds * bl
+            if smooth is not None:
+                nxt, pair, lam_t, lam_s, sigma = smooth
+                in_time = (((mu - agent.pi(nxt[j])) ** 2).mean(-1) * pair[j]).mean()
+                near = b_obs[j] + sigma * torch.randn(b_obs[j].shape, device=dev, generator=gen)
+                in_place = ((mu - agent.pi(near)) ** 2).mean()
+                loss = loss + lam_t * in_time + lam_s * in_place
             if not torch.isfinite(loss):
                 skipped += 1
                 continue
@@ -1077,6 +1087,11 @@ def main():
     p.add_argument("--start-share", type=float, default=0.25,
                    help="the share of worlds started at their clip's first frame (the evaluation plays each "
                         "clip from there)")
+    p.add_argument("--smooth-time", type=float, default=0.0,
+                   help="the weight of the actions' means' change from an observation to the next (Mysore et al. 2021)")
+    p.add_argument("--smooth-place", type=float, default=0.0,
+                   help="the weight of the actions' means' change for an observation `--smooth-noise` off")
+    p.add_argument("--smooth-noise", type=float, default=0.05)
     p.add_argument("--accel-weight", type=float, default=0.0,
                    help="the reward times e^-(this times the mean square of the joints' acceleration's distance "
                         "from the clip's, rad a frame squared): 1000 halves it at 0.026")
@@ -1263,8 +1278,13 @@ def main():
             b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
             with torch.no_grad():
                 past = float((agent.pi(b_obs[:4096]).abs() > 1.0).float().mean())
+            smooth = None
+            if a.smooth_time > 0.0 or a.smooth_place > 0.0:
+                with torch.no_grad():
+                    nxt = torch.cat([obs_buf[1:], norm(observe(sim))[None]], 0).reshape(H * N, -1)
+                smooth = (nxt, (1.0 - done_buf).reshape(-1), a.smooth_time, a.smooth_place, a.smooth_noise)
             kl, clipped, vloss, epochs = ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, a.target_kl,
-                                             a.bounds, vnorm=vnorm)
+                                             a.bounds, vnorm=vnorm, smooth=smooth)
             skipped += kl[1]
             step += 1
             samples += H * N
