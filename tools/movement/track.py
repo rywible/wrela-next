@@ -834,7 +834,8 @@ def play(sim, agent, norm, clips, most_frames=None, record=False, push=None):
                      "mean_m": float(dist[j] / max(float(count[j]), 1.0)),
                      "past_range": float(past[j] / max(float(count[j]), 1.0)),
                      "worst_range": float(worst[j]),
-                     "tremor": tremor(joints[:min(int(fell_at[j]), joints.shape[0]), j].float(), sim.rate)}
+                     "tremor": tremor(joints[:min(int(fell_at[j]), joints.shape[0]), j].float(), sim.rate),
+                     "ringing": ringing(joints[:min(int(fell_at[j]), joints.shape[0]), j].float(), sim.rate)}
             if record:
                 n = min(int(fell_at[j]), len(frames))
                 entry["qpos"] = torch.stack([f[j] for f in frames[:n]]).float().numpy()
@@ -971,6 +972,19 @@ def tremor(q, rate):
     return float(p[f > TREMOR_HZ].sum() / p.sum().clamp(min=1e-12))
 
 
+def ringing(q, rate):
+    """The share of the joints' speed's power at 4 to 7.5 Hz (a loop that rings; the capture,
+    low-passed at 6 Hz, keeps some 7% there): a shake slowed by a lag in the loop goes under
+    `TREMOR_HZ` (`b3`'s knees at 5.5 Hz)."""
+    if q.shape[0] < 32:
+        return 0.0
+    v = (q[1:] - q[:-1]) * rate
+    v = v - v.mean(0, keepdim=True)
+    p = torch.fft.rfft(v, dim=0).abs().pow(2).sum(1)
+    f = torch.fft.rfftfreq(v.shape[0], 1.0 / rate).to(p.device)
+    return float(p[(f >= 4.0) & (f < 7.5)].sum() / p.sum().clamp(min=1e-12))
+
+
 def summary(results, names=None):
     if not results:
         return {"clips": 0}
@@ -987,6 +1001,7 @@ def summary(results, names=None):
         out["range_in_target"] = sum(r["worst_range"] <= RANGE_TARGET for r in results) / len(results)
         out["tremor"] = sum(r["tremor"] * r["frames"] for r in results) / max(frames, 1)
         out["tremor_in_target"] = sum(r["tremor"] <= TREMOR_TARGET for r in results) / len(results)
+        out["ringing"] = sum(r["ringing"] * r["frames"] for r in results) / max(frames, 1)
     if names is not None:
         groups = {}
         for r in results:
