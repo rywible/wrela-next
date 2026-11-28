@@ -991,10 +991,17 @@ def summary(results, names=None):
 def evaluate(sim, agent, norm, most_frames=600):
     """The training clips and the test clips, each played from its start (`play`); the training
     clips' results weigh how often each starts a world after."""
-    training = play(sim, agent, norm, sim.train.tolist(), most_frames)
+    # One play of both sets where the worlds hold them (each play steps every world: two plays of
+    # 600 frames cost as much as 40 updates).
+    train, test = sim.train.tolist(), sim.test.tolist()
+    if len(train) + len(test) <= sim.n:
+        both = play(sim, agent, norm, train + test, most_frames)
+        training, held = both[:len(train)], both[len(train):]
+    else:
+        training = play(sim, agent, norm, train, most_frames)
+        held = play(sim, agent, norm, test, most_frames)
     sim.weigh(training)
-    return {"training": summary(training, sim.names),
-            "test": summary(play(sim, agent, norm, sim.test.tolist(), most_frames), sim.names)}
+    return {"training": summary(training, sim.names), "test": summary(held, sim.names)}
 
 
 def filtered(sim, agent, norm, head, push=None):
