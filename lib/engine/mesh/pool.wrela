@@ -22,11 +22,12 @@
 
 use matter::substance::Substance
 use mesh::dc::{lane_slice, prep_chunk, prep_slices, prep_super_sub}
-use mesh::extract::{ChunkMesh, EXTRACT_INDIRECT, ExtractScratch, MeshBatch, TRI_WORDS, cull_cut, cull_plan, zero_u32_buf}
+use mesh::extract::{ChunkMesh, EXTRACT_INDIRECT, ExtractScratch, MeshBatch, TRI_WORDS, bucket_bricks, cull_cut, cull_plan, zero_u32_buf}
 use mesh::grid::{
     ActiveBrick, BRICK, CAP_EXACT_MAX, CHUNK_BRICKS, CUT_BRICKS, ExactCell, GridSpec, MeshVertex, NONE,
     OVERFLOW_BRICKS, OVERFLOW_CREASES, OVERFLOW_CUT, OVERFLOW_EXACT, OVERFLOW_INDICES, OVERFLOW_THIN,
-    OVERFLOW_TRANS, OVERFLOW_UNLOCAL, SLICES_MOST, TALLY_DOUBLED, TALLY_LOST, brick_in_hole, frustum_cull_none,
+    OVERFLOW_TRANS, OVERFLOW_UNLOCAL, SLICES_MOST, TALLY_DOUBLED, TALLY_LOST, VERTS_BRICK, brick_in_hole,
+    frustum_cull_none,
 }
 use mesh::outline::{SLOT_BRICK_WORDS, SLOT_WORDS, zero_words}
 use std::collections::{Vec, swap}
@@ -76,6 +77,12 @@ pub const POOL_MARK_WORDS: u32 = 16
 pub const GATE_COMMIT: u32 = 0
 pub const GATE_MISSES: u32 = 1
 pub const GATE_EXACT: u32 = 2
+/// Why an update was voided (`pool_void`), or 0: `VOID_*`.
+pub const GATE_VOID: u32 = 3
+pub const VOID_VERTS: u32 = 1
+pub const VOID_INDICES: u32 = 2
+pub const VOID_EXACT: u32 = 4
+pub const VOID_ASKED: u32 = 8
 pub const GATE_WORDS: u32 = 4
 pub const GATE_WHOLE: u32 = 1
 pub const GATE_COLD: u32 = 2
@@ -440,6 +447,74 @@ pub(package) fn pool_insert(
     let _ = tally.add(i: TALLY_LOST, value: 1)
 }
 
+/// The words of `BrickPool::counts`: the vertices, outline records and kept thin cells an update
+/// began with (`COUNT_*`), then what each list and the exact arena hold once it is done
+/// (`COUNT_NOW + ...`: as the update left them, or as it began where it was voided).
+pub const COUNT_VERTS: u32 = 0
+pub const COUNT_QUADS: u32 = 1
+pub const COUNT_THIN: u32 = 2
+pub const COUNT_EXACT: u32 = 3
+pub const COUNT_NOW: u32 = 4
+pub const COUNT_WORDS: u32 = 8
+
+/// An update whose misses outgrew an arena (its vertices, its indices or its exact cells past
+/// their room: some were kept nowhere) is voided, unless it filled an emptied pool: none of its
+/// bricks is kept (no slot taken, no key put in the hash: `GATE_MISSES` 0), its lists and arenas
+/// are as it began (`counts`, `MARK_IDX`, `MARK_EXACT`), it draws nothing new (`GATE_NONE`), and
+/// it says why (`GATE_VOID`). So a pool holds no brick with a part missing, and is never emptied
+/// to be rid of one: the CPU, reading why, frees slots by age or grows the arena by a rebase
+/// (`MeshBatch::took_pool_counts`). (`ask`: a judge's, to hold what a voided update leaves.)
+@strict
+@compute(1)
+pub(package) fn pool_void(
+    verts_count: [u32],
+    quad_count: [u32],
+    thin_count: [u32],
+    exact_count: [u32],
+    exact_base: [u32],
+    marks: [u32],
+    cap_verts: u32,
+    cap_pool_indices: u32,
+    cap_pool_exact: u32,
+    ask: u32,
+    counts: mut Atomics<u32>,
+    pool_tri_count: mut Atomics<u32>,
+    gate: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let _ = id
+    var why: u32 = 0
+    if verts_count[0] > cap_verts {
+        why |= VOID_VERTS
+    }
+    if pool_tri_count.load(i: 0) > cap_pool_indices {
+        why |= VOID_INDICES
+    }
+    if exact_count[0] > cap_pool_exact {
+        why |= VOID_EXACT
+    }
+    if ask != 0 {
+        why |= VOID_ASKED
+    }
+    if why == 0 || gate.load(i: GATE_COMMIT) == GATE_COLD {
+        gate.store(i: GATE_VOID, value: 0)
+        counts.store(i: COUNT_NOW + COUNT_VERTS, value: verts_count[0])
+        counts.store(i: COUNT_NOW + COUNT_QUADS, value: quad_count[0])
+        counts.store(i: COUNT_NOW + COUNT_THIN, value: thin_count[0])
+        counts.store(i: COUNT_NOW + COUNT_EXACT, value: exact_count[0])
+        return
+    }
+    gate.store(i: GATE_VOID, value: why)
+    gate.store(i: GATE_COMMIT, value: GATE_NONE)
+    gate.store(i: GATE_MISSES, value: 0)
+    gate.store(i: GATE_EXACT, value: exact_base[0])
+    counts.store(i: COUNT_NOW + COUNT_VERTS, value: counts.load(i: COUNT_VERTS))
+    counts.store(i: COUNT_NOW + COUNT_QUADS, value: counts.load(i: COUNT_QUADS))
+    counts.store(i: COUNT_NOW + COUNT_THIN, value: counts.load(i: COUNT_THIN))
+    counts.store(i: COUNT_NOW + COUNT_EXACT, value: marks[MARK_EXACT])
+    pool_tri_count.store(i: 0, value: marks[MARK_IDX])
+}
+
 /// The slots, the index arena and the exact arena taken once the misses are meshed.
 @strict
 @compute(1)
@@ -708,6 +783,7 @@ pub(package) fn finish_pool_draw(
     tri_count.store(i: 15, value: pool_tri_count[0])
     tri_count.store(i: 17, value: commit)
     tri_count.store(i: 18, value: marks.load(i: MARK_EXACT))
+    tri_count.store(i: 19, value: gate[GATE_VOID])
     if commit == GATE_NONE {
         tri_count.store(i: 0, value: marks.load(i: MARK_DRAWN_IDX))
         tri_count.store(i: 2, value: marks.load(i: MARK_DRAWN_ACTIVE))
@@ -807,6 +883,18 @@ pub struct BrickPool {
     /// The times the pool was emptied while it held bricks of the thing and lattice it is then
     /// filled for again (its buffers grown, or jammed), and the bricks it held then: resident
     /// bricks let go to be meshed again, which the plan wants none of along a path.
+    /// The rebases that moved the pool into larger arenas (`rebase_pool`'s `grow_to`), the updates
+    /// read voided (`pool_void`), and what a judge asks of the next update: a growth, a void.
+    pub grows: u32,
+    pub voids: u32,
+    pub(package) grow_next: bool,
+    pub(package) void_next: bool,
+    /// Whether an update that filled the emptied pool outgrew an arena (it can't be voided: there
+    /// is nothing else to draw): what the pool holds has parts missing, and the next update
+    /// empties it again, its arenas grown.
+    pub(package) spoiled: bool,
+    /// An update's lists' counts as it began and as it leaves them (`COUNT_*`, `pool_void`).
+    pub(package) counts: GpuBuffer<u32>,
     pub colds: u32,
     pub cold_dropped: u32,
     /// Of those, the ones for buffers grown (the rest for a pool jammed), and the updates made and
@@ -953,6 +1041,12 @@ pub fn brick_pool() -> BrickPool {
         exact_slots: buffer(1),
         stamp: buffer(1),
         rebases: 0,
+        grows: 0,
+        voids: 0,
+        grow_next: false,
+        void_next: false,
+        spoiled: false,
+        counts: buffer_of(Vec::filled(COUNT_WORDS, 0)),
         colds: 0,
         cold_dropped: 0,
         colds_grown: 0,
@@ -971,17 +1065,13 @@ pub fn brick_pool() -> BrickPool {
 const POOL_PENDING: u32 = 6
 
 impl MeshBatch {
-    /// Grows the pool to hold `want_slots` bricks (a power of two, at most the draw's
-    /// compaction's), its index arena all their indices, and its exact arena the most exact cells
-    /// a batch draws; true if any of its buffers was made anew.
-    pub(package) fn ensure_pool(mut self, want_slots: u32) -> bool {
+    /// Makes the pool: every slot the draw's compaction takes, from the first (their words are
+    /// few: 65,536 keys are a megabyte; a pool whose slots grew with its cut was emptied each time
+    /// they did), its index arena all their indices, and its exact arena the most exact cells a
+    /// batch draws; true if any of its buffers was made anew.
+    pub(package) fn ensure_pool(mut self) -> bool {
         var grew = false
-        let most = COMPACT_GROUPS * COMPACT_PER_GROUP
-        let target = min(max(want_slots, 2048), most)
-        var cap = max(self.pool.cap, 2048)
-        while cap < target && cap < most {
-            cap = min(cap * 2, most)
-        }
+        let cap = COMPACT_GROUPS * COMPACT_PER_GROUP
         if cap > self.pool.cap {
             var hcap: u32 = 4096
             while hcap < cap * 2 {
@@ -996,7 +1086,9 @@ impl MeshBatch {
             self.ensure_brick_draws(cap)
             grew = true
         }
-        let want_idx = min(max(self.cap_indices * 2, cap * self.indices_per_brick), 16777216)
+        // (Its index arena at its most from the first too: grown to it later, with the draw's
+        // indices, it emptied the study's pool of 2,760 bricks at its second update.)
+        let want_idx: u32 = 16777216
         if want_idx > self.pool.idx_cap {
             self.pool.indices = buffer(want_idx)
             self.pool.idx_cap = want_idx
@@ -1022,6 +1114,27 @@ impl MeshBatch {
     ) {
         let commit = c[17]
         self.pool.jammed = commit == 0 && c[14] >= self.pool.cap
+        // A voided update (`pool_void`): room is made for its misses before they are meshed again,
+        // by freeing slots by age where there are any to free, else by a larger arena of vertices
+        // (a rebase's too), else (the indices' or exact cells' arenas, at their most) by emptying.
+        let why = c[19]
+        if why != 0 {
+            self.pool.voids += 1
+            // (Asked of each update till one is read voided: not every update is read.)
+            if (why & VOID_ASKED) != 0 {
+                self.pool.void_next = false
+            }
+            let freeable = self.pool.used_slots > self.active_hint + self.pool.cap / 8
+            if (why & VOID_ASKED) == 0 {
+                if freeable {
+                    self.pool.rebase_next = true
+                } else if (why & VOID_VERTS) != 0 && self.verts_per_brick < VERTS_BRICK {
+                    self.verts_per_brick = min(self.verts_per_brick * 2, VERTS_BRICK)
+                } else {
+                    self.pool.jammed = true
+                }
+            }
+        }
         self.pool.cut_kept = c[10] + c[11]
         if commit == 0 {
             return
@@ -1060,8 +1173,21 @@ impl MeshBatch {
         self.pool.rebase_next = true
     }
 
+    /// Asks the pool's next update that keeps it to move it into a larger arena of vertices (a
+    /// rebase's growth), and to void its misses (`pool_void`): what a judge of each asks. An
+    /// update is made for it, though the cut holds.
+    pub fn grow_next(mut self) {
+        self.pool.grow_next = true
+        self.built = false
+    }
+
+    pub fn void_next(mut self) {
+        self.pool.void_next = true
+        self.built = false
+    }
+
     /// The rebase's second buffers, each made the size of its first.
-    fn ensure_rebase(mut self, uses_kept: bool) {
+    fn ensure_rebase(mut self, uses_kept: bool, verts: u32) {
         if self.pool.r.slots != self.pool.cap || self.pool.r.alive.len() != self.brick_alive.len() {
             let cap = self.pool.cap
             self.pool.r.keys = buffer(cap * 4)
@@ -1073,21 +1199,25 @@ impl MeshBatch {
             self.pool.r.alive = buffer(self.brick_alive.len())
             self.pool.r.slots = cap
         }
-        if self.pool.r.verts_cap != self.cap_verts {
-            self.pool.r.verts = append_buffer(self.cap_verts)
-            self.pool.r.mark = buffer(self.cap_verts)
-            self.pool.r.remap = buffer(self.cap_verts)
-            self.pool.r.inv = buffer(self.cap_verts)
-            self.pool.r.vgsum = buffer(self.cap_verts / REBASE_VERTS_GROUP + 1)
-            self.pool.r.vgoff = buffer(self.cap_verts / REBASE_VERTS_GROUP + 1)
-            self.pool.r.verts_cap = self.cap_verts
+        // What is sized by the vertices' room: `verts` of it (the batch's, or more where the
+        // rebase grows it: each list a vertex's, where the batch's is).
+        if self.pool.r.verts_cap != verts {
+            self.pool.r.verts = append_buffer(verts)
+            self.pool.r.mark = buffer(verts)
+            self.pool.r.remap = buffer(verts)
+            self.pool.r.inv = buffer(verts)
+            self.pool.r.vgsum = buffer(verts / REBASE_VERTS_GROUP + 1)
+            self.pool.r.vgoff = buffer(verts / REBASE_VERTS_GROUP + 1)
+            self.pool.r.verts_cap = verts
         }
-        if self.pool.r.cert.len() != self.vert_cert.len() {
-            self.pool.r.cert = buffer(self.vert_cert.len())
+        let cert = if self.vert_cert.len() == self.cap_verts { verts } else { self.vert_cert.len() }
+        if self.pool.r.cert.len() != cert {
+            self.pool.r.cert = buffer(cert)
         }
-        if uses_kept && self.pool.r.kept_cap != self.vert_kept.len() {
-            self.pool.r.kept = buffer(self.vert_kept.len())
-            self.pool.r.kept_cap = self.vert_kept.len()
+        let kept = if self.vert_kept.len() == 2 * self.cap_verts { 2 * verts } else { self.vert_kept.len() }
+        if uses_kept && self.pool.r.kept_cap != kept {
+            self.pool.r.kept = buffer(kept)
+            self.pool.r.kept_cap = kept
         }
         if self.pool.r.idx_cap != self.pool.idx_cap {
             self.pool.r.indices = buffer(self.pool.idx_cap)
@@ -1097,11 +1227,12 @@ impl MeshBatch {
             self.pool.r.quads = append_buffer(self.watch_quads_cap)
             self.pool.r.quads_cap = self.watch_quads_cap
         }
-        if self.pool.r.watch_cap != self.watch_slots_cap || self.pool.r.proof.len() != self.thin_proof.len() {
+        let thin = if self.thin_proof.len() == self.cap_verts { verts } else { self.thin_proof.len() }
+        if self.pool.r.watch_cap != self.watch_slots_cap || self.pool.r.proof.len() != thin {
             self.pool.r.slot_bricks = buffer(self.watch_slots_cap * SLOT_BRICK_WORDS)
             self.pool.r.watch_bits = buffer(self.watch_slots_cap * SLOT_WORDS)
-            self.pool.r.thin = append_buffer(self.thin_proof.len())
-            self.pool.r.proof = buffer(self.thin_proof.len())
+            self.pool.r.thin = append_buffer(thin)
+            self.pool.r.proof = buffer(thin)
             self.pool.r.watch_cap = self.watch_slots_cap
         }
         if self.pool.r.exact_slots.len() != self.pool.exact_cap {
@@ -1114,9 +1245,18 @@ impl MeshBatch {
     /// rest kept, no more than `target` if the drawn ones leave room; everything they hold moved
     /// into the second buffers, renamed, and the buffers swapped; the hash made again; the drawn
     /// cut drawn again from what was moved.
-    pub(package) fn rebase_pool(mut self, scratch: mut ExtractScratch, use_exact: bool, uses_kept: bool, target: u32) {
+    pub(package) fn rebase_pool(
+        mut self,
+        scratch: mut ExtractScratch,
+        use_exact: bool,
+        uses_kept: bool,
+        target: u32,
+        grow_to: u32 = 0,
+    ) {
         label("mesh_pool_rebase")
-        self.ensure_rebase(uses_kept)
+        // (The second buffers at the vertices' room the pool is to have: it is moved into them.)
+        let verts_room = max(grow_to, self.cap_verts)
+        self.ensure_rebase(uses_kept, verts_room)
         let cap = self.pool.cap
         let slots = self.pool.marks.items()
         // Which slots are kept: every drawn one, then the youngest while within `target`.
@@ -1403,6 +1543,22 @@ impl MeshBatch {
         swap(mut self.pool.meta, mut self.pool.r.meta)
         swap(mut self.pool.stamp, mut self.pool.r.stamp)
         swap(mut self.brick_alive, mut self.pool.r.alive)
+        if verts_room > self.cap_verts {
+            // Grown: the batch's lists are the larger ones now (the smaller are made to their
+            // size at the next rebase), and what is only a frame's is made anew.
+            if self.vert_kept_cap == self.cap_verts {
+                self.vert_kept_cap = verts_room
+            }
+            if self.watch_verts_cap == self.cap_verts {
+                self.watch_verts_cap = verts_room
+                self.thin_due = append_buffer(verts_room)
+            }
+            self.cap_verts = verts_room
+            self.pool.grows += 1
+            // (The second buffers are the smaller ones now, whatever was said of their size.)
+            self.pool.r.verts_cap = 0
+            self.pool.r.kept_cap = 0
+        }
         // The hash of the kept, the drawn cut listed, the marks, and the drawn cut drawn again.
         dispatch(reset_pool_hash.bind(hash_slots: self.pool.hash.items_mut()), over: self.pool.hash_cap)
         scratch.draw_slots.clear()
@@ -1641,24 +1797,59 @@ impl MeshBatch {
         let this_cut = self.cut_predicted
         let drawn = if self.active_hint > 0 { max(self.active_hint, this_cut) } else { min(total_bricks, CUT_BRICKS) }
         let want = min(POOL_CUTS * drawn, min(self.max_bricks, COMPACT_GROUPS * COMPACT_PER_GROUP))
-        self.ensure_cap(want)
+        // A pool that holds this thing's bricks on this lattice keeps them through a growth: its
+        // vertices' arena grows by a rebase into a larger one (`rebase_pool`'s `grow_to`), and the
+        // draw's indices are made anew and the cut drawn again by it. (Each grown in place emptied
+        // the pool: the study's, 59,664 bricks along a run, when its vertices a brick doubled.)
+        let keeps = self.pooled && !self.pool.spoiled && self.pool.field_key == field_key &&
+            self.pool.origin == scratch.origin0 && self.pool.shift == scratch.lattice
+        var grow_to: u32 = 0
+        var redraw = false
+        if keeps {
+            let cap_b = max(bucket_bricks(want, self.max_bricks), self.cap_bricks)
+            self.cap_bricks = cap_b
+            if cap_b * self.verts_per_brick > self.cap_verts {
+                grow_to = cap_b * self.verts_per_brick
+            }
+            if self.pool.grow_next {
+                grow_to = max(grow_to, self.cap_verts + self.cap_verts / 2)
+            }
+            if cap_b * self.indices_per_brick > self.cap_indices {
+                self.cap_indices = cap_b * self.indices_per_brick
+                self.indices = buffer(self.cap_indices)
+                redraw = true
+            }
+        } else {
+            self.ensure_cap(want)
+        }
         if uses_kept {
             self.ensure_vert_kept(self.cap_verts)
         }
         if use_exact {
             self.ensure_exact_cap(CAP_EXACT_MAX)
         }
-        let grew = self.ensure_pool(want)
+        let grew = self.ensure_pool()
         let grew_watch = if use_exact { self.ensure_watch(need_slots: self.pool.cap) } else { false }
         let reallocated = grew || grew_watch || self.cap_verts != old_verts || self.vert_kept_cap != old_kept
-        let same_space = self.pooled && !reallocated && self.pool.field_key == field_key &&
-            self.pool.origin == scratch.origin0 && self.pool.shift == scratch.lattice
+        let same_space = keeps && !reallocated
         // Slots to free by age (`rebase_pool`): at least an eighth of them not the drawn cut's. A
         // pool its last read found full, drawing nothing new, with none such to free, starts
         // afresh: the drawn cut leaves no room for the bricks of the cut that would replace it.
         let freeable = self.pool.used_slots > self.active_hint + self.pool.cap / 8
         let warm = same_space && !(self.pool.jammed && !freeable)
         self.pool.jammed = false
+        self.pool.spoiled = false
+        if !warm && keeps {
+            // Emptied after all (jammed): its arenas are made anew at the sizes asked.
+            self.ensure_cap(want)
+            if uses_kept {
+                self.ensure_vert_kept(self.cap_verts)
+            }
+            if use_exact {
+                let _ = self.ensure_watch(need_slots: self.pool.cap)
+            }
+            grow_to = 0
+        }
         // Dispatched for as many misses as the cut's boxes bound against the cut the pool holds,
         // as far as the frame's budget goes.
         let fc = frustum_cull_none()
@@ -1684,9 +1875,10 @@ impl MeshBatch {
             self.pool.used_idx + ahead * self.indices_per_brick > self.pool.idx_cap ||
             self.verts_known + ahead * self.verts_per_brick > self.cap_verts ||
             self.pool.used_exact > self.pool.exact_cap / 2
-        if warm && ((short && freeable) || self.pool.rebase_next) {
-            self.rebase_pool(mut scratch, use_exact, uses_kept, target: self.pool.cap / 4)
+        if warm && ((short && freeable) || self.pool.rebase_next || grow_to > 0 || redraw) {
+            self.rebase_pool(mut scratch, use_exact, uses_kept, target: self.pool.cap / 4, grow_to: grow_to)
             self.pool.rebase_next = false
+            self.pool.grow_next = false
             miss_bound = min(cut_bounds(Vec::new(), cut.clone()), min(total_bricks, self.pool.cap))
         }
         // Chunks for what the last readbacks found missed, twice over and a chunk more, and no
@@ -1824,6 +2016,10 @@ impl MeshBatch {
             over: 1,
         )
         scratch.miss_interior.count_from(scratch.pool_gate.items().sub(start: GATE_MISSES, count: 1))
+        // The lists as the misses' meshing finds them (`pool_void` puts them back if it voids it).
+        copy(from: self.verts.count().sub(start: 0, count: 1), to: self.pool.counts.span_mut(start: COUNT_VERTS, count: 1))
+        copy(from: self.quad_recs.count().sub(start: 0, count: 1), to: self.pool.counts.span_mut(start: COUNT_QUADS, count: 1))
+        copy(from: self.thin_keep.count().sub(start: 0, count: 1), to: self.pool.counts.span_mut(start: COUNT_THIN, count: 1))
 
         label("mesh_extract_miss")
         var chunk_start: u32 = 0
@@ -1885,6 +2081,30 @@ impl MeshBatch {
         if has_seams {
             self.stitch_seams(mut scratch, fields, held: use_exact, uses_kept: uses_kept, pooled: true)
         }
+        // An update whose misses outgrew an arena keeps none of them (`pool_void`).
+        dispatch(
+            pool_void.bind(
+                verts_count: self.verts.count(),
+                quad_count: self.quad_recs.count(),
+                thin_count: self.thin_keep.count(),
+                exact_count: self.pool.exact.count(),
+                exact_base: self.exact_base.items(),
+                marks: self.pool.marks.items(),
+                cap_verts: self.cap_verts,
+                cap_pool_indices: self.pool.idx_cap,
+                cap_pool_exact: self.pool.exact_cap,
+                ask: if self.pool.void_next && warm { 1 } else { 0 },
+                counts: mut self.pool.counts,
+                pool_tri_count: mut self.pool.tri_count,
+                gate: mut scratch.pool_gate,
+            ),
+            over: 1,
+        )
+        self.verts.count_from(self.pool.counts.items().sub(start: COUNT_NOW + COUNT_VERTS, count: 1))
+        self.quad_recs.count_from(self.pool.counts.items().sub(start: COUNT_NOW + COUNT_QUADS, count: 1))
+        self.thin_keep.count_from(self.pool.counts.items().sub(start: COUNT_NOW + COUNT_THIN, count: 1))
+        self.pool.exact.count_from(self.pool.counts.items().sub(start: COUNT_NOW + COUNT_EXACT, count: 1))
+        scratch.miss_interior.count_from(scratch.pool_gate.items().sub(start: GATE_MISSES, count: 1))
         dispatch(
             prep_slices.bind(
                 count: scratch.miss_interior.count(),
