@@ -874,3 +874,26 @@ Before phase 5's step 1 and phase 4, two measurements on both machines: the sche
 frame with every dispatch emptied: what submission and the passes' order cost alone), and the
 7 ms of SCENE 10's 20.7 ms span that no pass of the per-pass table above 0.6 ms holds (passes
 summed, the idle inside the span, the floor).
+
+**The schedule floor, measured (2026-11-28, M4, at `6636b11` with the host's `WRELA_EMPTY_WORK`).**
+From frame 25 on, every dispatch is recorded with no groups and every draw left out, the passes
+as they were (the frames before run whole: a start's checks read their work back). 1080p, the
+span's median, frames 30 to 89 still and 30 to 269 moving, one placement:
+
+| Build | Span (ms) | Floor (ms) |
+| --- | --- | --- |
+| SCENE 10 | 33.15 | 7.25 |
+| SCENE 11 | 15.34 | 1.25 |
+| SCENE 13 | 14.31 | 0.70 |
+| SCENE 14 | 20.54 | 0.69 |
+| SCENE 16 | 9.35 | 1.03 |
+| SCENE 10 VIEW 3 | 40.60 | 8.52 |
+| SCENE 13 VIEW 3 | 70.05 | 4.55 |
+
+SCENE 10's floor is its moving things' extraction made each frame: `mesh_extract`'s empty passes
+alone are 2.06 ms of it (the ward's and the flames' chunks, a few hundred dispatches a frame
+each holding nothing), and the rest is the passes of the watches and lights of those batches. It
+is most of the 7 ms the per-pass table did not hold, and phase 4 (a moving kind meshed by its
+structure, not by Dual Contouring each frame) is what removes it. SCENE 10's still span is 33 ms
+now where it was 20.7 (`6c6adcc`): the ward meshed at the rule's cells (§10, 8.6 ms) and the
+watches of moving batches made each frame. The Radeon's floor is not measured.

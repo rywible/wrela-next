@@ -971,6 +971,13 @@ pub(crate) struct Gpu {
     /// same frames every time and a judge's meshes settle in as few frames as it says; `None`
     /// (unset) answers each once the GPU has done its work, as a game's run does.
     reads_after: Option<usize>,
+    /// `WRELA_EMPTY_WORK=N`: from frame `N` on, every dispatch is recorded with no groups and
+    /// every draw left out, its passes kept as they are: a frame's span is then what submitting
+    /// and scheduling its passes cost alone, the schedule floor (`docs/plans/build-time-engine-4d.md`
+    /// §17). The frames before it run whole (a start's checks read their work back), and after it
+    /// every buffer keeps what it last held, so the program makes the passes it made then. The
+    /// picture is nothing; only a measurement of time reads such a run.
+    empty_from: Option<usize>,
     /// The calls ended so far: a timing's call, and an ask's.
     calls: usize,
     /// The display's guard: how far behind the GPU is on this run's frames.
@@ -1265,6 +1272,7 @@ impl Gpu {
             labelled_order: Vec::new(),
             asked: Vec::new(),
             settling: Vec::new(),
+            empty_from: std::env::var("WRELA_EMPTY_WORK").ok().and_then(|v| v.trim().parse::<usize>().ok()),
             reads_after: std::env::var("WRELA_READS_AFTER")
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
@@ -2750,7 +2758,11 @@ impl Gpu {
         // An indirect dispatch's groups are checked on the GPU first, in its own pass
         // (`step::Indirect`): it reads the checked ones, none where they're past what its
         // kernel's bound allows.
+        // (An empty run's, `empty_from`, launch nothing, and no arguments are checked: none of this
+        // frame's were worked out.)
+        let empty = self.empty_from.is_some_and(|f| self.frame >= f);
         let groups = match groups {
+            _ if empty => Ok([0, 0, 0]),
             Ok(g) => Ok(g),
             Err((buffer, at, stated)) => {
                 let p = &self.pipelines[pipeline as usize];
@@ -3250,6 +3262,7 @@ impl Gpu {
             },
         });
         let mut prepared = prepared.iter();
+        let empty = self.empty_from.is_some_and(|f| self.frame >= f);
         for item in &items {
             let d = match item {
                 PassItem::Scissor([x, y, w, h]) => {
@@ -3285,6 +3298,7 @@ impl Gpu {
                 rp.set_index_buffer(self.buffer(indices), u64::from(at));
             };
             match d.how {
+                _ if empty => {}
                 DrawHow::Direct { vertices, instances } => rp.draw(0..vertices, 0..instances),
                 DrawHow::Indirect { buffer, offset } => {
                     rp.draw_indirect(self.buffer(buffer), u64::from(offset));
