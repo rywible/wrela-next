@@ -398,7 +398,8 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-27 | `p4h-12` (L4): phase 4 on human3 refs_clean: fine-tune from p4h-11 upd 4000 with startup-accel trim and 8x tail mining, 1200 updates, done | 4.07 |
 | 2026-11-27 | `amp-walk` (L4): phase 5 step 14: AMP style prior + walk controller on human3 physics-filtered capture (1993 clips), 1500 updates, done | 3.29 |
 | 2026-11-27 | `amp-walk2` (L4): phase 5 step 14: calibrated AMP walk with 200k replay buffer, logit reg, gp=10, and upright athletic style-caster prior (120 clips, 2.10 h), 1200 updates, done | 2.93 |
-| 2026-11-27 | `p4h-13` (L4): phase 4 on sim-human5 (joints held to the body's ranges, cones collided as the judge measures them, 1/240 s steps with 10 ms contacts): fine-tune of p4h-12 with its last action read and its change paid for (the 7 Hz shake), the soles held where planted, the ball joints held to their cones, 1500 updates; the filtered capture with actions, servo and contact forces, done | 7.99 |
+| 2026-11-27 | `p4h-13` (L4): phase 4 on sim-human5 (joints held to the body's ranges, cones collided as the judge measures them, 1/240 s steps with 10 ms contacts): fine-tune of p4h-12 with its last action read and its change paid for (the 7 Hz shake), the soles held where planted, the ball joints held to their cones, 1500 updates; the filtered capture with actions, servo and contact forces; training clips followed for 20 s 95.3% and test 90.0%, the shake halved, penetration 1.95 mm on average, done | 7.99 |
+| 2026-11-27 | `p4h-14` (L4): phase 4 on sim-human5: fine-tune of p4h-13 with each muscle's activation (30 ms), the ball joints' weight 20, and ACCAD's clips (2300 clips, 26.3 h), 2000 updates; the filtered capture with actions, servo forces, contacts and momentum; flat from update 250 (training clips followed for 20 s 90.4% at update 1,000: 100STYLE 88.4%, CeTI 97.8%, ACCAD 55.5%; the ball joints 0.0042 rad past their ranges): stopped at update 1,151 when the retarget's faults were found (the clips it followed are to be imported again) | 5.18 |
 
 #### A new machine
 
@@ -986,6 +987,31 @@ removes the faults of the retarget: slide, penetration and forces that cannot oc
   count a failure, at 0.5 m on average; the tracker now does the same (`--fall-mean`, the plan's
   50 mm on average holds it near the clip), and `p4h-9` goes on from `p4h-8`'s weights at update
   1,527 (`--init`).
+- Why the tracker loses a clip (`tools/movement/falls.py`, 2026-11-27, on `p4h-13`'s 113 falls
+  of 2,038 clips): 45 are in the clip's first second, and of those 47% start with the centre of
+  mass more than 3 cm outside what holds it up (6.4% of the clips it followed) and 36% more than
+  10 mm in the floor (5.6%). The cause is before the tracker, in the capture's fit (phase 2):
+  - started each frame from the frame before and given four steps, its root trailed a fast
+    capture (CeTI's fast walk, task w04: by up to 0.9 m, the feet held back and the body laid out
+    forward; its 32 clips 450 mm from their capture on average), and its first frame, started from
+    the body at rest, kept a wrong basin for the whole clip (100STYLE's crouched styles, Crouched,
+    Dinosaur, Sweep, Chicken and HandsBetweenLegs, stood with straight knees leaning 0.3 to 0.45 m
+    past their ankles where the capture has bent knees and its hips behind its heels). The mean
+    of 42 mm hid them: 61 of 810 clips of 100STYLE were more than 100 mm from their capture and
+    103 of 1,563 of CeTI more than 150 mm;
+  - the fit now starts each frame with its root where the capture has its pelvis and its legs
+    turned as their bones are (and in the first frame every mapped segment), aims an arm's places
+    from the body's own shoulder scaled by the arms' lengths (a performer's spine is not the
+    body's: CeTI's neck is 68 cm over its hips, the body's 59), holds an upper arm to its bone's
+    turn lightly (its roll about itself is the hand's to set) and takes each bone's direction at
+    rest as it is (a difference under 20 degrees was left out). On six clips: the fast walk's
+    feet 26 mm from the capture's, the crouched run 44 mm on average (64), ACCAD's jab's hands 7
+    and 15 mm from their places (140) and its walk's 11 and 12 (70). The fast walk's arms are
+    still off (its hands 0.16 and 0.38 m from their places: not yet found why);
+  - every source is imported again with it (2026-11-27), and the tracker's references, the
+    judge's calibration and the solver's poses follow from that import. `p4h-14` (the muscles'
+    activation, ACCAD's clips), flat from its update 250 on the clips of the import before
+    (training 90.4% followed for 20 s, ACCAD 55.5%), was stopped at update 1,151 (5.18 units).
 - The filtered capture back as poses (`tools/movement/export -- human unfilter`, `--read
   filtered=` the run's outputs, `--read sim=` its export, `--write out=.movement/poses-filtered`):
   each clip's qpos up to its fall as the body's numbers (a welded segment at rest), so the solver
