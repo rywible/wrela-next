@@ -59,6 +59,22 @@ def longest_clean_span(data, rate, max_root_speed, max_joint_speed, max_start_ac
     return best_a, best_b
 
 
+def resampled(q, rate, to):
+    """A clip's qpos at `to` frames a second from `rate`: the places and the joints' numbers
+    linearly, the root's turn on the sphere (normalised, its sign kept from frame to frame)."""
+    n = q.shape[0]
+    t = np.arange(0.0, (n - 1) / rate + 1e-9, 1.0 / to) * rate
+    i = np.minimum(np.floor(t).astype(int), n - 2)
+    u = (t - i)[:, None]
+    a, b = q[i], q[i + 1]
+    out = a + (b - a) * u
+    qa, qb = a[:, 3:7], b[:, 3:7].copy()
+    qb[(qa * qb).sum(-1) < 0] *= -1.0
+    r = qa * (1 - u) + qb * u
+    out[:, 3:7] = r / np.linalg.norm(r, axis=-1, keepdims=True)
+    return out.astype(np.float32)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("sets", nargs="+")
@@ -71,6 +87,9 @@ def main():
                    help="cut clips at frames where any joint speed exceeds this (rad/s); 0 disables")
     p.add_argument("--max-start-accel", type=float, default=10.0,
                    help="trim leading IK startup transients where root accel exceeds this (m/s^2); 0 disables")
+    p.add_argument("--rate", type=float, default=0.0,
+                   help="resample each clip to this many frames a second (0: as exported); the tracker acts once a "
+                        "frame, so 60 halves the delay of its loop")
     p.add_argument("--min-frames", type=int, default=60,
                    help="drop clean spans shorter than this many frames")
     a = p.parse_args()
@@ -101,6 +120,9 @@ def main():
                 trimmed += 1
                 data = data[i0:i1]
                 n = data.shape[0]
+            if a.rate and a.rate != r:
+                data = resampled(data, r, a.rate)
+                n = data.shape[0]
             names.append(name)
             which.append(os.path.basename(s)[:-4] if s.endswith(".txt") else s)
             starts.append(total)
@@ -109,7 +131,7 @@ def main():
             chunks.append(np.ascontiguousarray(data))
     body = zlib.compress(np.concatenate(chunks).astype("<f4").tobytes(), 6)
     head = json.dumps({"names": names, "starts": starts, "lengths": lengths, "nq": nq,
-                       "rate": rate, "sets": which}).encode()
+                       "rate": a.rate or rate, "sets": which}).encode()
     with open(a.o, "wb") as f:
         f.write(b"WRFS" + struct.pack("<I", len(head)) + head + body)
     print(f"pack: {len(names)} clips ({missing} not exported, {trimmed} trimmed at spikes, {dropped} dropped), "

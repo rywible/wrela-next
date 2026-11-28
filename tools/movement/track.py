@@ -388,7 +388,8 @@ def observe(sim):
     rel = act_x[:, 1:] - root_x[:, None]
     parts.append(quat_rotate(hq[:, None].expand(-1, rel.shape[1], -1), rel).reshape(n, -1))
     for a in AHEAD:
-        g = sim.global_frame(a)
+        # `AHEAD` is in frames at 30 a second: the same times at the clips' rate.
+        g = sim.global_frame(max(1, int(round(a * sim.rate / 30.0))))
         # Direct per-body error vector to target (includes both root drift and local pose),
         # plus target root orientation, target root linear velocity, and joint angle deltas.
         dx = sim.ref_x[g] - act_x
@@ -1013,9 +1014,12 @@ def summary(results, names=None):
     return out
 
 
-def evaluate(sim, agent, norm, most_frames=600):
+def evaluate(sim, agent, norm, most_frames=None):
     """The training clips and the test clips, each played from its start (`play`); the training
     clips' results weigh how often each starts a world after."""
+    if most_frames is None:
+        # 20 s of each clip, at the clips' rate.
+        most_frames = int(20 * sim.rate)
     # One play of both sets where the worlds hold them (each play steps every world: two plays of
     # 600 frames cost as much as 40 updates).
     train, test = sim.train.tolist(), sim.test.tolist()
