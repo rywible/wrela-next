@@ -1,36 +1,46 @@
 // Certificates: what a field's enclosures prove about the surface inside a cell, so a mesh there
 // can be trusted to cover what the field covers without solving its pixels.
 //
-// A sheet certificate says the surface inside a cell lies in a slab no wider than `width`
-// parallel to a plane (the plane of the cell's mesh vertex, where the extraction asks it). It is
-// proven directly in world space from one enclosure of the field per sub-box
-// (`Surface::slope_affine`: the field's own, composed through its combinators, the compiler's
-// affine form of a leaf that states none; one path for every kind):
+// A sheet certificate says how wide a slab holds the surface inside a cell (`sheet_width`): a
+// number of the surface's own, which each eye then holds to what it needs. It is proven in world
+// space from one enclosure of the field per part of the cell (`Surface::slope_affine`: the
+// field's own, composed through its combinators, the compiler's affine form of a leaf that
+// states none; one path for every kind):
 //   `f(p) = c + dot(l, u) + η`, `|η| ≤ e` over `u ∈ [-1, 1]³`, `p = c_b + h_in * u + δ`.
-// Projecting the linear part onto `w(p) = dot(p - at, n)` (`w_l = h_in * n`) with optimal slope
-// `α = dot(l / h_in, n)` splits `dot(l, u) = α (w(p) - w_mid) + dot(r, u)` (`r = l - α w_l`),
-// giving a tight slab `[w_mid - c / α ± (|r|₁ + e) / |α|]` intersected with the box's exact span
-// `[w_mid ± |w_l|₁]`. Any sub-box that does not yet fit within `width` is bisected along the world
-// axis dominating `|w_l| + |r| / |α|`, pre-pruning halves already proved empty by `af.sub_range`.
-// Not certified is not a fault: the cell's pixels are solved.
+// Across a plane's normal `n`, with `w(p) = dot(p - at, n)` (`w_l = h_in * n`) and any slope
+// `α ≠ 0`, `dot(l, u) = α (w(p) - w_mid) + dot(r, u)` (`r = l - α w_l`), so the surface lies in
+// `[w_mid - c / α ± (|r|₁ + e) / |α|]`, and in the part's own span `[w_mid ± |w_l|₁]`
+// (`theory/Theory/Sheet/Slab.lean`: `engine_slab`; `α` is `dot(l / h_in, n)`). The slab faces
+// one of two ways, both read from the same enclosures: across the plane of the cell's mesh
+// vertex, or across the cell's own enclosure's gradient, where the residual `r` is nothing and
+// a surface that is flat but leans from its vertex's plane is still held (`Own.lean`). The
+// widest part is halved, along the axis that holds most of its width, while the visits last.
+// A wide slab is not a fault: the cell's pixels are solved.
 //
-// `certify_sheet` runs on the CPU (the scoreboard, `certify_report`) and in the extraction's
-// kernels alike: no recursion, a fixed stack, the field read where it lies (`fields[which]`).
+// It runs on the CPU (the scoreboard, `certify_report`) and in the engine's kernels alike: no
+// recursion, a fixed list of parts, the field read where it lies (`fields[which]`) from one
+// place in the loop (a kernel keeps each call's locals: three calls kept 15,292 B an
+// invocation where one keeps 5,412).
 
-use std::derive::{Box3, gradient}
+use std::derive::{Affine3, Box3, gradient}
 use std::field::{ALL_LIVE, Live, Surface, hash_u32}
 use std::io::print
 
-/// The most parts of a cell a sheet certificate looks at: past it the cell is not certified.
+/// The most enclosures of a cell a sheet certificate asks for: the cell's, then the two halves
+/// of its widest part, three times.
 pub const SHEET_VISITS: u32 = 7
+
+/// The parts of a cell a sheet certificate holds at once.
+const SHEET_PARTS: u32 = 4
+
+/// The width `sheet_width` says of a cell it can say nothing of.
+pub const SHEET_NONE: f32 = 1.0e30
 
 const CERT_EPS: f32 = 1.0 / 8388608.0
 const CERT_TINY: f32 = 1.2e-38
 
 /// Whether the surface of `fields[which]` (its parts `live`) inside the cell `[lo, lo + h]`
-/// provably lies in a slab no wider than `width` parallel to the plane through `at` facing
-/// `normal` (unit). A mesh whose vertices lie on the surface lies in any slab that holds them,
-/// so mesh and surface stand no further apart, across the plane, than the slab is wide.
+/// provably lies in a slab no wider than `width` (`sheet_width`).
 pub fn certify_sheet<S: Surface>(
     fields: [S],
     which: u32,
@@ -41,126 +51,188 @@ pub fn certify_sheet<S: Surface>(
     normal: vec3,
     width: f32,
 ) -> bool {
-    let n_len = length(normal)
-    if !(h > 0.0) || !(width > 0.0) || !(n_len > 1.0e-6) {
+    if !(width > 0.0) {
         return false
     }
+    let (w, _) = sheet_width(fields, which, live, lo, h, at, normal, width)
+    w <= width
+}
+
+/// How wide a slab provably holds the surface of `fields[which]` (its parts `live`) inside the
+/// cell `[lo, lo + h]`, and whether that is all the certificate can say (`true`) or it stopped
+/// because the slab was already no wider than `enough` (`false`: asked again with less, it may
+/// say less). The slab is across the cell's vertex's normal (`normal`, through `at`) or across
+/// the cell's own enclosure's gradient, whichever holds the cell's surface in less: a mesh and a
+/// surface in one slab stand no further apart across it than it is wide, whichever way it faces
+/// (`theory/Theory/Sheet/Hull.lean`: `gap_le_width`; `Own.lean`: `zero_in_own_slab`). The width
+/// is the surface's own, of no eye: an eye holds it to what it needs. `SHEET_NONE` where nothing
+/// is proven, 0 where the cell holds no surface.
+pub fn sheet_width<S: Surface>(
+    fields: [S],
+    which: u32,
+    live: Live,
+    lo: vec3,
+    h: f32,
+    at: vec3,
+    normal: vec3,
+    enough: f32,
+) -> (f32, bool) {
+    let n_len = length(normal)
+    if !(h > 0.0) || !(n_len > 1.0e-6) {
+        return (SHEET_NONE, true)
+    }
     let n = normal / n_len
-    // Where across the plane the surface is proven to be, so far (empty: `lo` above `hi`).
-    var w_lo = 1.0e30
-    var w_hi = -1.0e30
-    var blo: [vec3; 8] = [vec3(0.0); 8]
-    var bhi: [vec3; 8] = [vec3(0.0); 8]
+    // The other way a slab may face: across the cell's own enclosure's gradient (the vertex's
+    // normal until the cell's enclosure is read, and where it has no slope).
+    var g = n
+    // The cell's parts (boxes), each with where its surface lies across `n` (`x`, `y`) and
+    // across `g` (`z`, `w`), the axis to halve it along for each, and whether its enclosure
+    // has been read (until then its slab is its whole's).
+    var blo: [vec3; 4] = [vec3(0.0); 4]
+    var bhi: [vec3; 4] = [vec3(0.0); 4]
+    var slab: [vec4; 4] = [vec4(-SHEET_NONE, SHEET_NONE, -SHEET_NONE, SHEET_NONE); 4]
+    var axes: [vec2u; 4] = [vec2u(0, 0); 4]
+    var read: [bool; 4] = [false; 4]
     blo[0] = lo
     bhi[0] = lo + vec3(h)
-    var top: u32 = 1
+    var count: u32 = 1
+    var hull = slab[0]
+    var done = true
     for _visit in 0..SHEET_VISITS {
-        if top == 0 {
-            return true
-        }
-        top -= 1
-        let b_lo = blo[top]
-        let b_hi = bhi[top]
-        let bx = Box3 { lo: b_lo, hi: b_hi }
-        let af = fields[which].slope_affine(bx, live)
-        if af.lo() > 0.0 || af.hi() < 0.0 {
-            continue
-        }
-        // World-space box center & half-extent matching `ir::derive::affine::input_box`.
-        let hl = 0.5 * b_lo
-        let hh = 0.5 * b_hi
-        let c_b = hl + hh
-        let h_in = (hh - hl) * (1.0 + 2.0 * CERT_EPS)
-        let w_mid = dot(c_b - at, n)
-        let w_l = h_in * n
-        let margin_w = (abs(c_b.x) + abs(c_b.y) + abs(c_b.z) + abs(at.x) + abs(at.y) + abs(at.z)) *
-            (6.0 * CERT_EPS) +
-            (h_in.x + h_in.y + h_in.z) * (12.0 * CERT_EPS) +
-            8.0 * CERT_TINY
-        let span = abs(w_l.x) + abs(w_l.y) + abs(w_l.z) + margin_w
-        let box_lo = w_mid - span
-        let box_hi = w_mid + span
-        // A sub-box already thinner than `width` across `n`: surface lies within its own span.
-        if box_hi - box_lo <= width && max(w_hi, box_hi) - min(w_lo, box_lo) <= width {
-            w_lo = min(w_lo, box_lo)
-            w_hi = max(w_hi, box_hi)
-            continue
-        }
-        var best_axis: u32 = 0
-        var score_x = abs(w_l.x)
-        var score_y = abs(w_l.y)
-        var score_z = abs(w_l.z)
-        if af.valid() && h_in.x > 0.0 && h_in.y > 0.0 && h_in.z > 0.0 {
-            let g = vec3(af.l.x / h_in.x, af.l.y / h_in.y, af.l.z / h_in.z)
-            let alpha = dot(g, n)
-            let abs_a = abs(alpha)
-            if abs_a > 1.0e-6 {
-                let r = af.l - w_l * alpha
-                let mag_f = abs(af.c) + abs(af.l.x) + abs(af.l.y) + abs(af.l.z) + af.e
-                let margin_f = mag_f * (16.0 * CERT_EPS) + 4.0 * CERT_TINY
-                let half_w = (abs(r.x) + abs(r.y) + abs(r.z) + af.e + margin_f) / abs_a + margin_w
-                let w_ctr = w_mid - af.c / alpha
-                let s_lo = max(w_ctr - half_w, box_lo)
-                let s_hi = min(w_ctr + half_w, box_hi)
-                if s_lo > s_hi {
-                    continue
-                }
-                if max(w_hi, s_hi) - min(w_lo, s_lo) <= width {
-                    w_lo = min(w_lo, s_lo)
-                    w_hi = max(w_hi, s_hi)
-                    continue
-                }
-                let inv_a = 1.0 / abs_a
-                score_x += abs(r.x) * inv_a
-                score_y += abs(r.y) * inv_a
-                score_z += abs(r.z) * inv_a
+        // The next part to read; with none, the widest part across the way that holds the
+        // cell's surface in less so far is halved along the axis that holds most of its width.
+        var j: u32 = SHEET_PARTS
+        for i in 0..SHEET_PARTS {
+            if i < count && !read[i] && j == SHEET_PARTS {
+                j = i
             }
         }
-        if score_y >= score_x && score_y >= score_z {
-            best_axis = 1
-        } else if score_z >= score_x && score_z >= score_y {
-            best_axis = 2
-        }
-        // Pre-prune halves already proved empty by the parent affine form before pushing.
-        let lo_u_hi = vec3(
-            if best_axis == 0 { 0.0 } else { 1.0 },
-            if best_axis == 1 { 0.0 } else { 1.0 },
-            if best_axis == 2 { 0.0 } else { 1.0 },
-        )
-        let hi_u_lo = vec3(
-            if best_axis == 0 { 0.0 } else { -1.0 },
-            if best_axis == 1 { 0.0 } else { -1.0 },
-            if best_axis == 2 { 0.0 } else { -1.0 },
-        )
-        let r0 = af.sub_range(vec3(-1.0), lo_u_hi)
-        let r1 = af.sub_range(hi_u_lo, vec3(1.0))
-        let keep0 = !(r0.lo > 0.0 || r0.hi < 0.0)
-        let keep1 = !(r1.lo > 0.0 || r1.hi < 0.0)
-        let need: u32 = (if keep0 { 1 } else { 0 }) + (if keep1 { 1 } else { 0 })
-        if top + need > 8 {
-            return false
-        }
-        let m = 0.5 * (b_lo + b_hi)
-        if keep0 {
-            blo[top] = b_lo
-            bhi[top] = vec3(
-                if best_axis == 0 { m.x } else { b_hi.x },
-                if best_axis == 1 { m.y } else { b_hi.y },
-                if best_axis == 2 { m.z } else { b_hi.z },
+        if j == SHEET_PARTS {
+            let by_g = hull.w - hull.z < hull.y - hull.x
+            if (if by_g { hull.w - hull.z } else { hull.y - hull.x }) <= enough {
+                done = false
+                break
+            }
+            if count == SHEET_PARTS {
+                break
+            }
+            var k: u32 = 0
+            var widest = -1.0
+            for i in 0..SHEET_PARTS {
+                let wi = if by_g { slab[i].w - slab[i].z } else { slab[i].y - slab[i].x }
+                if i < count && wi > widest {
+                    widest = wi
+                    k = i
+                }
+            }
+            if !(widest > 0.0) {
+                break
+            }
+            let axis = if by_g { axes[k].y } else { axes[k].x }
+            let p_lo = blo[k]
+            let p_hi = bhi[k]
+            let m = 0.5 * (p_lo + p_hi)
+            bhi[k] = vec3(
+                if axis == 0 { m.x } else { p_hi.x },
+                if axis == 1 { m.y } else { p_hi.y },
+                if axis == 2 { m.z } else { p_hi.z },
             )
-            top += 1
-        }
-        if keep1 {
-            blo[top] = vec3(
-                if best_axis == 0 { m.x } else { b_lo.x },
-                if best_axis == 1 { m.y } else { b_lo.y },
-                if best_axis == 2 { m.z } else { b_lo.z },
+            blo[count] = vec3(
+                if axis == 0 { m.x } else { p_lo.x },
+                if axis == 1 { m.y } else { p_lo.y },
+                if axis == 2 { m.z } else { p_lo.z },
             )
-            bhi[top] = b_hi
-            top += 1
+            bhi[count] = p_hi
+            slab[count] = slab[k]
+            read[k] = false
+            read[count] = false
+            count += 1
+            j = k
+        }
+        let af = fields[which].slope_affine(Box3 { lo: blo[j], hi: bhi[j] }, live)
+        if count == 1 && af.valid() {
+            let gl = length(af.l)
+            if gl > 1.0e-6 * (abs(af.c) + af.e) && gl > 1.0e-30 {
+                g = af.l / gl
+            }
+        }
+        // A part's slab is within its whole's.
+        let (sj, aj) = slabs_in_box(af, blo[j], bhi[j], at, n, g)
+        let whole = slab[j]
+        slab[j] = vec4(max(sj.x, whole.x), min(sj.y, whole.y), max(sj.z, whole.z), min(sj.w, whole.w))
+        axes[j] = aj
+        read[j] = true
+        hull = vec4(1.0e30, -1.0e30, 1.0e30, -1.0e30)
+        for i in 0..SHEET_PARTS {
+            if i < count && slab[i].x <= slab[i].y && slab[i].z <= slab[i].w {
+                hull = vec4(min(hull.x, slab[i].x), max(hull.y, slab[i].y), min(hull.z, slab[i].z), max(hull.w, slab[i].w))
+            }
         }
     }
-    top == 0
+    if hull.x > hull.y || hull.z > hull.w {
+        return (0.0, true)
+    }
+    (min(hull.y - hull.x, hull.w - hull.z), done)
+}
+
+/// `slab_in_box` across `n` (`x`, `y` of the first result, its axis the second's `x`) and across
+/// `g` (`z`, `w`, and `y`), from the one enclosure.
+fn slabs_in_box(af: Affine3, b_lo: vec3, b_hi: vec3, at: vec3, n: vec3, g: vec3) -> (vec4, vec2u) {
+    let (n_lo, n_hi, n_axis) = slab_in_box(af, b_lo, b_hi, at, n)
+    let (g_lo, g_hi, g_axis) = slab_in_box(af, b_lo, b_hi, at, g)
+    (vec4(n_lo, n_hi, g_lo, g_hi), vec2u(n_axis, g_axis))
+}
+
+/// Where across `n` (unit, from the plane through `at`) the surface inside the box
+/// `[b_lo, b_hi]` lies, by the box's enclosure `af`: from the first result to the second (the
+/// first above the second: the box holds no surface), and the axis of the box that holds most
+/// of that width (the third).
+fn slab_in_box(af: Affine3, b_lo: vec3, b_hi: vec3, at: vec3, n: vec3) -> (f32, f32, u32) {
+    if af.lo() > 0.0 || af.hi() < 0.0 {
+        return (1.0, -1.0, 0)
+    }
+    // World-space box center & half-extent matching `ir::derive::affine::input_box`.
+    let hl = 0.5 * b_lo
+    let hh = 0.5 * b_hi
+    let c_b = hl + hh
+    let h_in = (hh - hl) * (1.0 + 2.0 * CERT_EPS)
+    let w_mid = dot(c_b - at, n)
+    let w_l = h_in * n
+    let margin_w = (abs(c_b.x) + abs(c_b.y) + abs(c_b.z) + abs(at.x) + abs(at.y) + abs(at.z)) *
+        (6.0 * CERT_EPS) +
+        (h_in.x + h_in.y + h_in.z) * (12.0 * CERT_EPS) +
+        8.0 * CERT_TINY
+    let span = abs(w_l.x) + abs(w_l.y) + abs(w_l.z) + margin_w
+    var s_lo = w_mid - span
+    var s_hi = w_mid + span
+    var score_x = abs(w_l.x)
+    var score_y = abs(w_l.y)
+    var score_z = abs(w_l.z)
+    if af.valid() && h_in.x > 0.0 && h_in.y > 0.0 && h_in.z > 0.0 {
+        let g = vec3(af.l.x / h_in.x, af.l.y / h_in.y, af.l.z / h_in.z)
+        let alpha = dot(g, n)
+        let abs_a = abs(alpha)
+        if abs_a > 1.0e-6 {
+            let r = af.l - w_l * alpha
+            let mag_f = abs(af.c) + abs(af.l.x) + abs(af.l.y) + abs(af.l.z) + af.e
+            let margin_f = mag_f * (16.0 * CERT_EPS) + 4.0 * CERT_TINY
+            let half_w = (abs(r.x) + abs(r.y) + abs(r.z) + af.e + margin_f) / abs_a + margin_w
+            let w_ctr = w_mid - af.c / alpha
+            s_lo = max(w_ctr - half_w, s_lo)
+            s_hi = min(w_ctr + half_w, s_hi)
+            let inv_a = 1.0 / abs_a
+            score_x += abs(r.x) * inv_a
+            score_y += abs(r.y) * inv_a
+            score_z += abs(r.z) * inv_a
+        }
+    }
+    var axis: u32 = 0
+    if score_y >= score_x && score_y >= score_z {
+        axis = 1
+    } else if score_z >= score_x && score_z >= score_y {
+        axis = 2
+    }
+    (s_lo, s_hi, axis)
 }
 
 fn u01(k: u32) -> f32 {
