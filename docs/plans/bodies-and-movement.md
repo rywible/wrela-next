@@ -404,6 +404,13 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-27 | `b2` (L4): the benchmark: b1's weights, 200 updates with the joints' acceleration held to the clip's (weight 1000), for the tremor, stopped by a signal | 0.91 |
 | 2026-11-27 | `b3` (L4): the benchmark: b1's weights, 200 updates with the actions' means held smooth in time and in place (Mysore et al. 2021, weights 10 and 10), for the tremor, done | 1.70 |
 | 2026-11-27 | `b4` (L4): the benchmark, its clips low-passed at 6 Hz: b3's weights, 300 updates with the actions' means held smooth (weights 30 and 30), stopped by a signal | 0.55 |
+| 2026-11-27 | `b5` (L4): the benchmark on a model whose servos damp as muscles do (0.2 s of strength): b3's weights, 300 updates, the actions smooth (10, 10), done | 2.13 |
+| 2026-11-28 | `b6` (L4): the benchmark on muscles' damping: b5's weights, 400 updates, the actions smooth (30, 30), done | 2.63 |
+| 2026-11-28 | `b7` (L4): the benchmark at 60 frames a second (the tracker's loop half the delay): b5's weights, 500 updates, the actions smooth (10, 10), stopped by a signal | 1.07 |
+| 2026-11-28 | `b8` (L4): the benchmark at 60 frames a second: b7's weights, 400 updates, the actions smooth (30, 30), stopped by a signal | 1.40 |
+| 2026-11-28 | `b9` (L4): the benchmark at 60 frames a second: b7's weights, 400 updates, the joints' speeds rewarded as DeepMimic's (6.2 on the mean), the actions smooth (10, 10), stopped by a signal | 1.29 |
+| 2026-11-28 | `b10` (L4): the benchmark at 60 frames a second: b9's weights, 400 updates, the servos damping toward the clip's speed, the joints' speeds as DeepMimic's, stopped by a signal | 1.35 |
+| 2026-11-28 | `b11` (L4): the benchmark at 60 frames a second, the servos damping 0.4 s of strength toward the clip's speed: b10's weights, 400 updates, stopped by a signal | 1.06 |
 
 #### A new machine
 
@@ -1040,6 +1047,23 @@ removes the faults of the retarget: slide, penetration and forces that cannot oc
   for a knee that holds the body up. The servos now damp as muscles do (`MUSCLE_DAMPING`, Hill
   1938: 0.2 s times the strength, twice before); the same net untrained for it rang a fifth as
   much (15.5% of its power at 4.5 to 7.5 Hz from 48.9%). `b5` trains on it.
+- The shake, followed down (2026-11-28, `b5` to `b11` on the benchmark, 1 to 2.6 units each):
+  each fix that softened the tracker moved the shake lower without ending it (7 Hz, 5.5 Hz at
+  0.2 s of damping and smoothed actions, 3.5 Hz at 60 frames a second), under every band the
+  measures held; the tracker's evaluations now give the body's joints' speed above 2 Hz against
+  its clip's (`excess_speed`), which sees it at any frequency. What shakes is the body bouncing
+  on its legs: the root's height's speed above 2 Hz 1 to 2.2 times its clip's while along the
+  ground it follows its clip's spectrum, the net's own commands a third to two fifths of their
+  power at 3 to 4.5 Hz (the joints' angles 3 to 6%). Tried, each on the benchmark: the actions
+  smoothed harder (the shake under the clips' own level, `b6`: tremor in target for 72% of
+  clips, its physics better than the capture's in each measure, but 65% of training clips
+  followed to the end and 34% of test); 60 frames a second (`b7`: training clips followed for
+  20 s 82% where 30 a second had 73%, the shake at 3.5 Hz); DeepMimic's reward on the joints'
+  speeds (a hundred times the old, `b9`: the joints' speed 1.67 to 1.62 times the clip's); the
+  servos damping toward the clip's speed (`b10`: no gain); a damped contact (no change on the
+  CPU); 0.4 s of damping (`b11`: the joints' speed 1.42 times, its balance lost, 30% followed).
+  Each fine-tune began from weights that learned to bounce on soft knees: `b12` trains from
+  scratch with them all, at 0.3 s of damping.
 - The filtered capture back as poses (`tools/movement/export -- human unfilter`, `--read
   filtered=` the run's outputs, `--read sim=` its export, `--write out=.movement/poses-filtered`):
   each clip's qpos up to its fall as the body's numbers (a welded segment at rest), so the solver
