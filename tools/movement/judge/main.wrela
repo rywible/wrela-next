@@ -192,6 +192,12 @@ const NAMES: [Text; MEASURES] = [
 /// `targets/BODY.json` (`--read targets=tools/movement/judge/targets`), refused when they were
 /// calibrated on another declaration of the body (`bodies::declaration`).
 fn targets<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>) -> Result<[f32; MEASURES], ToolError> {
+    targets_for(def, "")
+}
+
+/// A source's targets (its own for its style, the body's for the rest), or the body's where the
+/// file has none for it (a source calibrated before, or a movement of none).
+fn targets_for<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, source: str) -> Result<[f32; MEASURES], ToolError> {
     let bytes = read_all(f"targets/{def.name}.json")?
     let Some(text) = String::from_utf8(take bytes) else { return Err(ToolError::new("targets: not UTF-8")) }
     let Some(doc) = parse(text.as_str()) else { return Err(ToolError::new("targets: not JSON")) }
@@ -205,7 +211,17 @@ fn targets<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>) -> Resul
             ),
         )
     }
-    let Some(list) = doc.get(TOP, "targets") else { return Err(ToolError::new("targets: no list")) }
+    var list = match doc.get(TOP, "targets") {
+        Some(l) => l,
+        None => return Err(ToolError::new("targets: no list")),
+    }
+    if source.len() > 0 {
+        if let Some(by) = doc.get(TOP, "by_source") {
+            if let Some(l) = doc.get(by, source) {
+                list = l
+            }
+        }
+    }
     if doc.count(list) != MEASURES {
         return Err(ToolError::new(f"targets: {doc.count(list)} of them, the judge has {MEASURES} measures"))
     }
@@ -570,6 +586,7 @@ struct Job<const D: u32>: Clone {
 /// and how long the judge took for the clean one.
 struct Judged: Clone {
     name: String,
+    root: String,
     failed: bool,
     clean: [f32; MEASURES],
     damaged: Vec<[f32; MEASURES]>,
@@ -601,6 +618,7 @@ fn judged_creature(j: take Job<cs::FREEDOM>) -> Judged {
 fn judged_clip<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, j: Job<D>) -> Judged {
     var out = Judged {
         name: j.name.clone(),
+        root: j.root.clone(),
         failed: true,
         clean: [0.0; MEASURES],
         damaged: Vec::new(),
@@ -673,8 +691,37 @@ fn calibration_jobs<const S: u32, const D: u32, const P: u32>(
             },
         )
     }
+    // The tracker's filtered capture, where it is given (`--read filtered=`): what a physical
+    // movement of the body keeps its physics measures to.
+    if files::stat(f"filtered/{def.name}").wait().is_ok() {
+        for which in ["training", "test"] {
+            for n in set(which)? {
+                if files::stat(f"filtered/{def.name}/{n}.pose").wait().is_ok() {
+                    jobs.push(
+                        Job {
+                            name: n.clone(),
+                            refs: refs_for(refs_by.clone(), n.as_str()),
+                            root: String::from("filtered"),
+                            damage: false,
+                        },
+                    )
+                }
+            }
+        }
+    }
     Ok(jobs)
 }
+
+/// The measures a body's physics keeps (the root's residual, the torque past strength, the slide,
+/// the float): retargeted capture is not physical (another skeleton's movement fitted to this
+/// one), so where a filtered capture is given their targets are its 95th percentile. The
+/// penetration and the range are limits of the floor and of the declaration, whatever moves.
+const PHYSICS: [bool; MEASURES] = [true, true, true, false, true, false, false, false, false]
+
+/// The measures of a movement's style (its distance from the capture, its goal error, its tremor):
+/// each source's own, as a source's movements are its own (ACCAD's strikes are faster than
+/// 100STYLE's walks: their power above 6 Hz is a strike's, not a tremor).
+const STYLE: [bool; MEASURES] = [false, false, false, false, false, false, true, true, true]
 
 /// The check of phase 4 (`check`): every clip of the training and test sets that the tracker
 /// filtered (`--read filtered=.movement/poses-filtered`), judged as the tracker moved it and as
@@ -721,6 +768,8 @@ fn followed_to_end(body: str, name: str) -> bool {
 fn check<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, results: Vec<Judged>) -> Result<u32, ToolError> {
     let target = targets(def)?
     var inside = [vec2(0.0); MEASURES]
+    var by_name: Vec<String> = Vec::new()
+    var by_target: Vec<[f32; MEASURES]> = Vec::new()
     var inside_raw = [vec2(0.0); MEASURES]
     var mean = [0.0; MEASURES]
     var mean_raw = [0.0; MEASURES]
@@ -734,8 +783,23 @@ fn check<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, results: V
             continue
         }
         let filtered = i % 2 == 0
+        // The clip's source's targets.
+        let src = source_of(r.name.as_str())
+        var own = target
+        var found = false
+        for k in 0..by_name.len() {
+            if by_name[k].as_str() == src.as_str() {
+                own = by_target[k]
+                found = true
+            }
+        }
+        if !found {
+            own = targets_for(def, src.as_str())?
+            by_name.push(src.clone())
+            by_target.push(own)
+        }
         for k in 0..MEASURES {
-            let ok = if r.clean[k] <= target[k] { 1.0 } else { 0.0 }
+            let ok = if r.clean[k] <= own[k] { 1.0 } else { 0.0 }
             if filtered {
                 inside[k] += vec2(ok, 1.0)
                 mean[k] += r.clean[k]
@@ -794,9 +858,20 @@ fn check<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, results: V
     for k in 0..MEASURES {
         let share = inside[k].x / max(inside[k].y, 1.0)
         let raw = inside_raw[k].x / max(inside_raw[k].y, 1.0)
+        if PHYSICS[k] {
+            // A physics measure's target is a filtered capture's own 95th percentile (`calibrate`),
+            // so its share in it says nothing of the capture it came from: the filtered capture
+            // is held to being more physical than the capture, on average (the phase's line).
+            let (mf, mr) = (mean[k] / max(judged.x, 1.0), mean_raw[k] / max(raw_n, 1.0))
+            done = done && mf <= mr
+            print(
+                f"check: {NAMES[k]}: filtered mean {mf} against the capture's {mr} ({100.0 * share}% in the target {target[k]}){if mf <= mr { "" } else { "  FAILS" }}",
+            )
+            continue
+        }
         done = done && share >= 0.95
         print(
-            f"check: {NAMES[k]}: target {target[k]}; filtered {100.0 * share}% in it (mean {mean[k] / max(judged.x, 1.0)}), captured {100.0 * raw}% (mean {mean_raw[k] / max(raw_n, 1.0)}){if share >= 0.95 { "" } else { "  FAILS" }}",
+            f"check: {NAMES[k]}: target {target[k]} (each source's own for its style); filtered {100.0 * share}% in it (mean {mean[k] / max(judged.x, 1.0)}), captured {100.0 * raw}% (mean {mean_raw[k] / max(raw_n, 1.0)}){if share >= 0.95 { "" } else { "  FAILS" }}",
         )
     }
     print(if done { "check: phase 4 is done" } else { "check: phase 4 is not done" })
@@ -822,9 +897,14 @@ fn calibrate(results: Vec<Judged>, body: str, declaration: String) -> Result<u32
     var timing = 0.0
     var seconds = 0.0
     var left_out = 0
+    var physical: Vec<[f32; MEASURES]> = Vec::new()
     for r in results {
         if r.failed {
             left_out += 1
+            continue
+        }
+        if r.root.as_str() == "filtered" {
+            physical.push(r.clean)
             continue
         }
         timing += r.timing
@@ -858,29 +938,64 @@ fn calibrate(results: Vec<Judged>, body: str, declaration: String) -> Result<u32
         }
     }
     var target = [0.0; MEASURES]
+    var by_source: Vec<[f32; MEASURES]> = Vec::new()
+    // Each source's capture's own targets, every measure: what the pairs below are scored with
+    // (the pairs ask whether each measure sees the damage done to a capture, so the capture's own
+    // scale; held to the filtered capture's physics, a retargeted capture's own faults outweigh
+    // the damage: a body standing still is more physical than a retargeted walk).
+    var capture_own: Vec<[f32; MEASURES]> = Vec::new()
+    for _ in sources.clone() {
+        by_source.push([0.0; MEASURES])
+        capture_own.push([0.0; MEASURES])
+    }
     for i in 0..MEASURES {
         var line = String::new()
         var most = 0.0
-        for src in sources.clone() {
+        for k in 0..sources.len() {
             var xs: Vec<f32> = Vec::new()
             for c in 0..clean.len() {
-                if clean_source[c].as_str() == src.as_str() {
+                if clean_source[c].as_str() == sources[k].as_str() {
                     xs.push(clean[c][i])
                 }
             }
             let p95 = percentile(xs.clone(), 0.95)
             most = max(most, p95)
-            line.push_str(f" {src} {p95} ({xs.len()} clips)")
+            by_source[k][i] = max(p95, floors[i])
+            capture_own[k][i] = max(p95, floors[i])
+            line.push_str(f" {sources[k]} {p95} ({xs.len()} clips)")
         }
         target[i] = max(most, floors[i])
+        if PHYSICS[i] && physical.len() > 0 {
+            var xs: Vec<f32> = Vec::new()
+            for v in physical.clone() {
+                xs.push(v[i])
+            }
+            target[i] = max(percentile(xs.clone(), 0.95), floors[i])
+            line.push_str(f"; the filtered capture's {target[i]} ({xs.len()} clips) holds")
+        }
+        // A source's own target for its style; every other measure the body's.
+        for k in 0..sources.len() {
+            if !STYLE[i] {
+                by_source[k][i] = target[i]
+            }
+        }
         print(f"judge: target {NAMES[i]}: {target[i]} (each source's clean clips' 95th percentile:{line})")
     }
-    // The targets, kept for this declaration of the body (`--write targets=tools/movement/judge/targets`).
+    // The targets, kept for this declaration of the body (`--write targets=tools/movement/judge/targets`):
+    // the body's (a movement of no source: the solver's) and each source's.
     var list = String::new()
     for i in 0..MEASURES {
         list.push_str(if i == 0 { f"{target[i]}" } else { f", {target[i]}" })
     }
-    let doc = f"{{\"body\": \"{declaration}\", \"clips\": {clean.len()}, \"targets\": [{list}]}}\n"
+    var each = String::new()
+    for k in 0..sources.len() {
+        var l = String::new()
+        for i in 0..MEASURES {
+            l.push_str(if i == 0 { f"{by_source[k][i]}" } else { f", {by_source[k][i]}" })
+        }
+        each.push_str(if k == 0 { f"\"{sources[k]}\": [{l}]" } else { f", \"{sources[k]}\": [{l}]" })
+    }
+    let doc = f"{{\"body\": \"{declaration}\", \"clips\": {clean.len()}, \"filtered_clips\": {physical.len()}, \"targets\": [{list}], \"by_source\": {{{each}}}}}\n"
     write_all(f"targets/{body}.json", Vec::from(doc.as_bytes()))?
     print(f"judge: the targets of {body} written for its declaration {declaration}")
     // The pairs: each clean clip against each of its damaged copies.
@@ -891,14 +1006,20 @@ fn calibrate(results: Vec<Judged>, body: str, declaration: String) -> Result<u32
     var monotone = [0; 5]
     var monotone_of = [0; 5]
     for ci in 0..clean.len() {
-        let s_clean = score(clean[ci], target)
+        var own = target
+        for k in 0..sources.len() {
+            if sources[k].as_str() == clean_source[ci].as_str() {
+                own = capture_own[k]
+            }
+        }
+        let s_clean = score(clean[ci], own)
         var idx = ci * per
         for k in 0..5 {
             let n = if k == 4 { 1 } else { 3 }
             var last = s_clean
             var rising = true
             for _ in 0..n {
-                let s = score(damaged[idx], target)
+                let s = score(damaged[idx], own)
                 pairs += 1
                 by_kind[k] += vec2(if s > s_clean { 1.0 } else { 0.0 }, 1.0)
                 if s > s_clean {
