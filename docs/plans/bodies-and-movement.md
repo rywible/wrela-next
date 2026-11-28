@@ -398,6 +398,7 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-27 | `p4h-12` (L4): phase 4 on human3 refs_clean: fine-tune from p4h-11 upd 4000 with startup-accel trim and 8x tail mining, 1200 updates, done | 4.07 |
 | 2026-11-27 | `amp-walk` (L4): phase 5 step 14: AMP style prior + walk controller on human3 physics-filtered capture (1993 clips), 1500 updates, done | 3.29 |
 | 2026-11-27 | `amp-walk2` (L4): phase 5 step 14: calibrated AMP walk with 200k replay buffer, logit reg, gp=10, and upright athletic style-caster prior (120 clips, 2.10 h), 1200 updates, done | 2.93 |
+| 2026-11-27 | `p4h-13` (L4): phase 4 on sim-human5 (joints held to the body's ranges, cones collided as the judge measures them, 1/240 s steps with 10 ms contacts): fine-tune of p4h-12 with its last action read and its change paid for (the 7 Hz shake), the soles held where planted, the ball joints held to their cones, 1500 updates; the filtered capture with actions, servo and contact forces, done | 7.99 |
 
 #### A new machine
 
@@ -1068,6 +1069,21 @@ removes the faults of the retarget: slide, penetration and forces that cannot oc
   error 97.4% against 98.9%; penetration 0% (10.3 mm) against 97.1% (0.84); out of range 0%
   (0.274 rad) against 99.0% (0.012); distance from capture 58.7% (2.36) against 98.6% (0.30);
   tremor 0% (0.71) against 98.5% (0.018). Not done.
+- The check on `p4h-13` (7.99 units: 1,500 updates on `sim-human5` from `p4h-12`, its last action
+  read and its change paid for, the ball joints held to their cones, the soles held where
+  planted): 1,993 filtered clips. Followed to the end: 100STYLE 89.6% of training and 84.6% of
+  test, CeTI 97.9% and 95.8%; ACCAD's (not in its training) none. In target: penetration 70.7%
+  (mean 1.95 mm, from 0%), out of range 2.9% (0.109 rad, from 0%), distance from capture 68.4%
+  (1.59, from 58.7%), tremor 2.5% (0.32, from 0%); root residual (0.012 of the weight), torque,
+  slide (233 mm/s), float and goal error as before. The shake is half what it was (the joints'
+  speed above 6 Hz, RMS: a walk 0.82 rad/s from 1.63, a run 0.96 from 2.31, standing 0.07 from
+  0.81), its peak at 5.9 Hz. Not done.
+- Each muscle's activation (`--activation-ms`): a servo applies the net's command through a lag,
+  as a muscle's force follows its excitation (F. E. Zajac 1989; D. G. Thelen 2003: some 15 ms
+  rising and 50 falling), and the net reads what is applied. With 30 ms, `p4h-13`'s net (two
+  updates on the CPU) keeps 12.7% of a walk's joints' speed's power above 6 Hz (51% without) and
+  13.7% of a run's (28%). `p4h-14` trains with it, the ball joints' weight 20 (5), and ACCAD's
+  clips (2,300 clips, 26.3 h).
 
 ### Done when
 

@@ -217,6 +217,11 @@ class Sim:
         # its rate (`p4h-12`: 83 to 99% of the joints' speed's power above 6 Hz, the servos alone
         # 2%).
         self.last_act = torch.zeros(worlds, self.mjm.nu, device=device)
+        # Each muscle's activation (`activation_ms`): what the servo applies follows the net's
+        # command with a lag, as a muscle's force follows its excitation (Zajac 1989; Thelen 2003:
+        # some 15 ms rising, 50 falling). 0: none, the command applied at once.
+        self.applied = torch.zeros(worlds, self.mjm.nu, device=device)
+        self.activation_ms = 0.0
         self.read_last = False
         self.rate_weight = 0.0
         # The soles: the feet and the toes (segments 9, 10, 13 and 14 of the human), as places in
@@ -227,6 +232,16 @@ class Sim:
         self.soles = torch.tensor([act_list.index(b) for b in sole_ids if b in act_list], device=device,
                                   dtype=torch.long)
         self.sole_weight = 0.0
+
+    def command(self, a):
+        """The servos' targets for the net's action `a` (in [-1, 1]): the clip's next frame and
+        the action, through the muscles' activation (`activation_ms`)."""
+        if self.activation_ms > 0.0:
+            k = 1.0 - math.exp(-1000.0 / (self.rate * self.activation_ms))
+            self.applied = self.applied + k * (a - self.applied)
+        else:
+            self.applied = a
+        return self.ref_q[self.global_frame(1)][:, 7:] + self.act_scale * self.applied
 
     def tilt(self, g):
         """Each world's own gravity (`g`, worlds by 3): a floor tilted under the body is a slope.
@@ -292,6 +307,7 @@ class Sim:
         self.qvel[idx] = self.ref_vel(g)
         self.warm[idx] = 0.0
         self.last_act[idx] = 0.0
+        self.applied[idx] = 0.0
         mjw.kinematics(self.m, self.d)
 
     def weigh(self, results):
@@ -373,7 +389,8 @@ def observe(sim):
         parts.append(quat_rotate(hq, sim.ref_vel(g)[:, :3]))
         parts.append(sim.ref_q[g][:, 7:] - sim.qpos[:, 7:])
     if sim.read_last:
-        parts.append(sim.last_act)
+        # The muscles' state: what is applied (the last action itself where there is no lag).
+        parts.append(sim.applied if sim.activation_ms > 0.0 else sim.last_act)
     return torch.cat(parts, -1)
 
 
@@ -736,6 +753,7 @@ def play(sim, agent, norm, clips, most_frames=None, record=False, push=None):
         sim.warm[:] = 0.0
         mjw.kinematics(sim.m, sim.d)
         sim.last_act[:] = 0.0
+        sim.applied[:] = 0.0
         alive = torch.ones(sim.n, dtype=torch.bool, device=sim.dev)
         fell_at = sim.lengths[c].clone()
         dist = torch.zeros(sim.n, device=sim.dev)
@@ -756,7 +774,7 @@ def play(sim, agent, norm, clips, most_frames=None, record=False, push=None):
                 force, first, frames_on = push
                 on = (t >= first) & (t < first + frames_on)
                 sim.xfrc[:, 1, :3] = torch.where(on[:, None], force, torch.zeros_like(force))
-            sim.step(sim.ref_q[sim.global_frame(1)][:, 7:] + sim.act_scale * a.clamp(-1, 1))
+            sim.step(sim.command(a.clamp(-1, 1)))
             _, fell, ex = reward(sim)
             sim.last_act = a.clamp(-1, 1)
             live_clip = sim.frame < (sim.lengths[sim.clip] - 1)
@@ -995,6 +1013,9 @@ def main():
     p.add_argument("--start-share", type=float, default=0.25,
                    help="the share of worlds started at their clip's first frame (the evaluation plays each "
                         "clip from there)")
+    p.add_argument("--activation-ms", type=float, default=0.0,
+                   help="the muscles' activation: the servos apply the net's command through a lag of this "
+                        "time constant (ms; 0: at once)")
     p.add_argument("--read-last", action="store_true",
                    help="the net reads its last action (a net that reads only the body shakes it)")
     p.add_argument("--rate-weight", type=float, default=0.0,
@@ -1035,6 +1056,7 @@ def main():
         sim.fall_mean = a.fall_mean
         sim.range_weight = a.range_weight
         sim.read_last = a.read_last
+        sim.activation_ms = a.activation_ms
         sim.rate_weight = a.rate_weight
         sim.sole_weight = a.sole_weight
         print(f"sim: {a.worlds} worlds, {len(head['names'])} clips, {refs.shape[0]} frames, "
@@ -1143,7 +1165,7 @@ def main():
                     logp_buf[h] = dist.log_prob(act).sum(-1)
                     val_buf[h] = vnorm.denorm(agent.v(o).squeeze(-1))
                     act_c = act.clamp(-1, 1)
-                    sim.step(sim.ref_q[sim.global_frame(1)][:, 7:] + sim.act_scale * act_c)
+                    sim.step(sim.command(act_c))
                     r, fell, _ = reward(sim, act_c)
                     sim.last_act = act_c
                     blown += int(exploded(sim).sum())
