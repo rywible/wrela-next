@@ -59,6 +59,11 @@ vertex, so the mesh and the surface stand no further apart than that, so with `w
 | `Hole.no_hole`, `covered` | A slab narrower than the side rays' reach across it leaves no hole | Proven |
 | `Hole.hole_fits` | That is tight: any slab as wide as the reach has a field and a mesh with a hole | Proven |
 | `Hole.side_reach`, `side_reach_ge`, `side_reach_diagonal` | The audit's four side rays reach `max \|x\| \|y\|` of half a pixel across an outline whose normal in the picture is `(x, y)`: `√2/2` of it across a diagonal one | Proven |
+| `Hole.no_hole_centred`, `no_extra_centred` | A mesh that fills to the slab's middle may have a slab twice as wide | Proven |
+| `Own.zero_in_own_slab`, `own_slab_engine` | Across the enclosure's own gradient the surface lies in a slab of half width `e / \|α\|`: no tilt term | Proven |
+| `Own.mesh_in_own_slab`, `field_on_mesh` | A triangle whose corners are zeros of the field in the box lies in that slab, and the field on it is at most `2e` | Proven |
+| `Sandwich.sandwich_zero` | The field positive on a patch pushed out by `δ` and negative on it pushed in: every point of the patch is within `δ` of the surface | Proven |
+| `Sandwich.sandwich_no_hole`, `sandwich_no_extra` | A sandwich of `δ` less than the side rays' reach leaves no hole and no extra | Proven |
 | `checks/slab_lp.py` | The best multiplier is one of four (`0` and `wl[i] / l[i]`), and the slab it gives is the true extent | Numbers only: 20,000 enclosures, largest difference 4.7e-15 |
 
 #### Findings
@@ -98,24 +103,48 @@ The model's two hypotheses (`hcert`, `hmesh`) are one-sided: the field has no ma
 slab, and all below the slab is the mesh's matter. They follow from "the surface and the mesh
 lie in the slab" only with the mesh closed and facing out there. That step is not formalised.
 
-#### To carry into wrela (none is carried yet)
+#### What the engine said
 
-1. **The best multipliers in `certify_sheet`**, in place of `α = dot(g, n)`: evaluate the upper
-   bound and the lower bound at `λ ∈ {0, w_l.x / l.x, w_l.y / l.y, w_l.z / l.z}` and keep the
-   least and the greatest. Measure with `certify_report` and the candlestick's census before and
-   after. Prove first, or keep as numbers: that a breakpoint is optimal.
-2. **The mesh's corners in the slab.** Where `outline_quads` puts a quad's cells up, hold each
-   cell's slab to the quad's four vertices as well. First build the wrela test that attacks it: a
-   sphere a few cells in radius and a ridge on a lattice plane, at many placements, counted by
-   the hole audit.
-3. **The need across the outline's own direction**: `HOLE_PX * px * max(|n·x̂|, |n·ŷ|)` with the
-   picture's axes, in `cert_due` and `certify_watched`. First add diagonal outlines to the audit's
-   eyes if it has none that graze so.
+Measured on the M4 at `69c6f34` (the GPU shared with another session's runs, so counts and
+audits are firm and frame times are not). Exact cells are a frame's, at 1080p, frame 89; the
+audit is the full one (640x360, 24 eyes, 20 kinds); the census is `certify_report`'s cells
+(4,560 over 19 kinds at 1, 2.7 and 8 cm).
+
+| Tried | How | Result |
+| --- | --- | --- |
+| A. The best multipliers | In `certify_sheet`, CPU reports and exact cells | Not carried. Certified cells 5,619 to 5,715 of 9,520, but exact cells on SCENE 10, 13, 14 moved -1.3%, -0.1%, +0.6%: with the plane's normal fixed, the engine's slab was already near the surface's true extent |
+| B. The mesh's corners in the slab | A quad's cells solved where its corners stand more than a quarter of the need off a cell's plane | Not carried. It clears the pillars' holes as C does, at +77% exact cells on SCENE 10 against C's +5%. No hole the audit finds needs it |
+| C. The reach across a diagonal outline | `HOLE_REACH_PX` (`mesh::dc`) in place of `HOLE_PX` for a certificate's need | **Carried** (`828598d`). The arena's pillars: 16 holes at the outline to 0, in three runs of the old and two of the new. No kind gained a hole |
+| The slab across the enclosure's own gradient (`Own.lean`) | `sheet_width` reads both ways from the same enclosures | **Carried**, with the next (`b79923e`). Census: 5,619 to 5,855 certified of 9,520; 46 counts rose, 4 fell by one or two cells |
+| 1. A certificate that says a width | `matter::certify::sheet_width`, kept by vertex for every eye (`mesh::outline`) | **Carried** (`b79923e`); its own full audit had not finished when it was. SCENE 10 VIEW 4 (running), each pass alone: the certificates' pass 4.2 to 2.2 ms a frame (median; mean 6.6 to 2.5), none due once settled. Exact cells with C: SCENE 10 23,060 to 22,341, SCENE 13 16,355 to 16,256, SCENE 14 10,917 to 10,908 |
+| 2. The mesh in the middle of its slab | Census, then a rule in the engine: how far the slab reaches from the vertex's plane to either side | Open. The slab's middle is not where a mesh of chords lies (it lies inside a surface that bulges, and the slab's middle is inside it too), so no vertex was moved. The reach rule certifies 6,328 of 9,520 on the census; its audit has not run |
+| 3. Draw the slab | Census of slab widths | Not built. Of the 2,133 cells that fail at the need, 531 have a slab under a pixel wide (at 2.5 pixels a cell) and 1,051 have one wider than their cell: too few to pay for a second raster path before the enclosures are tighter |
+| 4. Certify on the mesh (the sandwich, `Sandwich.lean`) | CPU probe on a patch of three surface points a cell apart; then in `outline_quads`, each frame, no cache | Open, and the strongest. Probe, kinds not of the kit: 2,543 of 3,060 cells held at the need against the slab's 2,186 (the orb at 8 cm: 60 of 60 against 1). The kit's kinds: 15 of 1,500 (their enclosures are their own, not the compiler's form of their distance). In the engine it took SCENE 10's exact cells a further 1.9% down and SCENE 13 and 14 nowhere, and with no cache its scan costs 86 ms a frame on SCENE 10 VIEW 4. It needs a kept verdict a quad and the parts live in a quad's bricks |
+| 4, by a block of cells | The slab of a block two cells wide | Not viable: 1,443 certified of 4,560 against a cell's 2,427 |
+| 5. The outline as a field | `interval` of `dot(gradient, q - eye)` over a cell | No speed in it. The compiler encloses it and proves no outline in 2,097 of 3,060 cells not of the kit, but those are cells the mesh's facing test already passes over. It could prove that test's premise |
+| 6. The cell size | `CELL_PX` at 2.0, 3.0 and 3.5 | Not read yet |
+
+The census overstates what a frame gains. Surface cells sampled evenly gained 4% to 13%; a
+frame's exact cells moved 0% to 5%, because more than a quarter of SCENE 10's come from the
+extraction itself (folds, seams, thin cells) and most of SCENE 13's and 14's are the kit's, whose
+enclosures have no slope to certify with.
+
+#### To carry into wrela next
+
+1. **The sandwich with a kept verdict.** A proof a quad, kept as the least `δ` proven (as
+   `vert_cert` keeps a width), the field asked with the parts live in the quad's bricks. First
+   the kit: a stated enclosure over a patch's own coordinates, or the sandwich proves nothing for
+   the made things.
+2. **The reach rule's audit** (idea 2), and its theory: what holds the mesh to the vertex's
+   plane across a cell.
+3. **The exact cell's live parts kept.** With no certificate due, the certificates' pass still
+   costs 2.2 ms a frame on SCENE 10 VIEW 4: each frame it asks the field for the parts live in
+   every failed cell again.
 
 ### Next
 
 - The thin cells' cores (`watched_core`: a cell less a quarter pixel on every side) by the same
-  model.
+  model: they still hold `HOLE_PX`, not `HOLE_REACH_PX`.
 - Second-order enclosures: the form, how it composes through `smin` and the maps, the remainder.
 - Motion by structure: when a displaced surface is a graph over its rest surface.
 - Steepness rules for std's and the kit's operators.

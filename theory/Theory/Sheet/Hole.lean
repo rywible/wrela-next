@@ -96,6 +96,29 @@ theorem hole_fits {o n : E} (hn : ‖n‖ = 1) {a b δ : ℝ} (hδ : δ ≤ b - 
       abel
     rw [this, inner_smul_right, hnn, mul_one]
 
+/-- **A mesh in the middle of the slab may have a slab twice as wide.** `no_hole` reads the
+slab's bottom only as the level the mesh's matter reaches. If the mesh fills to the slab's middle
+(within `ε` of it) while the field lies in `[a, b]`, a hole needs `δ ≤ (b - a) / 2 + ε`: the slab
+may be nearly `2 δ` wide. A mesh whose vertices are on the surface can lie anywhere in the slab;
+one whose vertices are at the slab's middle splits the error between the two sides. -/
+theorem no_hole_centred {o n : E} {a b δ ε : ℝ} {C F M : Set E}
+    (hcert : ∀ q ∈ C, q ∈ F → acrossE o n q ≤ b)
+    (hmesh : ∀ q ∈ C, acrossE o n q < (a + b) / 2 - ε → q ∈ M)
+    {p p' : E} (hp : p ∈ C) (hpM : p ∉ M) (hp' : p' ∈ C) (hp'F : p' ∈ F)
+    (hside : δ ≤ ⟪n, p' - p⟫) : δ ≤ (b - a) / 2 + ε := by
+  have h := no_hole hcert hmesh hp hpM hp' hp'F hside
+  linarith
+
+/-- The same for an extra (the mesh's matter where the field has none), with the two exchanged:
+the mesh has no matter above the middle plus `ε`, all below the slab is the field's matter. -/
+theorem no_extra_centred {o n : E} {a b δ ε : ℝ} {C F M : Set E}
+    (hmesh : ∀ q ∈ C, q ∈ M → acrossE o n q ≤ (a + b) / 2 + ε)
+    (hfield : ∀ q ∈ C, acrossE o n q < a → q ∈ F)
+    {p p' : E} (hp : p ∈ C) (hpF : p ∉ F) (hp' : p' ∈ C) (hp'M : p' ∈ M)
+    (hside : δ ≤ ⟪n, p' - p⟫) : δ ≤ (b - a) / 2 + ε := by
+  have h := no_hole (F := M) (M := F) hmesh hfield hp hpF hp' hp'M hside
+  linarith
+
 /-! ### The audit's side rays
 
 Four rays, half a pixel out along the picture's axes. In the picture's plane, with `d` that half
