@@ -227,6 +227,7 @@ class Sim:
         self.joints_1 = torch.zeros(worlds, self.mjm.nq - 7, device=device)
         self.joints_2 = torch.zeros(worlds, self.mjm.nq - 7, device=device)
         self.accel_weight = 0.0
+        self.vel_scale = 0.05
         self.read_last = False
         self.rate_weight = 0.0
         # The soles: the feet and the toes (segments 9, 10, 13 and 14 of the human), as places in
@@ -485,7 +486,11 @@ def reward(sim, act_clamped=None):
     r_loc = torch.exp(-40.0 * (dx_loc * dx_loc).mean(-1))
     r_rot = torch.exp(-5.0 * (dr * dr).mean(-1))
     r_root = torch.exp(-10.0 * eroot * eroot)
-    r_vel = 0.5 * torch.exp(-0.5 * dv_root * dv_root) + 0.5 * torch.exp(-0.05 * (dv * dv).mean(-1))
+    # The joints' speeds against the clip's (`vel_scale` on their mean square, rad/s): DeepMimic's
+    # (Peng et al. 2018) is exp(-0.1 sum), 6.2 on the mean of 62; until 2026-11-28 it was 0.05, a
+    # hundred times weaker, and a body that shook about its clip's path (0.05 rad at 3.5 Hz) lost
+    # 6% of this term for it.
+    r_vel = 0.5 * torch.exp(-0.5 * dv_root * dv_root) + 0.5 * torch.exp(-sim.vel_scale * (dv * dv).mean(-1))
     r = (0.25 * r_pos_fine + 0.20 * r_pos_wide + 0.20 * r_loc +
          0.15 * r_rot + 0.10 * r_root + 0.10 * r_vel)
     if sim.sole_weight > 0.0 and sim.soles.numel():
@@ -836,7 +841,10 @@ def play(sim, agent, norm, clips, most_frames=None, record=False, push=None):
                      "past_range": float(past[j] / max(float(count[j]), 1.0)),
                      "worst_range": float(worst[j]),
                      "tremor": tremor(joints[:min(int(fell_at[j]), joints.shape[0]), j].float(), sim.rate),
-                     "ringing": ringing(joints[:min(int(fell_at[j]), joints.shape[0]), j].float(), sim.rate)}
+                     "ringing": ringing(joints[:min(int(fell_at[j]), joints.shape[0]), j].float(), sim.rate),
+                     "excess_speed": excess_speed(joints[:min(int(fell_at[j]), joints.shape[0]), j].float(),
+                                                  sim.ref_q[int(sim.starts[batch[j]]):int(sim.starts[batch[j]]) +
+                                                            min(int(fell_at[j]), joints.shape[0]), 7:].float(), sim.rate)}
             if record:
                 n = min(int(fell_at[j]), len(frames))
                 entry["qpos"] = torch.stack([f[j] for f in frames[:n]]).float().numpy()
@@ -986,6 +994,22 @@ def ringing(q, rate):
     return float(p[(f >= 4.0) & (f < 7.5)].sum() / p.sum().clamp(min=1e-12))
 
 
+def excess_speed(q, ref, rate):
+    """The body's joints' speed against its clip's, as the ratio of their RMS above 2 Hz (a body
+    that follows has 1; one that shakes about the clip's path more, at whatever frequency it
+    shakes: the tracker's shake went from 7 to 5.5 to 3.5 Hz as each fix softened it)."""
+    n = min(q.shape[0], ref.shape[0])
+    if n < 32:
+        return 1.0
+    def hi(x):
+        v = (x[1:n] - x[:n - 1]) * rate
+        v = v - v.mean(0, keepdim=True)
+        p = torch.fft.rfft(v, dim=0).abs().pow(2).sum(1)
+        f = torch.fft.rfftfreq(v.shape[0], 1.0 / rate).to(p.device)
+        return p[f > 2.0].sum()
+    return float(torch.sqrt(hi(q.to(ref.device)) / hi(ref).clamp(min=1e-9)))
+
+
 def summary(results, names=None):
     if not results:
         return {"clips": 0}
@@ -1003,6 +1027,8 @@ def summary(results, names=None):
         out["tremor"] = sum(r["tremor"] * r["frames"] for r in results) / max(frames, 1)
         out["tremor_in_target"] = sum(r["tremor"] <= TREMOR_TARGET for r in results) / len(results)
         out["ringing"] = sum(r["ringing"] * r["frames"] for r in results) / max(frames, 1)
+        xs = sorted(r["excess_speed"] for r in results)
+        out["excess_speed_median"] = xs[len(xs) // 2]
     if names is not None:
         groups = {}
         for r in results:
@@ -1111,6 +1137,8 @@ def main():
     p.add_argument("--smooth-place", type=float, default=0.0,
                    help="the weight of the actions' means' change for an observation `--smooth-noise` off")
     p.add_argument("--smooth-noise", type=float, default=0.05)
+    p.add_argument("--vel-scale", type=float, default=0.05,
+                   help="the joints' speeds' term exp(-this times their mean square error, rad/s): DeepMimic's 6.2")
     p.add_argument("--accel-weight", type=float, default=0.0,
                    help="the reward times e^-(this times the mean square of the joints' acceleration's distance "
                         "from the clip's, rad a frame squared): 1000 halves it at 0.026")
@@ -1159,6 +1187,7 @@ def main():
         sim.read_last = a.read_last
         sim.activation_ms = a.activation_ms
         sim.accel_weight = a.accel_weight
+        sim.vel_scale = a.vel_scale
         sim.rate_weight = a.rate_weight
         sim.sole_weight = a.sole_weight
         print(f"sim: {a.worlds} worlds, {len(head['names'])} clips, {refs.shape[0]} frames, "
