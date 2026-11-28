@@ -438,7 +438,13 @@ def ball_numbers(sim):
     return torch.stack([v[..., 0], v[..., 2], angle], -1)
 
 
-def range_excess(sim):
+def range_worst(sim):
+    """Each world's worst ball joint's distance past its range (rad, 0 within): what the judge
+    holds a movement's worst frame to."""
+    return range_excess(sim, worst=True)
+
+
+def range_excess(sim, worst=False):
     """Each world's ball joints' distances past their ranges, summed (rad): the engine's
     `Joint::range` (the swing's ellipse, scaled by its smaller half axis, and the twist's
     interval), 0 within. The simulator's hinges hold a box of Euler angles that contains each
@@ -451,7 +457,8 @@ def range_excess(sim):
     ay = torch.where(q[..., 1] >= 0, hi[..., 1], -lo[..., 1]).clamp(min=1e-4)
     swing = (torch.sqrt((q[..., 0] / ax) ** 2 + (q[..., 1] / ay) ** 2) - 1.0) * torch.minimum(ax, ay)
     twist = torch.maximum(lo[..., 2] - q[..., 2], q[..., 2] - hi[..., 2])
-    return torch.relu(torch.maximum(swing, twist)).sum(-1)
+    past = torch.relu(torch.maximum(swing, twist))
+    return past.amax(-1) if worst else past.sum(-1)
 
 
 def reward(sim, act_clamped=None):
@@ -758,6 +765,8 @@ def play(sim, agent, norm, clips, most_frames=None, record=False, push=None):
         fell_at = sim.lengths[c].clone()
         dist = torch.zeros(sim.n, device=sim.dev)
         past = torch.zeros(sim.n, device=sim.dev)
+        worst = torch.zeros(sim.n, device=sim.dev)
+        joints = [sim.qpos[:k, 7:].half().clone()]
         count = torch.zeros(sim.n, device=sim.dev)
         steps = int(sim.lengths[c[:k]].max().item()) - 2
         if most_frames:
@@ -784,14 +793,19 @@ def play(sim, agent, norm, clips, most_frames=None, record=False, push=None):
             m = (alive & live_clip).float()
             dist += ex * m
             past += range_excess(sim) * m
+            worst = torch.maximum(worst, range_worst(sim) * m)
+            joints.append(sim.qpos[:k, 7:].half().clone())
             count += m
             if record:
                 frames.append(sim.qpos[:k].float().cpu().clone())
                 extras.append(extra_of(sim, a.clamp(-1, 1))[:k].half().cpu())
+        joints = torch.stack(joints)
         for j in range(k):
             entry = {"clip": batch[j], "followed": bool(alive[j]), "frames": int(fell_at[j]),
                      "mean_m": float(dist[j] / max(float(count[j]), 1.0)),
-                     "past_range": float(past[j] / max(float(count[j]), 1.0))}
+                     "past_range": float(past[j] / max(float(count[j]), 1.0)),
+                     "worst_range": float(worst[j]),
+                     "tremor": tremor(joints[:min(int(fell_at[j]), joints.shape[0]), j].float(), sim.rate)}
             if record:
                 n = min(int(fell_at[j]), len(frames))
                 entry["qpos"] = torch.stack([f[j] for f in frames[:n]]).float().numpy()
@@ -910,6 +924,24 @@ def variants(head, refs, clip, n, seed):
     return h, np.concatenate(chunks), kinds
 
 
+TREMOR_HZ = 6.0
+TREMOR_TARGET = 0.05
+RANGE_TARGET = 0.0136
+
+
+def tremor(q, rate):
+    """The share of the power of the joints' speeds above `TREMOR_HZ` in the frames `q` (frames
+    by joints), as the judge measures it (`engine::judge::movement::tremor`; here by the speeds'
+    spectrum, there by a low-pass: the same to a few hundredths). 0 for under a second of frames."""
+    if q.shape[0] < 32:
+        return 0.0
+    v = (q[1:] - q[:-1]) * rate
+    v = v - v.mean(0, keepdim=True)
+    p = torch.fft.rfft(v, dim=0).abs().pow(2).sum(1)
+    f = torch.fft.rfftfreq(v.shape[0], 1.0 / rate).to(p.device)
+    return float(p[f > TREMOR_HZ].sum() / p.sum().clamp(min=1e-12))
+
+
 def summary(results, names=None):
     if not results:
         return {"clips": 0}
@@ -920,6 +952,12 @@ def summary(results, names=None):
     if "past_range" in results[0]:
         # The ball joints' distances past the body's ranges, summed, on average over the frames.
         out["past_range_rad"] = sum(r["past_range"] * r["frames"] for r in results) / max(frames, 1)
+    if "tremor" in results[0]:
+        # The phase's check, as far as the simulator knows it: the share of clips whose worst
+        # joint stays in the judge's range target, and whose tremor is in its target.
+        out["range_in_target"] = sum(r["worst_range"] <= RANGE_TARGET for r in results) / len(results)
+        out["tremor"] = sum(r["tremor"] * r["frames"] for r in results) / max(frames, 1)
+        out["tremor_in_target"] = sum(r["tremor"] <= TREMOR_TARGET for r in results) / len(results)
     if names is not None:
         groups = {}
         for r in results:

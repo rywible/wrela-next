@@ -29,7 +29,7 @@
 use clips::clips::{read_all, write_all}
 use engine::body::body::{Body, Pose}
 use engine::body::fit::{Aim, aim_floor, aim_frame, aim_point, fit}
-use engine::body::joint::{Frame, vector_of_turn}
+use engine::body::joint::{Frame, numbers_of, vector_of_turn}
 use std::collections::Vec
 use std::hash::sha256::{hex, sha256}
 use std::io::print
@@ -256,6 +256,8 @@ struct Target: Copy {
     shank: u32,
     foot: u32,
     foot_right: u32,
+    hand_left: u32,
+    hand_right: u32,
 }
 
 fn target(body: str) -> Target {
@@ -267,6 +269,8 @@ fn target(body: str) -> Target {
             shank: hs::SHANK_LEFT,
             foot: hs::FOOT_LEFT,
             foot_right: hs::FOOT_RIGHT,
+            hand_left: hs::HAND_LEFT,
+            hand_right: hs::HAND_RIGHT,
         }
     } else {
         Target {
@@ -276,6 +280,8 @@ fn target(body: str) -> Target {
             shank: cs::SHIN_LEFT,
             foot: cs::FOOT_LEFT,
             foot_right: cs::FOOT_RIGHT,
+            hand_left: cs::HAND_LEFT,
+            hand_right: cs::HAND_RIGHT,
         }
     }
 }
@@ -636,7 +642,7 @@ fn import_into<const S: u32, const D: u32, const P: u32>(
         let apart = if length(cap) < 1.0e-6 || length(ours) < 1.0e-6 { 0.0 } else {
             acos(clamp(dot(normalize(ours), normalize(cap)), -1.0, 1.0))
         }
-        let turn = if seg == t.pelvis || apart < 0.349066 {
+        let turn = if seg == t.pelvis || apart < 1.0e-4 {
             Quat::identity()
         } else { shortest_arc(normalize(ours), normalize(cap)) }
         // Calibrated: the bone's turn in the frame of standing undone, that frame's heading kept.
@@ -711,8 +717,63 @@ fn import_into<const S: u32, const D: u32, const P: u32>(
     w.write_u32(D)
     w.write_u32(n)
     w.write_u32(bitcast_u32(RATE))
+    // An arm's places are aimed from the body's own shoulder, not the capture's: each mapped
+    // segment of an arm that is aimed at a place (an elbow, a hand) has its `anchor`, the nearest
+    // mapped segment above it on the arm that is aimed by its turn alone (the upper arm), and its
+    // place is the anchor's place in the body plus the capture's offset from the anchor's bone,
+    // scaled by the lengths of the two arms between them. A performer's spine is not the body's
+    // (CeTI's neck is 68 cm over its hips where the body's is 59, its shoulders carried higher
+    // still): aimed at the capture's own places, the hands were 0.2 to 0.4 m short of them and the
+    // arm lost its bones' shape to reach.
+    var anchor: Vec<u32> = Vec::new()
+    var arm_scale: Vec<f32> = Vec::new()
+    for i in 0..ms.len() {
+        let sg = ms[i].segment
+        let on_arm = (body.above(sg, t.hand_left) != body.above(sg, t.hand_right)) ||
+            body.above(t.hand_left, sg) || body.above(t.hand_right, sg)
+        var found = NONE
+        var ours = 0.0
+        if on_arm && ms[i].aim != TURN {
+            var x = sg
+            while x != 0 && x != NONE && found == NONE {
+                let parent = body.segments[x].joint.parent
+                ours += length(at0[x].t - at0[parent].t)
+                for k in 0..ms.len() {
+                    let pk = ms[k].segment
+                    let arm_k = body.above(pk, t.hand_left) != body.above(pk, t.hand_right)
+                    if pk == parent && ms[k].aim == TURN && arm_k {
+                        found = k
+                    }
+                }
+                x = parent
+            }
+        }
+        var scale = s
+        if found != NONE {
+            // The capture's length between the two bones, along its own tree.
+            var theirs = 0.0
+            var b = idx[i]
+            var reached = false
+            while b != NONE && !reached {
+                if b == idx[found] {
+                    reached = true
+                } else {
+                    theirs += length(bvh.bones[b].offset) * u
+                    b = bvh.bones[b].parent
+                }
+            }
+            if reached && theirs > 1.0e-4 {
+                scale = ours / theirs
+            } else {
+                found = NONE
+            }
+        }
+        anchor.push(found)
+        arm_scale.push(scale)
+    }
     var places: Vec<vec3> = Vec::new()
     var turns: Vec<Quat> = Vec::new()
+    var targets: Vec<vec3> = Vec::filled(ms.len(), vec3(0.0))
     var prev = rest
     var dist_sum = 0.0
     var dist_n = 0.0
@@ -724,6 +785,41 @@ fn import_into<const S: u32, const D: u32, const P: u32>(
         let t_cap = f32(j) / RATE / k
         let f = min(first + u32(round(t_cap / bvh.frame_time)), last)
         posed(bvh, f, mut places, mut turns)
+        // Where the frame's fit starts: the frame before, its root where the capture has its
+        // pelvis now and its legs (each mapped segment at or below a thigh) turned as their bones
+        // are (each joint's numbers nearest that turn, in its range, parents first); and in the
+        // first frame every mapped segment so. Started from the frame before alone, four steps a
+        // frame, the fit trailed a fast capture (CeTI's fast walk: the root by up to 0.9 m, the
+        // feet held back and the body laid out forward, its 32 clips 450 mm from their capture on
+        // average; with the root alone set, its feet still 0.23 m behind); started from the body at
+        // rest, the first frame kept a wrong basin (100STYLE's crouched styles stood with straight
+        // knees, leaning 0.4 m past their ankles, for the whole clip). (The arms too turned as
+        // their bones each frame left the hands 0.2 to 0.4 m low at any number of steps: an arm
+        // keeps the frame before's compromise between its bones' turns and its hand's place.)
+        var start = prev
+        start.root = Frame {
+            q: turns[idx[0]].mul(rest_turn[0]).mul(at0[t.pelvis].q),
+            t: places[idx[0]] * (u * s) + vec3(0.0, lift, 0.0),
+        }
+        for sg in 1..S {
+            for i in 0..ms.len() {
+                let leg = body.above(sg, t.foot) || body.above(sg, t.foot_right) ||
+                    body.above(t.foot, sg) || body.above(t.foot_right, sg)
+                if (j != 0 && !leg) || ms[i].segment != sg {
+                    continue
+                }
+                let jt = body.segments[sg].joint
+                let at = body.places(start)
+                let want = turns[idx[i]].mul(rest_turn[i]).mul(at0[sg].q)
+                let local = at[jt.parent].q.mul(jt.at.q).inverse().mul(want)
+                body.set_numbers(mut start, sg, jt.clamped(numbers_of(jt.kind, local)))
+            }
+        }
+        // Every part above the floor too, each end's centre its radius above it (a sphere's lowest
+        // point at any turn): a body that lies or crawls rests on the floor, not in it (the soles
+        // alone held, ACCAD's lying clip went 170 mm into it). Only the ends within 0.3 m of the
+        // floor where the fit starts: no step of a frame's fit brings a higher one down to it.
+        let at_start = body.places(start)
         var aims: Vec<Aim> = Vec::new()
         for i in 0..ms.len() {
             borrow m = ms[i]
@@ -731,13 +827,27 @@ fn import_into<const S: u32, const D: u32, const P: u32>(
             // Turned from its rest as the capture's bone turned from its own (both at rest in
             // a T-pose, facing +z, +x their left).
             let q = turns[b].mul(rest_turn[i]).mul(at0[m.segment].q)
-            let p = places[b] * (u * s) + vec3(0.0, lift, 0.0)
+            var p = places[b] * (u * s) + vec3(0.0, lift, 0.0)
+            if anchor[i] != NONE {
+                let k = anchor[i]
+                p = at_start[ms[k].segment].t + (places[b] - places[idx[k]]) * (u * arm_scale[i])
+            }
+            targets[i] = p
             if m.aim == BOTH {
                 let place = if m.segment == t.pelvis { 2.0 } else { 1.0 }
                 aims.push(aim_frame(m.segment, Frame { q, t: p }, place, 0.3))
             } else if m.aim == PLACE {
                 aims.push(aim_point(m.segment, vec3(0.0), p, 1.0))
             } else {
+                // An arm's anchor (its upper arm) is held to its bone's turn lightly: its elbow's
+                // place gives its direction, and its roll about itself, which a bone's direction
+                // at rest cannot tell (so the capture's is no guide to it), is the hand's to set.
+                var is_anchor = false
+                for k in 0..ms.len() {
+                    if anchor[k] == i {
+                        is_anchor = true
+                    }
+                }
                 aims.push(
                     Aim {
                         segment: m.segment,
@@ -745,7 +855,7 @@ fn import_into<const S: u32, const D: u32, const P: u32>(
                         at: p,
                         place: 0.0,
                         turn: q,
-                        turned: 0.3,
+                        turned: if is_anchor { 0.05 } else { 0.3 },
                         axes: vec3(1.0),
                         floor: false,
                     },
@@ -758,29 +868,23 @@ fn import_into<const S: u32, const D: u32, const P: u32>(
         for sole in soles {
             aims.push(aim_floor(sole.segment, sole.point, 0.0, SOLE))
         }
-        // Every part above the floor too, each end's centre its radius above it (a sphere's lowest
-        // point at any turn): a body that lies or crawls rests on the floor, not in it (the soles
-        // alone held, ACCAD's lying clip went 170 mm into it).
+        // Every part above the floor too (below).
         for cone in parts {
-            aims.push(aim_floor(cone.a.on, cone.a.at, cone.ra, SOLE))
-            aims.push(aim_floor(cone.b.on, cone.b.at, cone.rb, SOLE))
-        }
-        if j == 0 {
-            // The pelvis's first turn as its aim will have it (its rest's turn too: a calibrated
-            // source's is no turn of the body).
-            prev.root = Frame {
-                q: turns[idx[0]].mul(rest_turn[0]).mul(at0[t.pelvis].q),
-                t: places[idx[0]] * (u * s) + vec3(0.0, lift, 0.0),
+            if at_start[cone.a.on].apply(cone.a.at).y - cone.ra < 0.3 {
+                aims.push(aim_floor(cone.a.on, cone.a.at, cone.ra, SOLE))
+            }
+            if at_start[cone.b.on].apply(cone.b.at).y - cone.rb < 0.3 {
+                aims.push(aim_floor(cone.b.on, cone.b.at, cone.rb, SOLE))
             }
         }
-        let fr = fit(body, aims, prev, if j == 0 { FIRST_STEPS } else {
+        let fr = fit(body, aims, start, if j == 0 { FIRST_STEPS } else {
             c.steps
         }, still: if j == 0 { 0.001 } else { STILL })
         prev = fr.pose
         // How far each mapped joint is from the scaled capture's.
         let at = body.places(prev)
         for i in 0..ms.len() {
-            let e = length(at[ms[i].segment].t - places[idx[i]] * (u * s) - vec3(0.0, lift, 0.0))
+            let e = length(at[ms[i].segment].t - targets[i])
             dist_sum += e
             dist_n += 1.0
             by_bone[i] += e
@@ -1204,9 +1308,19 @@ pub fn tool() -> u32 {
     let from = if a.len() > 2 { a[2].as_str().parse_u32().unwrap_or(0) } else { 0 }
     let count = if a.len() > 3 { a[3].as_str().parse_u32().unwrap_or(100000) } else { 100000 }
     let steps = if a.len() > 4 { a[4].as_str().parse_u32().unwrap_or(STEPS) } else { STEPS }
+    // `only=NAME` (any argument): the clip of that name alone.
+    var only = String::new()
+    for x in a.clone() {
+        if x.as_str().starts_with("only=") {
+            only = String::from(x.as_str().slice(5, x.len()))
+        }
+    }
     var chosen: Vec<Clip> = Vec::new()
     for i in from..min(from + count, all_clips.len()) {
         var c = all_clips[i].clone()
+        if only.len() > 0 && c.name.as_str() != only.as_str() {
+            continue
+        }
         c.steps = steps
         c.body = String::from(body)
         chosen.push(take c)
