@@ -225,6 +225,9 @@ pub(package) fn zero_u32_buf(buf: mut GpuBuffer<u32>, count: u32) {
 /// The most reads of a watch's counts put up at once (a read is back a few frames on).
 const WATCH_READS: u32 = 8
 
+/// The extractions read whose active bricks a batch remembers (`MeshBatch::active_recent`).
+const ACTIVE_RECENT: u32 = 8
+
 /// Whether the eye `v` is cut to from one at `at` looking along `fwd`: it jumped further than
 /// a third of its distance `near` to what it sees, or turned by more than about 25 degrees.
 fn view_cut(at: vec3, fwd: vec3, v: View, near: f32) -> bool {
@@ -575,6 +578,9 @@ pub struct MeshBatch {
     /// readback's.
     pub(package) active_hint: u32,
     pub(package) hint_total: u32,
+    /// The active bricks of the last `ACTIVE_RECENT` extractions read: a thing meshed each frame
+    /// is given chunks for the most it has had lately (`chunk_limit`), not the last alone.
+    pub(package) active_recent: Vec<u32>,
     /// The eye the latest view-dependent extraction was made for, and whether the one being made
     /// now follows a cut (`is_cut`): the latest readback's active bricks then say little of this
     /// view's, so `chunk_limit` meshes chunks for up to `CUT_BRICKS`.
@@ -592,6 +598,12 @@ pub struct MeshBatch {
     /// each frame, though nothing it meshes has changed, until one is whole, and till then what
     /// it draws may have holes.
     pub budget_short: bool,
+    /// Whether an extraction's counts were read since the batch was last synced: the sync to come
+    /// may cut it anew by them (a reach grown on the share they say), so it is not settled till
+    /// that sync has had them. (Taken as settled the frame its counts came, the carved table was
+    /// judged at its first cut's reach, the growth a frame off: six pixels of it three and four
+    /// pixels outside its outline.)
+    pub(package) read_since_sync: bool,
     /// The last extraction's sizes, for the audit's word on an unsettled eye: the bricks it
     /// wanted, what a frame's whole budget meshes, and the indirect dispatches a chunk makes.
     pub(package) last_wanted: u32,
@@ -702,6 +714,11 @@ pub struct MeshBatch {
     pub(package) kept_gen: u32,
     /// The most any cut of this batch was read to keep of its candidates (`ring_density`).
     pub(package) density_most: f32,
+    /// The candidates of the levels of the cut that reach the eye's surface (`rings::
+    /// grid_reached`): this sync's, the last extraction's, and the pending readback's.
+    pub(package) lod_reached: u32,
+    pub(package) extract_reached: u32,
+    pub(package) poll_reached: u32,
     /// The least reach a cut for this eye was read to keep more than the room at (2 where none
     /// was since the eye's last jump): a reach grows to less (`ring_reach`), so a growth its
     /// model had wrong is not tried again each readback.
@@ -730,10 +747,6 @@ pub struct MeshBatch {
     /// Whether the last run took fewer slices than it asked, the frame's watches' dispatches spent
     /// (`ExtractScratch::watch_take`): it is run again.
     pub(package) watch_capped: bool,
-    /// Whether the mesh has not settled since the eye was last cut to: its watches are sized for
-    /// whole lists till it has (each extraction of a cut's first frames changes the lists by more
-    /// than the last counts say, and a run's counts are four frames coming).
-    pub(package) watch_settling: bool,
     /// The runs read that were short of their lists, and the cells they left unasked (since
     /// `MeshSight::reset_lateness`): which batch's, where the gate's count is of them all.
     pub watch_short_runs: u32,
@@ -1041,6 +1054,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         lod_fit: Vec::new(),
         lod_fit_total: 0,
         budget_short: false,
+        read_since_sync: false,
         last_wanted: 0,
         last_alone: 0,
         last_per_chunk: 0,
@@ -1091,6 +1105,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         poll_caps: vec4u(0, 0, 0, 0),
         cell_scale: 1.0,
         active_hint: 0,
+        active_recent: Vec::new(),
         hint_total: 0,
         extract_total: 0,
         extract_limit: 0,
@@ -1144,6 +1159,9 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         kept_read: 0,
         kept_gen: 0,
         density_most: 0.0,
+        lod_reached: 0,
+        extract_reached: 0,
+        poll_reached: 0,
         reach_over: 2.0,
 
         watch_slots_cap: 1,
@@ -1159,7 +1177,6 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         watch_polled: 0,
         watch_from: 0,
         watch_capped: false,
-        watch_settling: false,
         watch_short_runs: 0,
         watch_unasked: 0,
         eye_near: 0.0,
@@ -1356,7 +1373,14 @@ impl MeshBatch {
             self.polled_gen == self.gen &&
             self.overflowed() == 0 &&
             !self.budget_short &&
+            !self.read_since_sync &&
             (!self.watched || (!self.watch_short && !self.watch_capped && self.watch_read == self.watch_run))
+    }
+
+    /// A sync of this batch is about to be made, with every count read so far
+    /// (`read_since_sync`): what drives a batch without a `MeshSight` says so.
+    pub fn synced(mut self) {
+        self.read_since_sync = false
     }
 
     /// Why `settled` doesn't hold, in words (`""` when it does): what the audit says of an eye it
@@ -1369,7 +1393,7 @@ impl MeshBatch {
             Some(_) => false,
             None => true,
         }
-        f"built {self.built}, read back {read}, generation read {self.polled_gen} of {self.gen}, overflow bits {self.overflowed()}, budget short {self.budget_short} (wanted {self.last_wanted} bricks, a frame alone meshes {self.last_alone}, {self.last_per_chunk} dispatches a chunk), outline short {self.watch_short} (its dispatches spent {self.watch_capped}), its run {self.watch_run} read {self.watch_read} (last counts {self.watch_hint.x}, {self.watch_hint.y}, {self.watch_hint.z} of {self.watch_taken.x}, {self.watch_taken.y}, {self.watch_taken.z} taken)"
+        f"built {self.built}, read back {read}, generation read {self.polled_gen} of {self.gen}, overflow bits {self.overflowed()}, budget short {self.budget_short} (wanted {self.last_wanted} bricks, a frame alone meshes {self.last_alone}, {self.last_per_chunk} dispatches a chunk), counts read since its sync {self.read_since_sync}, outline short {self.watch_short} (its dispatches spent {self.watch_capped}), its run {self.watch_run} read {self.watch_read} (last counts {self.watch_hint.x}, {self.watch_hint.y}, {self.watch_hint.z} of {self.watch_taken.x}, {self.watch_taken.y}, {self.watch_taken.z} taken)"
     }
 
     /// Draws nothing until synced again, and forgets what it meshed, so the next sync meshes its
@@ -1460,9 +1484,6 @@ impl MeshBatch {
         if !self.watched || !self.built || self.cpu_brick_slots == 0 {
             return
         }
-        if self.watch_settling && self.settled() {
-            self.watch_settling = false
-        }
         let eye = vec4(v.at, v.pixel())
         if eye == self.watch_eye &&
             v.forward == self.watch_fwd &&
@@ -1481,7 +1502,6 @@ impl MeshBatch {
         if view_cut(self.watch_eye.xyz, self.watch_fwd, v, self.eye_near) {
             self.watch_known = false
             self.watch_from = self.watch_run.wrapping_add(1)
-            self.watch_settling = true
         }
         self.watch_eye = eye
         self.watch_fwd = v.forward
@@ -1765,7 +1785,7 @@ impl MeshBatch {
     /// before any count is read.
     fn watch_slices(self, hint: u32, slice: u32, cap: u32) -> u32 {
         let most = thin_most(slice, cap)
-        if !self.watch_known || self.watch_settling {
+        if !self.watch_known {
             return most
         }
         let want = hint + hint / 4 + slice / 16
@@ -2218,6 +2238,7 @@ impl MeshBatch {
             }
             return
         }
+        self.read_since_sync = true
         self.stat_reads += 1
         self.stat_bricks += c.z
         var ovf = gpu_ovf
@@ -2261,6 +2282,13 @@ impl MeshBatch {
                 self.built = false
             }
         }
+        var recent: Vec<u32> = Vec::new()
+        let from = if self.active_recent.len() >= ACTIVE_RECENT { 1 } else { 0 }
+        for k in from..self.active_recent.len() {
+            recent.push(self.active_recent[k])
+        }
+        recent.push(c.z)
+        self.active_recent = take recent
         self.active_hint = c.z
         // The share of the read cut's candidates its cull kept: a pool's hits and misses (its
         // active count is the drawn cut's, which an update that drew nothing new is not).
@@ -2270,7 +2298,10 @@ impl MeshBatch {
             // (The share as read, a brick at least: held to no less than a 64th, the arena's
             // near things, whose cull kept 0.7% of their rings, were taken to keep 1.6%, and
             // stood a step short of the rule's reach with room for it.)
-            self.ring_density = min(f32(max(kept, 1)) / f32(self.poll_total), 1.0)
+            // Of the candidates of the levels that reach the surface (`poll_reached`), where the
+            // cut said them: what `ring_reach` multiplies it by.
+            let of = if self.poll_reached > 0 { self.poll_reached } else { self.poll_total }
+            self.ring_density = min(f32(max(kept, 1)) / f32(of), 1.0)
             self.density_reach = self.poll_reach
             self.kept_read = kept
             self.kept_gen = self.poll_gen
@@ -2345,6 +2376,7 @@ impl MeshBatch {
                 self.poll_real = self.gen_real
                 self.poll_scale = self.extract_scale
                 self.poll_total = self.extract_total
+                self.poll_reached = self.extract_reached
                 self.poll_reach = self.ring_reach
                 self.poll_limit = self.extract_limit
                 self.poll_caps = vec4u(
@@ -2434,7 +2466,14 @@ impl MeshBatch {
         if total > self.hint_total + self.hint_total / 4 {
             return hard_cap
         }
-        let want = self.active_hint + self.active_hint / 2 + CHUNK_BRICKS
+        // The most it has had lately, not the last read alone: the bolt as it strikes has
+        // 4,000 bricks one frame and 8,600 the next, was given chunks for 8,192 by the frame
+        // before, and its frame was drawn with 739 pixels of it missing.
+        var most = self.active_hint
+        for k in 0..self.active_recent.len() {
+            most = max(most, self.active_recent[k])
+        }
+        let want = most + most / 2 + CHUNK_BRICKS
         min(hard_cap, ((want + CHUNK_BRICKS - 1) / CHUNK_BRICKS) * CHUNK_BRICKS)
     }
 
@@ -2917,11 +2956,18 @@ impl MeshBatch {
         // smaller); a batch meshed in place, where a cut too large is drawn with bricks missing,
         // the most any of its cuts was read to keep (a walking creature's near eye kept 5 in 100
         // of a cut sized for 1).
-        let jumped = self.active_hint > 0 &&
-            (length(v.at - self.lod_view_at) > 0.35 * max(d_surf, 0.01) ||
-                dot(v.forward, self.lod_view_fwd) < 0.90)
+        // (Jumped: moved far, not turned. Rings by distance alone are the same cut whichever way
+        // the eye looks, and what was read of it holds: a turn taken as a jump put each second
+        // eye of the audit's pairs back to its most cautious reach, to grow again.)
+        let jumped = self.active_hint > 0 && length(v.at - self.lod_view_at) > 0.35 * max(d_surf, 0.01)
         let share_read = if self.ring_density > 0.0 { self.ring_density } else { scratch.density_prior }
-        let share = if jumped && !self.pooled { max(share_read, self.density_most) } else { share_read }
+        // An eye jumped to is one no cut was read for: its share is taken as the most this batch
+        // was read to keep, of the candidates of the levels that reach its surface (`reached`
+        // below: a share of every level's, the near ones that hold nothing among them, said
+        // 3.8 times too little of the walking creature seen from 9 cm after eyes metres off, its
+        // cut was 124,022 bricks where 65,536 are meshed, and its frame drew 133,873 pixels of
+        // sky).
+        let share = if jumped { max(share_read, self.density_most) } else { share_read }
         if jumped {
             self.reach_over = 2.0
         }
@@ -2936,8 +2982,10 @@ impl MeshBatch {
             share: share,
             clear: d_surf,
             last: self.ring_reach,
-            kept_last: if !jumped && self.density_reach == self.ring_reach && self.kept_gen >= self.cut_gen { f32(self.kept_read) } else { -1.0 },
+            // (What a cut at this reach was read to keep for this eye; none before any is read.)
+            kept_last: if !jumped && self.kept_gen > 0 && self.density_reach == self.ring_reach && self.kept_gen >= self.cut_gen { f32(self.kept_read) } else { -1.0 },
             over: self.reach_over,
+            unread: !jumped && self.active_hint > 0,
         )
         if self.ring_density > 0.0 {
             scratch.density_prior = 0.9 * scratch.density_prior + 0.1 * self.ring_density
@@ -2958,11 +3006,12 @@ impl MeshBatch {
         let total_bricks = built_total
         let has_seams = built_seams
         // The bricks the cut is expected to keep (the pool's room is sized by it).
-        var predicted = 0.0
+        var reached: u32 = 0
         for j in 0..grids.len() {
-            predicted += share * f32(grid_reached(grids[j], v.at, d_surf))
+            reached += grid_reached(grids[j], v.at, d_surf)
         }
-        self.cut_predicted = u32(predicted)
+        self.cut_predicted = u32(share * f32(reached))
+        self.lod_reached = reached
         self.lod_fit = grids.clone()
         self.lod_fit_total = total_bricks
         let fc = frustum_cull_none()
@@ -3048,11 +3097,11 @@ impl MeshBatch {
         if self.lod_cut {
             self.watch_known = false
             self.watch_from = self.watch_run.wrapping_add(1)
-            self.watch_settling = true
             self.cut_gen = self.gen + 1
         }
         self.lod_view_at = v.at
         self.lod_view_fwd = v.forward
+        self.extract_reached = self.lod_reached
         let fbuf = buffer_of([field])
         let cut = grids.clone()
         scratch.set_grids(grids)
@@ -3328,6 +3377,10 @@ impl MeshBatch {
                 }
                 self.hash = key
                 self.still_frames = 0
+                // (The template drawn is whole: an extraction the frame's budget cut short
+                // before is asked for no longer. Left standing, the flag held the glass
+                // barrage's shards unsettled for as long as their eye stood.)
+                self.budget_short = false
                 return
             }
             let template = fields[best_skin_i]
@@ -3420,6 +3473,10 @@ impl MeshBatch {
                 }
                 self.hash = key
                 self.still_frames = 0
+                // (The template drawn is whole: an extraction the frame's budget cut short
+                // before is asked for no longer. Left standing, the flag held the glass
+                // barrage's shards unsettled for as long as their eye stood.)
+                self.budget_short = false
                 return
             }
             let template = fields[best_i]

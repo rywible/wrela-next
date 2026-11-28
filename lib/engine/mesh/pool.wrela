@@ -905,6 +905,9 @@ pub struct BrickPool {
     /// Whether the last update read drew nothing new with every slot taken: if the drawn cut leaves
     /// too little to free (`run_pool_update`), the next update starts the pool afresh.
     pub(package) jammed: bool,
+    /// Whether the last update read was jammed though it rebased (`took_pool_counts`): the next
+    /// starts the pool afresh.
+    pub(package) stuck: bool,
     /// The bricks of its last read update's cut the cull kept, its hits and misses.
     pub(package) cut_kept: u32,
     pub(package) rebase_gen: u32,
@@ -1054,6 +1057,7 @@ pub fn brick_pool() -> BrickPool {
         chunks: 0,
         rebase_next: false,
         jammed: false,
+        stuck: false,
         cut_kept: 0,
         rebase_gen: 0,
         r: rebase_buffers(),
@@ -1113,7 +1117,17 @@ impl MeshBatch {
         gpu_ovf: u32,
     ) {
         let commit = c[17]
-        self.pool.jammed = commit == 0 && c[14] >= self.pool.cap
+        // (`GATE_NONE`: the test was of 0, which no update says, and no pool was ever found
+        // jammed.)
+        self.pool.jammed = commit == GATE_NONE && c[14] >= self.pool.cap
+        // An update that freed all it could by age (it rebased) and still drew nothing new, every
+        // slot taken: the drawn cut and the new one do not fit together, however the rest is
+        // freed (a cut to an eye that shares little with the last: the stack's two cuts of 36,000
+        // bricks, 3,808 of them shared, in 65,536 slots, tried again every frame for as long as
+        // the eye stood). The pool starts afresh for the new cut.
+        if self.pool.jammed && self.pool.rebase_gen == self.poll_gen {
+            self.pool.stuck = true
+        }
         // A voided update (`pool_void`): room is made for its misses before they are meshed again,
         // by freeing slots by age where there are any to free, else by a larger arena of vertices
         // (a rebase's too), else (the indices' or exact cells' arenas, at their most) by emptying.
@@ -1136,9 +1150,6 @@ impl MeshBatch {
             }
         }
         self.pool.cut_kept = c[10] + c[11]
-        if commit == 0 {
-            return
-        }
         self.pool.hits += c[10]
         self.pool.misses += c[11]
         var recent: Vec<u32> = Vec::new()
@@ -1836,8 +1847,9 @@ impl MeshBatch {
         // pool its last read found full, drawing nothing new, with none such to free, starts
         // afresh: the drawn cut leaves no room for the bricks of the cut that would replace it.
         let freeable = self.pool.used_slots > self.active_hint + self.pool.cap / 8
-        let warm = same_space && !(self.pool.jammed && !freeable)
+        let warm = same_space && !(self.pool.jammed && !freeable) && !self.pool.stuck
         self.pool.jammed = false
+        self.pool.stuck = false
         self.pool.spoiled = false
         if !warm && keeps {
             // Emptied after all (jammed): its arenas are made anew at the sizes asked.
