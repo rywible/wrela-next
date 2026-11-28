@@ -15,11 +15,14 @@ use engine::matter::verify::prove_field_facts
 use sea::swells
 use kit::substances::pbr::{basalt, dielectric, emissive, glass, metal, sand, stone}
 use std::cmp::Eq
+use std::derive::Box3
 use std::field::{
-    Bound, Field, FieldFacts, Rotate, RoundCone, Scale, Surface, Translate, Union, With,
-    box_distance, cylinder_distance, hash_u32, meets, round_cone, smin, wave_cos, wave_sin,
+    Bound, Deform, Deformed, Field, FieldFacts, Rotate, RoundCone, Scale, Surface, Translate, Union,
+    With, box_distance, cylinder_distance, deformed, hash_u32, meets, round_cone, smin, wave_cos,
+    wave_sin,
 }
 use std::hash::{StateHash, state_hash}
+use std::io::print
 
 /// Exact SDF of a tapered capsule/spear segment from `a` to `b` with radii `ra` -> `rb`.
 fn sd_spear(p: vec3, a: vec3, b: vec3, ra: f32, rb: f32) -> f32 {
@@ -378,17 +381,6 @@ const ARENA_FLAME_FACTS: FieldFacts = prove_field_facts(
 // 4. Golden Arcane Parry Ward Arc + Rival Sapphire Casting Orb
 // =================================================================================================
 
-pub struct ParryArc: Copy + GpuData + Eq + StateHash {
-    pub time: f32,
-    pub pad0: f32,
-    pub pad1: f32,
-    pub pad2: f32,
-}
-
-pub fn parry_arc(time: f32) -> ParryArc {
-    ParryArc { time, pad0: 0.0, pad1: 0.0, pad2: 0.0 }
-}
-
 /// Where the glass strikes the ward: the centre of its face, which the tether and the sand meet.
 const WARD_IMPACT: vec3 = vec3(-0.35, 1.38, 0.20)
 /// The ward's facing (unit, in the ground plane): toward the rival, turned 40° toward the eye so
@@ -412,79 +404,239 @@ fn ward_way(v: vec3) -> vec3 {
     WARD_FACING * v.x + vec3(0.0, v.y, 0.0) + WARD_ACROSS * v.z
 }
 
-impl Surface for ParryArc {
+/// The ward's shell, still: a spherical shell around the point of impact, clipped to its face.
+/// Its light ripples with `time` (`channels`); its shape reads none of it, and moves only by its
+/// ripple (`WardRipple`, `ParryArc`), so it is meshed once.
+pub struct WardShell: Copy + GpuData + Eq + StateHash {
+    pub time: f32,
+    pub pad0: f32,
+    pub pad1: f32,
+    pub pad2: f32,
+}
+
+/// The ward as it waves: its shell moved by its ripple.
+pub type ParryArc = Deformed<WardShell, WardRipple>
+
+pub fn parry_arc(time: f32) -> ParryArc {
+    deformed(WardShell { time, pad0: 0.0, pad1: 0.0, pad2: 0.0 }, WardRipple { time, pad0: 0.0, pad1: 0.0, pad2: 0.0 })
+}
+
+/// The ward's shell's half thickness, and its ripple's height and waves along its face (rad a
+/// metre of the face, as `y` and `z` at the shell's radius) and in time (rad/s).
+const WARD_HALF: f32 = 0.036
+const RIPPLE_AMP: f32 = 0.03
+const RIPPLE_KY: f32 = 5.0
+const RIPPLE_KZ: f32 = 4.0
+const RIPPLE_WY: f32 = 6.5
+const RIPPLE_WZ: f32 = 4.0
+
+impl Surface for WardShell {
     /// Its evaluation's work, held at build (`tools/layers` rule 7: every field states one, at
     /// most `FIELD_WORK_MOST`).
-    @budget(work: 160)
+    @budget(work: 120)
     fn distance(self, p: vec3) -> f32 {
-        // Sculpted curved golden crescent parry ward: a clipped spherical shell around `WARD_IMPACT`.
         let q = ward_local(p)
-        let r = length(q)
-        let wave = 0.03 * sin(q.y * 5.0 - self.time * 6.5) * cos(q.z * 4.0 + self.time * 4.0)
-        let shell = abs(r - (WARD_RADIUS + wave)) - 0.036
+        let shell = abs(length(q) - WARD_RADIUS) - WARD_HALF
         let clip_x = 0.68 - q.x
         let clip_y = abs(q.y) - 1.05
         let clip_z = abs(q.z) - 1.12
-        let shield = max(shell, max(clip_x, max(clip_y, clip_z)))
-
-        // Concentric golden impact ripple ring standing just proud of the parry face.
-        let r_yz = length(vec2(q.y, q.z))
-        let ring_r = 0.64 + 0.07 * sin(self.time * 4.5)
-        let ring_d = length(vec2(r_yz - ring_r, q.x - 1.18)) - 0.036
-
-        // Focused golden spell tether from the hero caster's raised wand into the parry arc core.
-        let beam = sd_spear(
-            p,
-            vec3(-2.45, 1.24, 0.30),
-            WARD_IMPACT - vec3(0.01, 0.0, 0.0),
-            ra: 0.022,
-            rb: 0.048,
-        )
-        smin(min(shield, ring_d), beam, 0.07)
+        max(shell, max(clip_x, max(clip_y, clip_z)))
     }
 
     fn bound(self) -> Bound {
-        Bound { centre: vec3(-1.0, 1.38, 0.10), radius: 2.35, slope: 0.5 }
+        Bound { centre: WARD_CENTRE + ward_way(vec3(1.0, 0.0, 0.0)), radius: 1.6, slope: 0.5 }
     }
 
-    /// The shell's wave tilts it by up to sqrt(0.15² + 0.12²) = 0.19, which can add to its
-    /// radial unit: 1.19. The clips, ring and tether are exact (the tether's taper is 0.026 over
-    /// 2.1 m).
+    /// A shell's distance and planes': exact.
     fn lipschitz(self, _near: f32) -> f32 {
-        1.2
+        1.0
     }
 }
 
-impl Field<Substance> for ParryArc {
+/// The light of the ward and what it holds, at `q` in its frame (`ward_local`) `time` s in: two
+/// ripples racing outward from the point of impact, thin white-hot gold filaments (bright enough
+/// to light the arena) over a dark smoky-amber body, a hot core where the glass strikes and a
+/// warm rim, so the ward reads as carved light, not a flat slab.
+fn ward_light(q: vec3, time: f32) -> Substance {
+    let r_face = length(vec2(q.y, q.z))
+    var rings = 0.0
+    for k in 0..2 {
+        let front = fract(time * 0.55 + f32(k) * 0.5) * 1.15
+        let d = (r_face - front) / 0.055
+        rings += exp(-d * d) * (1.0 - smoothstep(0.85, 1.15, front))
+    }
+    let core = 1.0 - smoothstep(0.0, 0.30, r_face)
+    let rim = smoothstep(0.90, 1.16, r_face)
+    let body = vec3(0.26, 0.085, 0.012)
+    let filament = vec3(13.5, 6.2, 1.15) * rings
+    let hot = vec3(15.0, 7.6, 1.7) * (core * core)
+    let edge = vec3(1.5, 0.52, 0.06) * rim
+    emissive(vec3(0.42, 0.25, 0.07), body + filament + hot + edge, roughness: 0.14)
+}
+
+impl Field<Substance> for WardShell {
     fn channels(self, p: vec3) -> Substance {
-        let q = ward_local(p)
-        let r_face = length(vec2(q.y, q.z))
-        // Two ripples racing outward from the point of impact: thin white-hot gold filaments
-        // (bright enough to light the arena) over a dark smoky-amber body, a hot core where the
-        // glass strikes and a warm rim, so the ward reads as carved light, not a flat slab.
-        var rings = 0.0
-        for k in 0..2 {
-            let front = fract(self.time * 0.55 + f32(k) * 0.5) * 1.15
-            let d = (r_face - front) / 0.055
-            rings += exp(-d * d) * (1.0 - smoothstep(0.85, 1.15, front))
-        }
-        let core = 1.0 - smoothstep(0.0, 0.30, r_face)
-        let rim = smoothstep(0.90, 1.16, r_face)
-        let body = vec3(0.26, 0.085, 0.012)
-        let filament = vec3(13.5, 6.2, 1.15) * rings
-        let hot = vec3(15.0, 7.6, 1.7) * (core * core)
-        let edge = vec3(1.5, 0.52, 0.06) * rim
-        emissive(vec3(0.42, 0.25, 0.07), body + filament + hot + edge, roughness: 0.14)
+        ward_light(ward_local(p), self.time)
     }
 
     fn field_facts(self) -> FieldFacts {
-        PARRY_ARC_FACTS
+        WARD_SHELL_FACTS
     }
 }
 
-const PARRY_ARC_FACTS: FieldFacts = prove_field_facts(
-    ParryArc { time: 0.0, pad0: 0.0, pad1: 0.0, pad2: 0.0 },
-)
+const WARD_SHELL_FACTS: FieldFacts = prove_field_facts(WardShell { time: 0.0, pad0: 0.0, pad1: 0.0, pad2: 0.0 })
+
+/// The ward's ripple: each point of its frame moved out from the shell's centre by the share
+/// `1 + w(u) / R` of its distance, where `u` is its way from the centre and `w` the ripple's height
+/// over the face there (`RIPPLE_*`): at the shell's radius `R`, the shell lifted by `w`. A point
+/// keeps its way, so the inverse divides by the same share, exactly.
+pub struct WardRipple: Copy + GpuData + Eq + StateHash {
+    pub time: f32,
+    pub pad0: f32,
+    pub pad1: f32,
+    pub pad2: f32,
+}
+
+impl WardRipple {
+    /// The share at the way `u` (unit, in the ward's frame).
+    fn share(self, u: vec3) -> f32 {
+        let w = RIPPLE_AMP * sin(WARD_RADIUS * RIPPLE_KY * u.y - self.time * RIPPLE_WY) *
+            cos(WARD_RADIUS * RIPPLE_KZ * u.z + self.time * RIPPLE_WZ)
+        1.0 + w / WARD_RADIUS
+    }
+
+    /// `p`, its offset from the shell's centre scaled by the share at its way (read in the
+    /// ward's frame), or unscaled by it (`inverse`). (Scaled in the world's frame, not taken there
+    /// from the ward's: the frame's axes are a ten-thousandth off unit, and its round trip moved a
+    /// point half a millimetre.)
+    fn scaled(self, p: vec3, inverse: bool) -> vec3 {
+        let o = p - WARD_CENTRE
+        let r = length(o)
+        // (At the centre and past any distance a float holds, the way is none: the point stays.)
+        if !(r > 1.0e-6 && r < 1.0e18) {
+            return p
+        }
+        // (Over `max(|q|, 1 mm)`, the same past it: a range over a box holding the centre stays a
+        // range.)
+        let q = ward_local(p)
+        let k = self.share(q / max(length(q), 1.0e-3))
+        WARD_CENTRE + (if inverse { o / k } else { o * k })
+    }
+}
+
+impl Deform for WardRipple {
+    fn forward(self, p: vec3) -> vec3 {
+        self.scaled(p, inverse: false)
+    }
+
+    fn inverse(self, p: vec3) -> vec3 {
+        self.scaled(p, inverse: true)
+    }
+
+    /// The inverse is `q / k(u)`: across `u` by `1 / k`, and along the face by at most the
+    /// ripple's slope over the share, `|grad_u k| / k^2` with `|grad_u k| <= A (ky + kz)` (A the
+    /// height, ky, kz its waves): at most `1 / (1 - A / R) + A (ky + kz) / (1 - A / R)^2`.
+    fn stretch(self) -> f32 {
+        let low = 1.0 - RIPPLE_AMP / WARD_RADIUS
+        1.0 / low + RIPPLE_AMP * (RIPPLE_KY + RIPPLE_KZ) / (low * low)
+    }
+
+    /// A ball's points scale about the shell's centre by at most `1 + A / R` either way.
+    fn bound(self, b: Bound) -> Bound {
+        let far = length(b.centre - WARD_CENTRE) + b.radius
+        Bound { centre: b.centre, radius: b.radius + far * RIPPLE_AMP / WARD_RADIUS, slope: b.slope }
+    }
+
+    /// The points a box's points come from: within `A / (R - A)` of their distance from the
+    /// shell's centre.
+    fn box_in(self, b: Box3) -> Box3 {
+        let far = length(max(abs(b.lo - WARD_CENTRE), abs(b.hi - WARD_CENTRE)))
+        let r = vec3(far * RIPPLE_AMP / (WARD_RADIUS - RIPPLE_AMP))
+        Box3 { lo: b.lo - r, hi: b.hi + r }
+    }
+}
+
+/// The impact ripple halo standing just proud of the ward's face: a torus whose radius pulses.
+pub struct WardHalo: Copy + GpuData + Eq + StateHash {
+    pub time: f32,
+    pub pad0: f32,
+    pub pad1: f32,
+    pub pad2: f32,
+}
+
+pub fn ward_halo(time: f32) -> WardHalo {
+    WardHalo { time, pad0: 0.0, pad1: 0.0, pad2: 0.0 }
+}
+
+impl Surface for WardHalo {
+    @budget(work: 60)
+    fn distance(self, p: vec3) -> f32 {
+        let q = ward_local(p)
+        let ring_r = 0.64 + 0.07 * sin(self.time * 4.5)
+        length(vec2(length(vec2(q.y, q.z)) - ring_r, q.x - 1.18)) - 0.036
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: WARD_CENTRE + ward_way(vec3(1.18, 0.0, 0.0)), radius: 0.76, slope: 0.5 }
+    }
+
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl Field<Substance> for WardHalo {
+    fn channels(self, p: vec3) -> Substance {
+        ward_light(ward_local(p), self.time)
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        WARD_HALO_FACTS
+    }
+}
+
+const WARD_HALO_FACTS: FieldFacts = prove_field_facts(WardHalo { time: 0.0, pad0: 0.0, pad1: 0.0, pad2: 0.0 })
+
+/// The spell's tether from the hero caster's raised wand into the ward's core, still: it meets
+/// the ward's face where the glass strikes.
+pub struct WardTether: Copy + GpuData + Eq + StateHash {
+    pub time: f32,
+    pub pad0: f32,
+    pub pad1: f32,
+    pub pad2: f32,
+}
+
+pub fn ward_tether(time: f32) -> WardTether {
+    WardTether { time, pad0: 0.0, pad1: 0.0, pad2: 0.0 }
+}
+
+impl Surface for WardTether {
+    @budget(work: 60)
+    fn distance(self, p: vec3) -> f32 {
+        sd_spear(p, vec3(-2.45, 1.24, 0.30), WARD_IMPACT - vec3(0.01, 0.0, 0.0), ra: 0.022, rb: 0.048)
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: 0.5 * (vec3(-2.45, 1.24, 0.30) + WARD_IMPACT), radius: 1.1, slope: 0.5 }
+    }
+
+    /// A tapered capsule's: its taper is 0.026 over 2.1 m.
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.01
+    }
+}
+
+impl Field<Substance> for WardTether {
+    fn channels(self, p: vec3) -> Substance {
+        ward_light(ward_local(p), self.time)
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        WARD_TETHER_FACTS
+    }
+}
+
+const WARD_TETHER_FACTS: FieldFacts = prove_field_facts(WardTether { time: 0.0, pad0: 0.0, pad1: 0.0, pad2: 0.0 })
 
 /// Rival caster's cold sapphire-cyan arcane focus orb conjuring the incoming glass shard barrage:
 /// local sphere + swirling veins composed via rigid `.scale().rotate().translate()`, so the engine
@@ -825,3 +977,58 @@ fn arena_field_contracts_are_sound() {
     )
 }
 
+
+/// The ward's ripple moves its still shell's points onto its waving surface: each point of the
+/// rest shell (its two faces, over the face's ways) carried by `WardRipple::forward` is on the
+/// ward's surface to the float's rounding, `inverse` takes it back, and the normal carried
+/// (`Deform::forward_normal`) is the waving surface's own (its distance's gradient), within a
+/// hundredth of a radian: what the engine's template, meshed at rest and moved each frame
+/// (`Surface::DEFORMED`), draws is the ward as its field says.
+@test
+fn the_ward_s_ripple_carries_its_shell_onto_its_surface() {
+    var worst_d = 0.0
+    var worst_back = 0.0
+    var worst_angle = 0.0
+    var held: u32 = 0
+    for k in 0..5 {
+        let t = 0.37 * f32(k)
+        let ward = parry_arc(t)
+        for i in 0..24 {
+            for j in 0..24 {
+                // A way over the ward's face, and a point of either face of the rest shell on it.
+                let y = -0.7 + 1.4 * f32(i) / 23.0
+                let z = -0.7 + 1.4 * f32(j) / 23.0
+                let u = normalize(vec3(sqrt(max(1.0 - y * y - z * z, 0.0)), y, z))
+                for side in 0..2 {
+                    let r = WARD_RADIUS + (if side == 0 { WARD_HALF } else { -WARD_HALF })
+                    // (Scaled along its offset till its distance in the ward's frame is the face's:
+                    // on the rest shell to the float's rounding.)
+                    let guess = WARD_CENTRE + ward_way(u * r)
+                    let rest = WARD_CENTRE + (guess - WARD_CENTRE) * (r / length(ward_local(guess)))
+                    let at_rest = ward.inner.distance(rest)
+                    if abs(at_rest) > 1.0e-5 {
+                        continue
+                    }
+                    held += 1
+                    let now = ward.by.forward(rest)
+                    worst_d = max(worst_d, abs(ward.distance(now)))
+                    worst_back = max(worst_back, length(ward.by.inverse(now) - rest))
+                    let n_rest = ward_way(u) * (if side == 0 { 1.0 } else { -1.0 })
+                    let carried = ward.by.forward_normal(rest, n_rest)
+                    let e = 1.0e-4
+                    let grad = normalize(vec3(
+                        ward.distance(now + vec3(e, 0.0, 0.0)) - ward.distance(now - vec3(e, 0.0, 0.0)),
+                        ward.distance(now + vec3(0.0, e, 0.0)) - ward.distance(now - vec3(0.0, e, 0.0)),
+                        ward.distance(now + vec3(0.0, 0.0, e)) - ward.distance(now - vec3(0.0, 0.0, e)),
+                    ))
+                    worst_angle = max(worst_angle, acos(clamp(dot(carried, grad), -1.0, 1.0)))
+                }
+            }
+        }
+    }
+    print(f"ward ripple: {held} points, worst distance on its surface {worst_d} m, back {worst_back} m, normal {worst_angle} rad")
+    assert(held > 1000, "the ward's ripple's test held too few points of its shell")
+    assert(worst_d < 1.0e-5, "a rest point carried by the ward's ripple is off its surface")
+    assert(worst_back < 1.0e-5, "the ward's ripple's inverse does not take a point back")
+    assert(worst_angle < 0.01, "the ward's ripple carries a normal off its surface's")
+}

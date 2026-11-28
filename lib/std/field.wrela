@@ -420,6 +420,22 @@ pub trait Surface: Copy + GpuData {
         self.distance(p)
     }
 
+    /// Whether this surface is a rest surface moved by a smooth map (`Deformed`): its skinned
+    /// template is meshed at rest (`rest_distance_live`) and each vertex moved by the map
+    /// (`deform_point`, `deform_normal`) where a skinned body's is by its bones. A constant of
+    /// the kind.
+    const DEFORMED: bool = false
+
+    /// Where a point of the rest surface (`rest_distance_live`'s space) is now (`DEFORMED`).
+    fn deform_point(self, p: vec3) -> vec3 {
+        p
+    }
+
+    /// The normal `n` of the rest surface at `p`, where `deform_point` takes it (`DEFORMED`).
+    fn deform_normal(self, p: vec3, n: vec3) -> vec3 {
+        n
+    }
+
     /// Optional world-space dirty box modified since the previous edit epoch (e.g. a CSG cut),
     /// enabling persistent brick caches to re-extract only the affected bricks.
     fn dirty_region(self) -> Option<Box3> {
@@ -883,6 +899,141 @@ impl<C, S: Field<C>> Field<C> for Skinned<S> {
 
     fn field_facts(self) -> FieldFacts {
         self.posed.field_facts()
+    }
+}
+
+/// A smooth map that moves a surface's points and has an exact inverse (`Deformed`): a ripple,
+/// a sway, a breath. What the thing does is the map; the surface it moves is still.
+pub trait Deform: Copy + GpuData {
+    /// Where the map takes `p`, from the rest surface's space to this one.
+    fn forward(self, p: vec3) -> vec3
+
+    /// Where `p` comes from: `forward`'s inverse, exact.
+    fn inverse(self, p: vec3) -> vec3
+
+    /// The most `inverse` stretches a length (its Lipschitz constant, at least 1): a distance of
+    /// the rest surface over it is no more than the distance here.
+    fn stretch(self) -> f32
+
+    /// A ball holding where the map takes every point of the ball `b`.
+    fn bound(self, b: Bound) -> Bound
+
+    /// A box holding `inverse(p)` for every `p` in `b`: where the rest surface's range is asked.
+    fn box_in(self, b: Box3) -> Box3
+
+    /// Where the map takes the normal `n` at `p`: the plane through `p` across `n`, carried
+    /// (each side of a small triangle in it moved by `forward`), as the map's own derivative
+    /// would carry it to first order.
+    fn forward_normal(self, p: vec3, n: vec3) -> vec3 {
+        let a = if abs(n.x) < 0.9 { vec3(1.0, 0.0, 0.0) } else { vec3(0.0, 1.0, 0.0) }
+        let t1 = normalize(cross(n, a))
+        let t2 = cross(n, t1)
+        let e = 1.0e-3
+        let o = self.forward(p)
+        let m = cross(self.forward(p + t1 * e) - o, self.forward(p + t2 * e) - o)
+        let l = length(m)
+        if l > 0.0 { m / l } else { n }
+    }
+}
+
+/// A still surface `inner` moved by the map `by` (`Deform`): its distance here is the rest
+/// surface's at the point's source (`Deform::inverse`) over the inverse's stretch, a bound no
+/// greater than the distance (the surface's nearest point here came from one of the rest
+/// surface's, no farther than `stretch` times as far), and the engine meshes it once at rest and
+/// moves the mesh's vertices by the map each frame (a skinned template's path, `DEFORMED`), so a
+/// moving thing whose motion is a map is meshed no more often than its rest surface changes.
+pub struct Deformed<S, D>: Copy + GpuData + Eq + StateHash {
+    pub inner: S,
+    pub by: D,
+}
+
+/// `inner` moved by `by`.
+pub fn deformed<S: Surface, D: Deform>(inner: S, by: D) -> Deformed<S, D> {
+    Deformed { inner, by }
+}
+
+impl<S: Surface + StateHash, D: Deform> Surface for Deformed<S, D> {
+    const MAY_SKIN: bool = true
+    const DEFORMED: bool = true
+
+    fn distance(self, p: vec3) -> f32 {
+        self.inner.distance(self.by.inverse(p)) / self.by.stretch()
+    }
+
+    fn bound(self) -> Bound {
+        self.by.bound(self.inner.bound())
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near)
+    }
+
+    /// The rest surface's over the box its points come from (`Deform::box_in`), over the
+    /// stretch.
+    fn interval_near(self, b: Box3) -> Interval {
+        let i = self.inner.interval_near(self.by.box_in(b))
+        let k = self.by.stretch()
+        Interval { lo: i.lo / k, hi: i.hi / k }
+    }
+
+    /// The template is the rest surface's: a hash of what its distance reads.
+    fn skin_shape_hash(self) -> Option<u64> {
+        var h = Hasher::new()
+        std::derive::kept_deps(|s: S, q: vec3| s.distance(q), self.inner).state_hash(mut h)
+        Some(h.finish())
+    }
+
+    fn rest_distance_live(self, p: vec3, live: Live) -> f32 {
+        self.inner.distance_live(p, live)
+    }
+
+    fn rest_pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        self.inner.pruned(over, at, stretch, live, first)
+    }
+
+    fn rest_bound(self) -> Bound {
+        self.inner.bound()
+    }
+
+    fn rest_interval_near(self, b: Box3) -> Interval {
+        self.inner.interval_near(b)
+    }
+
+    fn skin_bone_count(self) -> u32 {
+        1
+    }
+
+    fn posed_local_distance(self, p: vec3) -> f32 {
+        self.distance(p)
+    }
+
+    fn deform_point(self, p: vec3) -> vec3 {
+        self.by.forward(p)
+    }
+
+    fn deform_normal(self, p: vec3, n: vec3) -> vec3 {
+        self.by.forward_normal(p, n)
+    }
+}
+
+impl<C, S: Field<C> + StateHash, D: Deform> Field<C> for Deformed<S, D> {
+    fn channels(self, p: vec3) -> C {
+        self.inner.channels(self.by.inverse(p))
+    }
+
+    fn rest_channels(self, p: vec3) -> C {
+        self.inner.channels(p)
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        self.inner.field_facts()
     }
 }
 

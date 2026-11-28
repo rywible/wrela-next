@@ -647,6 +647,29 @@ coarse bricks without a slab, and the pool's cuts by distance hold the moving ey
 
 ## 11. Phase 4: State-box proofs `f(p; Theta)`, hard-CSG split, and motion by structure
 
+**State (2026-11-28): its two conditions hold on the M4; steps 1 and 3's other methods are not
+built.** A rest surface moved by a smooth map with an exact inverse is `std::field::Deformed<S,
+D: Deform>`: its distance is the rest surface's at the point's source over the inverse's stretch
+(a bound no greater than the distance), and the engine meshes it as a skinned template, at rest
+and once (its key what the rest's distance reads, `kept_deps`), and moves each vertex by the map
+(`Surface::DEFORMED`, `deform_skinned_verts`) with no projection: the surface now is the rest
+surface's image. The ward is a still clipped shell moved by a radial ripple
+(`world::arena::WardRipple`: each point's offset from the shell's centre scaled by `1 + w(u)/R` at
+its way `u`, so its inverse divides by the same share), its halo (whose radius pulses) and its
+tether things of their own (the tether met the ward with a smooth join before; now it meets it).
+`the_ward_s_ripple_carries_its_shell_onto_its_surface` holds 5,400 rest points carried onto the
+waving surface to 2.9e-7 m, the inverse back to 2.7e-7 m, the normals to 0.0028 rad.
+
+M4, 1080p, at `28b9933` and after, passes alone: SCENE 10's moving things' extraction 8.58 ms a
+frame to 1.65 (the flames and the halo), and the ward's deformation 0.74 (`mesh_skin` 0.42 to
+1.16): the ward's and flames' work 72% less; the watches of SCENE 10 5.3 ms to 0.27 (a deformed
+template has no outline watch: the full audit's ward, still and waving, passes without it).
+SCENE 10's span 34.46 to 24.01 ms still; moving (the gate's, frames 30 to 269) VIEW 3 40.60 to
+31.73, VIEW 4 42.87 to 32.87, VIEW 5 23.06 to 17.95. The full gate on the M4 passes every step
+but SCENE 10's and 14's still spans (23.98 and 20.78 against lines of 21.79 and 20.14). Not built:
+step 1's state boxes (no decision read them yet), step 2 (phase 0 step 5: the kinds are each one
+leaf, no operands to split), and step 3's narrow band, chart and transient methods.
+
 Purpose: unify dynamic proofs over field state boxes `f(p; Theta)` and select each moving kind's
 mesh and ray strategy by structure at build time, with zero mixed-motion brick cracks.
 
