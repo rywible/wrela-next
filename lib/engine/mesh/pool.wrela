@@ -22,13 +22,13 @@
 
 use matter::substance::Substance
 use mesh::dc::{lane_slice, prep_chunk, prep_slices, prep_super_sub}
-use mesh::extract::{ChunkMesh, EXTRACT_INDIRECT, ExtractScratch, MeshBatch, TRI_LEVELS, TRI_WORDS, cull_cut, cull_plan, zero_u32_buf}
+use mesh::extract::{ChunkMesh, EXTRACT_INDIRECT, ExtractScratch, MeshBatch, TRI_WORDS, cull_cut, cull_plan, zero_u32_buf}
 use mesh::grid::{
-    ActiveBrick, BRICK, CAP_EXACT_MAX, CHUNK_BRICKS, CUT_BRICKS, ExactCell, GridSpec, MAX_LOD_LEVELS, MeshVertex, NONE,
+    ActiveBrick, BRICK, CAP_EXACT_MAX, CHUNK_BRICKS, CUT_BRICKS, ExactCell, GridSpec, MeshVertex, NONE,
     OVERFLOW_BRICKS, OVERFLOW_CREASES, OVERFLOW_CUT, OVERFLOW_EXACT, OVERFLOW_INDICES, OVERFLOW_THIN,
     OVERFLOW_TRANS, OVERFLOW_UNLOCAL, SLICES_MOST, brick_in_hole, frustum_cull_none,
 }
-use mesh::outline::{PLACE_CERT_HASH, SLOT_BRICK_WORDS, SLOT_WORDS, reset_place_cert, zero_words}
+use mesh::outline::{SLOT_BRICK_WORDS, SLOT_WORDS, zero_words}
 use std::collections::{Vec, swap}
 use std::field::Field
 use std::gpu::{
@@ -1314,6 +1314,9 @@ impl MeshBatch {
                 first_e += REBASE_LANES
             }
             self.pool.r.thin.clear()
+            // No proof but the kept cells' own: a thin cell meshed after the rebase lands past
+            // them, and must not take one left from before it.
+            zero_u32_buf(mut self.pool.r.proof, self.pool.r.proof.len())
             var first_e: u32 = 0
             while first_e < self.thin_proof.len() {
                 dispatch(
@@ -1659,16 +1662,21 @@ impl MeshBatch {
             self.pool.rebase_next = false
             miss_bound = min(cut_bounds(Vec::new(), cut.clone()), min(total_bricks, self.pool.cap))
         }
-        // Chunks for what the last readbacks found missed, twice over and a chunk more, but never
-        // more than the bound (a cold pool, or none read yet, takes the bound): an update short of
-        // its misses meshes what it dispatched for, draws nothing new, and the next takes up the
-        // rest; a miss beyond the bound is none.
+        // Chunks for what the last readbacks found missed, twice over and a chunk more, and no
+        // fewer than the share of the cut's candidates its cull is expected to keep
+        // (`cut_predicted`) of those its boxes bound against the cut the pool holds (a ring's
+        // step after a run of updates that missed nothing brought 1,333 misses to an update of
+        // one chunk, and it was drawn a frame late), but never more than the bound (a cold
+        // pool, or none read yet, takes the bound): an update short of its misses meshes what it
+        // dispatched for, draws nothing new, and the next takes up the rest; a miss beyond the
+        // bound is none.
         let expect = if warm && self.pool.recent_misses.len() > 0 {
             var most: u32 = 0
             for k in 0..self.pool.recent_misses.len() {
                 most = max(most, self.pool.recent_misses[k])
             }
-            min(miss_bound, 2 * most + CHUNK_BRICKS)
+            let share = f32(self.cut_predicted) / f32(max(total_bricks, 1))
+            min(miss_bound, max(2 * most + CHUNK_BRICKS, u32(share * f32(miss_bound))))
         } else {
             miss_bound
         }
@@ -1713,11 +1721,6 @@ impl MeshBatch {
                 self.thin_keep.clear()
                 zero_u32_buf(mut self.vert_cert, self.watch_verts_cap)
                 zero_u32_buf(mut self.thin_proof, self.watch_verts_cap)
-                if self.place_cert_field_key != field_key {
-                    dispatch(reset_place_cert.bind(hash_slots: self.place_cert_hash.items_mut()), over: PLACE_CERT_HASH)
-                    self.place_cert_entries.clear()
-                    self.place_cert_field_key = field_key
-                }
                 self.watch_origin = scratch.origin0
                 self.watch_shift = scratch.lattice
             }
@@ -1740,7 +1743,6 @@ impl MeshBatch {
 
         label("mesh_extract_cull")
         cull_cut(mut scratch, fields, things: things, total_bricks: total_bricks, fc: fc, plan: cull)
-        copy(from: scratch.level_kept.items(), to: self.tri_count.span_mut(start: TRI_LEVELS, count: MAX_LOD_LEVELS))
 
         label("mesh_extract_probe")
         let probe_cap = min(total_bricks, scratch.max_bricks)
@@ -2220,6 +2222,10 @@ pub(package) fn rebase_copy_verts(
 ) {
     let w = first + id.x
     if w >= totals[2] {
+        // Past the kept vertices, no certificate: a vertex meshed after the rebase lands here,
+        // and one left from before it named another vertex's cell (the citadel's far floor, its
+        // outline and thin cells taken as proven, drew 343 pixels of sky).
+        new_cert[id] = 0
         return
     }
     let v = inv[w]

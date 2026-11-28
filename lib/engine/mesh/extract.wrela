@@ -21,12 +21,12 @@ use mesh::emit::{
     write_brick_meta, zero_chunk_counts,
 }
 use mesh::outline::{
-    PLACE_CERT_CAP, PLACE_CERT_HASH, PlaceCert, SLOT_BESIDE, SLOT_BRICK_WORDS, SLOT_LINE,
+    SLOT_BESIDE, SLOT_BRICK_WORDS, SLOT_LINE,
     SLOT_WORDS, cert_due, certify_watched, forget_frame, keep_slots, outline_quads,
-    place_cert_append, place_cert_link, reset_place_cert, stale_beside, thin_due, thin_watched,
+    stale_beside, thin_due, thin_watched,
     thin_watched_octants, uncertified, zero_words,
 }
-use mesh::rings::{LEVEL_SLOTS, build_ring_grids, grid_candidates, grid_reached, level_share, level_slot, ring_reach}
+use mesh::rings::{build_ring_grids, grid_reached, ring_reach}
 use mesh::pool::{BrickPool, COMPACT_GROUPS, COMPACT_PER_GROUP, CUT_ROOM, GATE_WORDS, brick_pool}
 use mesh::grid::{
     ActiveBrick, BrickBound, CAP_EXACT_MAX, CAP_SEAM, CAP_SURF, CERT_SLICE,
@@ -170,9 +170,6 @@ pub struct ExtractScratch {
     /// buffer passed as `exact_slots` when `cap_exact_slots == 0`.
     pub zero_u32: GpuBuffer<u32>,
     pub dummy_exact_slots: GpuBuffer<u32>,
-    /// Transient buffers for `certify_watched` -> `place_cert_append` -> `place_cert_link`.
-    pub place_cert_new: AppendBuffer<PlaceCert>,
-    pub place_cert_new_slots: GpuBuffer<u32>,
     /// Transient GPU workspace for `BrickPool` probing, seam extraction, and active-cut compaction.
     pub miss_interior: AppendBuffer<ActiveBrick>,
     pub draw_slots: AppendBuffer<u32>,
@@ -205,8 +202,6 @@ pub struct ExtractScratch {
     /// batch's last readback found (`MeshBatch::ring_density`): a thing's first cut is reached by it
     /// (one in eight before any readback: the kinds measured keep 4 to 15 in a hundred).
     pub density_prior: f32,
-    /// The bricks the last cull kept of each of its first `MAX_LOD_LEVELS` grids (`cull_cut`).
-    pub level_kept: GpuBuffer<u32>,
 }
 
 /// Zeroes `count` words of `buf` in chunks of at most `2097152` elements (`32768` workgroups,
@@ -219,6 +214,12 @@ pub(package) fn zero_u32_buf(buf: mut GpuBuffer<u32>, count: u32) {
         dispatch(zero_words.bind(words: buf.span_mut(start: off, count: n)), over: n)
         off += n
     }
+}
+
+/// Whether the eye `v` is cut to from one at `at` looking along `fwd`: it jumped further than
+/// a third of its distance `near` to what it sees, or turned by more than about 25 degrees.
+fn view_cut(at: vec3, fwd: vec3, v: View, near: f32) -> bool {
+    length(v.at - at) > 0.35 * max(near, 0.01) || dot(v.forward, fwd) < 0.90
 }
 
 /// The slices of `slice` cells that hold `cells`, no more than a prepared list's (`SLICES_MOST`).
@@ -261,11 +262,9 @@ pub(package) struct ChunkMesh: Copy {
     pub(package) crease_slices: u32,
 }
 
-/// The words of a batch's `tri_count` (`mesh::pool::finish_pool_draw` says what each is, and
-/// from `TRI_LEVELS` on, the bricks the cut's cull kept of each of its first `MAX_LOD_LEVELS`
-/// grids), all read back.
-pub(package) const TRI_WORDS: u32 = 28
-pub(package) const TRI_LEVELS: u32 = 20
+/// The words of a batch's `tri_count` (`mesh::pool::finish_pool_draw` says what each is), all read
+/// back.
+pub(package) const TRI_WORDS: u32 = 20
 
 /// The indirect dispatches a chunk of `run_extract` makes besides its crease slices.
 const CHUNK_INDIRECT: u32 = 7
@@ -319,8 +318,6 @@ pub fn extract_scratch(max_bricks: u32, lattice: vec3, cell_px: f32 = CELL_PX) -
         seam_args: buffer_of(Vec::filled(SLICES_MOST, DispatchArgs { x: 0, y: 1, z: 1 })),
         zero_u32: buffer_of([0]),
         dummy_exact_slots: buffer(1),
-        place_cert_new: append_buffer(CAP_SURF),
-        place_cert_new_slots: buffer(CAP_SURF),
         miss_interior: append_buffer(max_bricks),
         draw_slots: append_buffer(compact_cap),
         draw_slot_dst: buffer(compact_cap),
@@ -339,7 +336,6 @@ pub fn extract_scratch(max_bricks: u32, lattice: vec3, cell_px: f32 = CELL_PX) -
         cell_px,
         origin0: vec3(0.0),
         density_prior: 0.125,
-        level_kept: buffer(MAX_LOD_LEVELS),
     }
 }
 
@@ -635,11 +631,6 @@ pub struct MeshBatch {
     pub(package) cert_due: AppendBuffer<u32>,
     pub(package) vert_cert: GpuBuffer<u32>,
     pub(package) exact_base: GpuBuffer<u32>,
-    pub(package) place_cert_hash: GpuBuffer<u32>,
-    pub(package) place_cert_entries: AppendBuffer<PlaceCert>,
-    pub(package) place_cert_vals: GpuBuffer<u32>,
-    pub(package) place_cert_ready: bool,
-    pub(package) place_cert_field_key: u64,
     /// Persistent world-anchored `BrickPool` storage for static Multi-LOD batches.
     pub pooled: bool,
     /// The pool of a pooled mesh (`mesh::pool`).
@@ -662,21 +653,16 @@ pub struct MeshBatch {
     /// The reach of the cut `ring_density` was read of: a share read at another reach (an older
     /// cut's, read after the eye moved on) may make the rings reach less, never more.
     pub(package) density_reach: f32,
-    /// The share of its candidates each level's cull kept, by its cell (`rings::level_slot`), as
-    /// the readbacks found (0 where none was read): what `ring_reach` reaches a cut by. The levels
-    /// of the latest extraction (each one's cell slot and candidates), and of the one read.
-    pub(package) level_shares: [f32; LEVEL_SLOTS],
-    pub(package) level_gens: [u32; LEVEL_SLOTS],
-    pub(package) cut_slots: [u32; MAX_LOD_LEVELS],
-    pub(package) cut_cands: [u32; MAX_LOD_LEVELS],
-    pub(package) cut_levels: u32,
-    pub(package) poll_slots: [u32; MAX_LOD_LEVELS],
-    pub(package) poll_cands: [u32; MAX_LOD_LEVELS],
-    pub(package) poll_levels: u32,
     /// The first extraction since the eye last jumped (`lod_cut`).
     pub(package) cut_gen: u32,
-    /// The bricks the cut last made is expected to keep (`level_shares`).
+    /// The bricks the cut last made is expected to keep (`ring_density`).
     pub(package) cut_predicted: u32,
+    /// The bricks the last read cut kept (at `density_reach`), and that cut's generation.
+    pub(package) kept_read: u32,
+    pub(package) kept_gen: u32,
+    /// The most any cut of this batch was read to keep of its candidates (`ring_density`).
+    pub(package) density_most: f32,
+
     pub(package) watch_slots_cap: u32,
     pub(package) watch_quads_cap: u32,
     pub(package) watch_verts_cap: u32,
@@ -700,6 +686,13 @@ pub struct MeshBatch {
     pub(package) watch_taken: vec3u,
     pub(package) watch_taken_cands: u32,
     pub(package) watch_short: bool,
+    /// The watches run (each writes its number beside its counts, `watch_counts[8]`), and the
+    /// one whose counts were last read back: a frame is settled only once the counts of the watch
+    /// it drew are read (a read put up before it ran says nothing of it: a citadel's eye, its
+    /// watch run again with the counts of the run before it read, was taken as settled with 454
+    /// pixels of its floor missing).
+    pub(package) watch_run: u32,
+    pub(package) watch_read: u32,
     pub(package) stat_extractions: u32,
     pub(package) stat_reads: u32,
     pub(package) stat_bricks: u32,
@@ -741,7 +734,6 @@ pub(package) fn cull_plan<M: Field<Substance>>(
         first: 0,
         fc: fc,
         active: mut scratch.active,
-        kept_levels: mut scratch.level_kept,
     )
     let super_sub_slice = max(
         u32(clamp(
@@ -780,7 +772,6 @@ pub(package) fn cull_cut<M: Field<Substance>>(
     plan: CullPlan,
 ) {
     scratch.active.clear()
-    write(mut scratch.level_kept, 0, Vec::filled(MAX_LOD_LEVELS, 0))
     let grids = scratch.grids.items()
     let use_super = plan.use_super
     let super_slices = plan.super_slices
@@ -839,7 +830,6 @@ pub(package) fn cull_cut<M: Field<Substance>>(
                     first: sk * super_sub_slice,
                     fc: fc,
                     active: mut scratch.active,
-                    kept_levels: mut scratch.level_kept,
                 ),
                 groups: scratch.super_args.at(sk),
                 most: super_sub_slice,
@@ -855,7 +845,6 @@ pub(package) fn cull_cut<M: Field<Substance>>(
                 total_bricks: total_bricks,
                 fc: fc,
                 active: mut scratch.active,
-                kept_levels: mut scratch.level_kept,
             )),
             most: CULL_CHUNK,
         )
@@ -871,7 +860,6 @@ pub(package) fn cull_cut<M: Field<Substance>>(
                     total_bricks: total_bricks,
                     fc: fc,
                     active: mut scratch.active,
-                    kept_levels: mut scratch.level_kept,
                 ),
                 over: n,
             )
@@ -892,6 +880,8 @@ pub struct DrawnRead {
     pub slots: Pending<u32>,
     pub alive: Pending<u32>,
     pub quad_indices: Pending<u32>,
+    pub thin: Pending<u32>,
+    pub thin_count: Pending<u32>,
 }
 
 /// Creates a lazy `MeshBatch` (minimal initial buffers; grows cleanly on demand up to `max_bricks`).
@@ -1076,11 +1066,6 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         cert_due: append_buffer(CAP_SURF),
         vert_cert: buffer(1),
         exact_base: buffer(1),
-        place_cert_hash: buffer(1),
-        place_cert_entries: append_buffer(1),
-        place_cert_vals: buffer(1),
-        place_cert_ready: false,
-        place_cert_field_key: 0,
         pooled: false,
         pool: brick_pool(),
         drawn_grids: buffer(MAX_LOD_LEVELS),
@@ -1090,16 +1075,12 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         ring_reach: 1.0,
         reach_room: false,
         density_reach: 1.0,
-        level_shares: [0.0; LEVEL_SLOTS],
-        level_gens: [0; LEVEL_SLOTS],
-        cut_slots: [0; MAX_LOD_LEVELS],
-        cut_cands: [0; MAX_LOD_LEVELS],
-        cut_levels: 0,
-        poll_slots: [0; MAX_LOD_LEVELS],
-        poll_cands: [0; MAX_LOD_LEVELS],
-        poll_levels: 0,
         cut_gen: 0,
         cut_predicted: 0,
+        kept_read: 0,
+        kept_gen: 0,
+        density_most: 0.0,
+
         watch_slots_cap: 1,
         watch_quads_cap: 1,
         watch_verts_cap: 1,
@@ -1108,7 +1089,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         watch_eye: vec4(0.0),
         watch_fwd: vec3(0.0, 0.0, -1.0),
         watch_gen: 0,
-        watch_counts: buffer(8),
+        watch_counts: buffer(9),
         watch_poll: None,
         watch_hint: vec3u(0, 0, 0),
         watch_hint_cands: 0,
@@ -1118,6 +1099,8 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         watch_taken: vec3u(0, 0, 0),
         watch_taken_cands: 0,
         watch_short: false,
+        watch_run: 0,
+        watch_read: 0,
         stat_extractions: 0,
         stat_reads: 0,
         stat_bricks: 0,
@@ -1256,17 +1239,6 @@ impl MeshBatch {
             self.thin_due = append_buffer(self.watch_verts_cap)
             grew = true
         }
-        if !self.place_cert_ready {
-            self.place_cert_hash = buffer(PLACE_CERT_HASH)
-            self.place_cert_entries = append_buffer(PLACE_CERT_CAP)
-            self.place_cert_vals = buffer(PLACE_CERT_CAP)
-            dispatch(
-                reset_place_cert.bind(hash_slots: self.place_cert_hash.items_mut()),
-                over: PLACE_CERT_HASH,
-            )
-            self.place_cert_entries.clear()
-            self.place_cert_ready = true
-        }
         grew
     }
 
@@ -1312,7 +1284,7 @@ impl MeshBatch {
             self.polled_gen == self.gen &&
             self.overflowed() == 0 &&
             !self.budget_short &&
-            !self.watch_short
+            (!self.watched || (!self.watch_short && self.watch_read == self.watch_run))
     }
 
     /// Why `settled` doesn't hold, in words (`""` when it does): what the audit says of an eye it
@@ -1325,7 +1297,7 @@ impl MeshBatch {
             Some(_) => false,
             None => true,
         }
-        f"built {self.built}, read back {read}, generation read {self.polled_gen} of {self.gen}, overflow bits {self.overflowed()}, budget short {self.budget_short} (wanted {self.last_wanted} bricks, a frame alone meshes {self.last_alone}, {self.last_per_chunk} dispatches a chunk), outline short {self.watch_short} (last counts {self.watch_hint.x}, {self.watch_hint.y}, {self.watch_hint.z} of {self.watch_taken.x}, {self.watch_taken.y}, {self.watch_taken.z} taken)"
+        f"built {self.built}, read back {read}, generation read {self.polled_gen} of {self.gen}, overflow bits {self.overflowed()}, budget short {self.budget_short} (wanted {self.last_wanted} bricks, a frame alone meshes {self.last_alone}, {self.last_per_chunk} dispatches a chunk), outline short {self.watch_short}, its run {self.watch_run} read {self.watch_read} (last counts {self.watch_hint.x}, {self.watch_hint.y}, {self.watch_hint.z} of {self.watch_taken.x}, {self.watch_taken.y}, {self.watch_taken.z} taken)"
     }
 
     /// Draws nothing until synced again, and forgets what it meshed, so the next sync meshes its
@@ -1358,6 +1330,7 @@ impl MeshBatch {
         self.lod_kt = -1000.0
         self.watch_known = false
         self.watch_short = false
+        self.watch_read = self.watch_run
         self.last_field_key = 0
         self.static_key_streak = 0
         self.late_streak = 0
@@ -1422,9 +1395,23 @@ impl MeshBatch {
             !self.watch_short {
             return
         }
+        // An eye cut to (jumped far or turned sharply, `view_cut`) is a view the last run's counts
+        // say nothing of, though its extraction holds (rings by distance alone keep their cut
+        // through a turn): its slices are all the lists may need (a citadel's eye turned in place,
+        // sized by the counts before it, left 7596 of its kept thin cells unasked).
+        let near = max(length(v.at - self.bound.xyz) - self.bound.w, 0.0)
+        if view_cut(self.watch_eye.xyz, self.watch_fwd, v, near) {
+            self.watch_known = false
+        }
         self.watch_eye = eye
         self.watch_fwd = v.forward
         self.watch_gen = self.gen
+        // A new run: short only once its own counts say so (a verdict on the run before it, held
+        // till this one's are read, ran the watch again each frame, each read a run behind).
+        self.watch_run = self.watch_run.wrapping_add(1)
+        self.watch_short = false
+        // (A read put up for a run before it is let go: its own is put up at this frame's end.)
+        self.watch_poll = None
         let fc = frustum_cull_view(v, margin: 1.08)
         label("mesh_watch")
         let fbuf = buffer_of([field])
@@ -1518,10 +1505,6 @@ impl MeshBatch {
             shift: self.watch_shift,
             eye: eye,
             vert_cert: mut self.vert_cert,
-            place_hash: self.place_cert_hash.items(),
-            place_entries: self.place_cert_entries.items(),
-            place_new: mut scratch.place_cert_new,
-            place_vals: mut self.place_cert_vals,
             bits: mut self.watch_bits,
             exact_cells: mut self.exact_cells,
         )
@@ -1542,9 +1525,6 @@ impl MeshBatch {
             shift: self.watch_shift,
             eye: eye,
             vert_cert: mut self.vert_cert,
-            place_hash: self.place_cert_hash.items(),
-            place_entries: self.place_cert_entries.items(),
-            place_vals: self.place_cert_vals.items(),
             bits: mut self.watch_bits,
             exact_cells: mut self.exact_cells,
             due: mut self.cert_due,
@@ -1565,7 +1545,6 @@ impl MeshBatch {
             // The cached certificates read; the cells left unsaid put up (`cert_due`), and those
             // certified.
             self.cert_due.clear()
-            scratch.place_cert_new.clear()
             for k in 0..read_slices {
                 dispatch(
                     cert_due.bind(
@@ -1579,9 +1558,6 @@ impl MeshBatch {
                         shift: self.watch_shift,
                         eye: eye,
                         vert_cert: mut self.vert_cert,
-                        place_hash: self.place_cert_hash.items(),
-                        place_entries: self.place_cert_entries.items(),
-                        place_vals: self.place_cert_vals.items(),
                         bits: mut self.watch_bits,
                         exact_cells: mut self.exact_cells,
                         due: mut self.cert_due,
@@ -1615,54 +1591,11 @@ impl MeshBatch {
                         shift: self.watch_shift,
                         eye: eye,
                         vert_cert: mut self.vert_cert,
-                        place_hash: self.place_cert_hash.items(),
-                        place_entries: self.place_cert_entries.items(),
-                        place_new: mut scratch.place_cert_new,
-                        place_vals: mut self.place_cert_vals,
                         bits: mut self.watch_bits,
                         exact_cells: mut self.exact_cells,
                     ),
                     groups: scratch.crease_args.at(k),
                     most: cert_slice / 64,
-                )
-            }
-            // Publish newly certified cells into the place-keyed certificate cache (static/pooled
-            // batches only; dynamic per-frame movers never reuse world-place certificates).
-            if self.pooled || self.static_key_streak >= 1 {
-                dispatch(
-                    prep_slices.bind(
-                        count: scratch.place_cert_new.count(),
-                        cap: CAP_SURF,
-                        most: CAP_SURF,
-                        slices: 1,
-                        args: scratch.surf_args.span_mut(start: 0, count: 1),
-                    ),
-                    over: 1,
-                )
-                dispatch(
-                    place_cert_append.bind(
-                        new_entries: scratch.place_cert_new.items(),
-                        new_count: scratch.place_cert_new.count(),
-                        cap_new: CAP_SURF,
-                        entries: mut self.place_cert_entries,
-                        vals: mut self.place_cert_vals,
-                        new_slots: mut scratch.place_cert_new_slots,
-                    ),
-                    groups: scratch.surf_args.at(0),
-                    most: CAP_SURF / 64,
-                )
-                dispatch(
-                    place_cert_link.bind(
-                        new_entries: scratch.place_cert_new.items(),
-                        new_count: scratch.place_cert_new.count(),
-                        cap_new: CAP_SURF,
-                        new_slots: scratch.place_cert_new_slots.items(),
-                        entries: self.place_cert_entries.items(),
-                        hash_slots: mut self.place_cert_hash,
-                        vals: mut self.place_cert_vals,
-                    ),
-                    groups: scratch.surf_args.at(0),
-                    most: CAP_SURF / 64,
                 )
             }
         } else {
@@ -1708,6 +1641,7 @@ impl MeshBatch {
         copy(from: scratch.thin_cands.count().sub(start: 0, count: 1), to: self.watch_counts.span_mut(start: 1, count: 1))
         copy(from: self.thin_due.count().sub(start: 0, count: 1), to: self.watch_counts.span_mut(start: 2, count: 1))
         copy(from: self.exact_cells.count().sub(start: 0, count: 1), to: self.watch_counts.span_mut(start: 3, count: 1))
+        write(mut self.watch_counts, 8, [self.watch_run])
         self.watch_taken = vec3u(if certifies { cert_slices * cert_slice } else { CAP_SURF }, dilated, kept)
         self.watch_taken_cands = read_slices * read_slice
         self.has_exact = true
@@ -1914,8 +1848,24 @@ impl MeshBatch {
                     self.watch_exact = c[3]
                     self.watch_split = vec3u(c[4], c[5], c[6])
                     self.watch_known = true
-                    self.watch_short = c[0] > self.watch_taken.x || c[1] > self.watch_taken.y ||
-                        c[2] > self.watch_taken.z || c[7] > self.watch_taken_cands
+                    // Only the last run's counts say whether it was short (`watch_taken` is its).
+                    if c[8] == self.watch_run {
+                        self.watch_read = c[8]
+                        self.watch_short = c[0] > self.watch_taken.x || c[1] > self.watch_taken.y ||
+                            c[2] > self.watch_taken.z || c[7] > self.watch_taken_cands
+                    }
+                    // Exact cells past what the list holds are drawn none of: the list grows, the
+                    // batch extracts again to fill its own part, and the watch is done again; at
+                    // its most, the overflow is said (`OVERFLOW_EXACT`), never silent.
+                    if c[3] > self.cap_exact {
+                        if self.cap_exact < CAP_EXACT_MAX {
+                            self.ensure_exact_cap(min(c[3] + c[3] / 2, CAP_EXACT_MAX))
+                            self.built = false
+                            self.watch_short = true
+                        } else {
+                            self.overflow_flags |= OVERFLOW_EXACT
+                        }
+                    }
                     self.watch_poll = None
                 },
                 Some(Err(_)) => {
@@ -2035,6 +1985,8 @@ impl MeshBatch {
             } else {
                 read(self.indices.items().sub(start: 0, count: self.cap_indices))
             },
+            thin: read(self.thin_keep.items().sub(start: 0, count: max(self.watch_verts_cap, 1))),
+            thin_count: read(self.thin_keep.count()),
         }
     }
 
@@ -2063,12 +2015,6 @@ impl MeshBatch {
                     gpu_ovf = c[7]
                     exact_count = c[8]
                     self.seam_read = c[12]
-                    for j in 0..MAX_LOD_LEVELS {
-                        if j < self.poll_levels && self.poll_cands[j] > 0 {
-                            self.level_shares[self.poll_slots[j]] = clamp(f32(c[TRI_LEVELS + j]) / f32(self.poll_cands[j]), 0.0, 1.0)
-                            self.level_gens[self.poll_slots[j]] = self.poll_gen
-                        }
-                    }
                     if self.pooled {
                         self.took_pool_counts(c.clone(), c[7])
                     }
@@ -2173,6 +2119,9 @@ impl MeshBatch {
         if self.poll_total > 0 && self.poll_gen >= self.cut_gen {
             self.ring_density = clamp(f32(kept) / f32(self.poll_total), 1.0 / 64.0, 1.0)
             self.density_reach = self.poll_reach
+            self.kept_read = kept
+            self.kept_gen = self.poll_gen
+            self.density_most = max(self.density_most, self.ring_density)
         }
         self.crease_hint = creases
         self.seam_hint = self.seam_read
@@ -2237,9 +2186,6 @@ impl MeshBatch {
                 self.poll_scale = self.extract_scale
                 self.poll_total = self.extract_total
                 self.poll_reach = self.ring_reach
-                self.poll_slots = self.cut_slots
-                self.poll_cands = self.cut_cands
-                self.poll_levels = self.cut_levels
                 self.poll_limit = self.extract_limit
                 self.poll_caps = vec4u(
                     self.cap_verts,
@@ -2438,8 +2384,6 @@ impl MeshBatch {
         cell: f32,
     ) {
         let cell = cell * self.cell_scale
-        // One grid, not rings: its readbacks say nothing of the levels' shares.
-        self.cut_levels = 0
         var h = Hasher::new()
         mesh_key(field, mut h)
         let key = h.finish()
@@ -2806,22 +2750,17 @@ impl MeshBatch {
         let eff_cpx = cell_rule(lip, scratch.cell_px)
         // As far as the rule wants, but no more bricks kept than a cut holds (`CUT_ROOM`), as
         // the share of candidates the batch's last cull kept says.
-        // The levels' shares read for this eye: since its last jump, and not by a cut made before
-        // it (`cut_gen`); any other level is taken to keep the most any level of this batch was
-        // read to keep (a level an eye has newly come near holds as much surface as any).
+        // The share of a cut's candidates its cull keeps, as the batch's last cut read since the
+        // eye's last jump found it (`cut_gen`). After a jump, a pool takes the last cut's (a cut
+        // too large for it is not drawn till it is whole: the last whole cut stays, and the next is
+        // smaller); a batch meshed in place, where a cut too large is drawn with bricks missing,
+        // the most any of its cuts was read to keep (a walking creature's near eye kept 5 in 100
+        // of a cut sized for 1).
         let jumped = self.active_hint > 0 &&
             (length(v.at - self.lod_view_at) > 0.35 * max(d_surf, 0.01) ||
                 dot(v.forward, self.lod_view_fwd) < 0.90)
-        var shares = [-1.0; LEVEL_SLOTS]
-        var share_most = if self.ring_density > 0.0 { self.ring_density } else { scratch.density_prior }
-        for k in 0..LEVEL_SLOTS {
-            if self.level_gens[k] > 0 {
-                share_most = max(share_most, self.level_shares[k])
-                if !jumped && self.level_gens[k] >= self.cut_gen {
-                    shares[k] = self.level_shares[k]
-                }
-            }
-        }
+        let share_read = if self.ring_density > 0.0 { self.ring_density } else { scratch.density_prior }
+        let share = if jumped && !self.pooled { max(share_read, self.density_most) } else { share_read }
         let (reach, reach_room) = ring_reach(
             aabb,
             v.at,
@@ -2830,11 +2769,10 @@ impl MeshBatch {
             eff_top,
             scratch.lattice,
             holds: CUT_ROOM,
-            shares: shares,
-            fallback: share_most,
+            share: share,
             clear: d_surf,
             last: self.ring_reach,
-            may_grow: self.density_reach == self.ring_reach,
+            kept_last: if !jumped && self.density_reach == self.ring_reach && self.kept_gen >= self.cut_gen { f32(self.kept_read) } else { -1.0 },
         )
         if self.ring_density > 0.0 {
             scratch.density_prior = 0.9 * scratch.density_prior + 0.1 * self.ring_density
@@ -2854,17 +2792,10 @@ impl MeshBatch {
         let grids = take built_grids
         let total_bricks = built_total
         let has_seams = built_seams
-        // The cut's levels as an extraction of it will read them back (`level_shares`), and the
-        // bricks they are expected to keep (the pool's room is sized by it).
-        self.cut_levels = min(grids.len(), MAX_LOD_LEVELS)
+        // The bricks the cut is expected to keep (the pool's room is sized by it).
         var predicted = 0.0
         for j in 0..grids.len() {
-            let share = level_share(shares, level_slot(grids[j].cell), share_most)
             predicted += share * f32(grid_reached(grids[j], v.at, d_surf))
-            if j < MAX_LOD_LEVELS {
-                self.cut_slots[j] = level_slot(grids[j].cell)
-                self.cut_cands[j] = grid_candidates(grids[j])
-            }
         }
         self.cut_predicted = u32(predicted)
         self.lod_fit = grids.clone()
@@ -2948,9 +2879,7 @@ impl MeshBatch {
             (has_seams || self.pooled || total_bricks >= 512)
         let count = grids.len()
         // A cut: the eye jumped far or turned sharply since the last extraction.
-        self.lod_cut = self.active_hint > 0 &&
-            (length(v.at - self.lod_view_at) > 0.35 * max(z_near, 0.01) ||
-                dot(v.forward, self.lod_view_fwd) < 0.90)
+        self.lod_cut = self.active_hint > 0 && view_cut(self.lod_view_at, self.lod_view_fwd, v, z_near)
         if self.lod_cut {
             self.watch_known = false
             self.cut_gen = self.gen + 1
@@ -3705,7 +3634,6 @@ impl MeshBatch {
                 total_bricks: patch_total,
                 fc: frustum_cull_none(),
                 active: mut scratch.active,
-                kept_levels: mut scratch.level_kept,
             )),
             most: CULL_CHUNK,
         )
@@ -3721,7 +3649,6 @@ impl MeshBatch {
                     total_bricks: patch_total,
                     fc: frustum_cull_none(),
                     active: mut scratch.active,
-                    kept_levels: mut scratch.level_kept,
                 ),
                 over: cn,
             )
@@ -4933,7 +4860,6 @@ impl MeshBatch {
 
         // Pass 0: Interval-cull bricks (2-level 4×4×4 super-bricks on large grids, else flat).
         cull_cut(mut scratch, fields, things: things, total_bricks: total_bricks, fc: fc, plan: cull)
-        copy(from: scratch.level_kept.items(), to: self.tri_count.span_mut(start: TRI_LEVELS, count: MAX_LOD_LEVELS))
 
         // Passes 1–3: Extract in bounded chunks of `CHUNK_BRICKS` active bricks using `chunk_limit`
         // (generous 1.5× + 1-chunk headroom; `took_counts` re-extracts automatically if exceeded).
@@ -4949,16 +4875,6 @@ impl MeshBatch {
             self.thin_keep.clear()
             zero_u32_buf(mut self.vert_cert, self.watch_verts_cap)
             zero_u32_buf(mut self.thin_proof, self.watch_verts_cap)
-            // The place-keyed certificates hold for the field they were made of alone: emptied
-            // when it changes (every extraction of a field that moves).
-            if self.place_cert_field_key != field_key || field_key == 0 {
-                dispatch(
-                    reset_place_cert.bind(hash_slots: self.place_cert_hash.items_mut()),
-                    over: PLACE_CERT_HASH,
-                )
-                self.place_cert_entries.clear()
-                self.place_cert_field_key = field_key
-            }
             self.watch_origin = scratch.origin0
             self.watch_shift = scratch.lattice
         }

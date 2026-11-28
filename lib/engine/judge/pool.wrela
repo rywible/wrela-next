@@ -9,7 +9,10 @@
 //   to start at the least so its winding is kept;
 // - every exact cell its extraction made (its corner, width and live parts);
 // - every outline record of a live slot: its quad's four vertices, its four cells on the world's
-//   lattice, its cell, and whether it is flipped and split the other way.
+//   lattice, its cell, and whether it is flipped and split the other way;
+// - every thin cell kept of a live slot (`thin_keep`), by its place on the world's lattice: the
+//   cells whose cores each frame's eye asks of the field, where a thin feature lies that Dual
+//   Contouring meshes none of (a far floor thinner than its cells).
 //
 // Each side is a multiset: each item hashed and the hashes summed, whole and in `PLACES` places of
 // space (by the first vertex's or the corner's brick of the cut's coarsest cell), so a difference
@@ -116,9 +119,11 @@ struct Drawn {
     slots: Vec<u32>,
     alive: Vec<u32>,
     quad_indices: Vec<u32>,
+    thin: Vec<u32>,
+    thin_count: u32,
 }
 
-const DRAWN_PARTS: u32 = 1023
+const DRAWN_PARTS: u32 = 4095
 
 fn drawn() -> Drawn {
     Drawn {
@@ -133,6 +138,8 @@ fn drawn() -> Drawn {
         slots: Vec::new(),
         alive: Vec::new(),
         quad_indices: Vec::new(),
+        thin: Vec::new(),
+        thin_count: 0,
     }
 }
 
@@ -209,21 +216,93 @@ fn gather(r: mut DrawnRead, d: mut Drawn, what: str) -> bool {
             None => {},
         }
     }
+    if (d.got & 1024) == 0 {
+        match r.thin.poll() {
+            Some(Ok(x)) => { d.thin = take x; d.got |= 1024 },
+            Some(Err(_)) => panic(f"judge pool: {what}: a read failed"),
+            None => {},
+        }
+    }
+    if (d.got & 2048) == 0 {
+        match r.thin_count.poll() {
+            Some(Ok(x)) => { d.thin_count = x[0]; d.got |= 2048 },
+            Some(Err(_)) => panic(f"judge pool: {what}: a read failed"),
+            None => {},
+        }
+    }
     d.got == DRAWN_PARTS
 }
 
-/// One side held: its triangles, exact cells and outline records summed (`Sums`), and the
-/// triangles that are no triangle (two corners at one place) or name a vertex past those made.
+/// The thin cells kept of `d`'s live slots (`thin_keep`), each as its place's hash, its place on
+/// the lattice (whole cells of its own cell, and that cell) and its slot and cell, sorted by the
+/// hash, each place once.
+fn thin_list(d: Drawn) -> Vec<(u64, vec3u, f32, u32, u32)> {
+    let n_slots = d.slots.len() / SLOT_BRICK_WORDS
+    let nt = min(d.thin_count, d.thin.len())
+    var out: Vec<(u64, vec3u, f32, u32, u32)> = Vec::new()
+    for k in 0..nt {
+        let e = d.thin[k]
+        let slot = e >> 9
+        let c = e & 511
+        if slot >= n_slots || slot >= d.alive.len() || d.alive[slot] == 0 {
+            continue
+        }
+        let s = load_slot(d.slots, slot)
+        let w = s.base + vec3u(c % 7, (c / 7) % 7, c / 49)
+        var h = Hasher::new()
+        bitcast_u32(s.cell).state_hash(mut h)
+        w.state_hash(mut h)
+        out.push((h.finish(), w, s.cell, slot, c))
+    }
+    out.sort_by(|a: (u64, vec3u, f32, u32, u32), b: (u64, vec3u, f32, u32, u32)| a.0 < b.0)
+    var once: Vec<(u64, vec3u, f32, u32, u32)> = Vec::new()
+    for k in 0..out.len() {
+        if k == 0 || out[k].0 != out[k - 1].0 {
+            once.push(out[k])
+        }
+    }
+    once
+}
+
+/// The first thin cell kept on one side and not the other (`thin_list`), in words.
+fn thin_first_apart(p: Drawn, c: Drawn) -> String {
+    let a = thin_list(p)
+    let b = thin_list(c)
+    var i = 0
+    var j = 0
+    while i < a.len() && j < b.len() {
+        if a[i].0 == b[j].0 {
+            i += 1
+            j += 1
+        } else if a[i].0 < b[j].0 {
+            return f"first kept only in the pool: lattice cell {a[i].1.x} {a[i].1.y} {a[i].1.z} of {a[i].2} m, slot {a[i].3}, cell {a[i].4}"
+        } else {
+            return f"first kept only cold: lattice cell {b[j].1.x} {b[j].1.y} {b[j].1.z} of {b[j].2} m, slot {b[j].3}, cell {b[j].4}"
+        }
+    }
+    if i < a.len() {
+        return f"first kept only in the pool: lattice cell {a[i].1.x} {a[i].1.y} {a[i].1.z} of {a[i].2} m, slot {a[i].3}, cell {a[i].4}"
+    }
+    if j < b.len() {
+        return f"first kept only cold: lattice cell {b[j].1.x} {b[j].1.y} {b[j].1.z} of {b[j].2} m, slot {b[j].3}, cell {b[j].4}"
+    }
+    String::new()
+}
+
+/// One side held: its triangles, exact cells, outline records and kept thin cells summed
+/// (`Sums`), and the triangles that are no triangle (two corners at one place) or name a vertex
+/// past those made.
 struct Held {
     tris: Sums,
     exact: Sums,
     quads: Sums,
+    thin: Sums,
     flat: u32,
     stray: u32,
 }
 
 fn held_of(d: Drawn, place_cell: f32) -> Held {
-    var out = Held { tris: sums(), exact: sums(), quads: sums(), flat: 0, stray: 0 }
+    var out = Held { tris: sums(), exact: sums(), quads: sums(), thin: sums(), flat: 0, stray: 0 }
     let nv = min(d.counts[3], d.verts.len())
     let ni = min(d.counts[0], d.indices.len())
     var t: u32 = 0
@@ -326,6 +405,39 @@ fn held_of(d: Drawn, place_cell: f32) -> Held {
             }
         }
         out.quads.add(h.finish(), first, place_cell)
+    }
+    // The thin cells kept of each live slot (`thin_keep`), a set by place: the cells its outline's
+    // eye is asked of each frame, where a thin feature Dual Contouring meshes none of may be.
+    let nt = min(d.thin_count, d.thin.len())
+    var thin_keyed: Vec<vec2u> = Vec::new()
+    var thin_at: Vec<vec3> = Vec::new()
+    for k in 0..nt {
+        let e = d.thin[k]
+        let slot = e >> 9
+        let c = e & 511
+        if slot >= n_slots || slot >= d.alive.len() || d.alive[slot] == 0 {
+            continue
+        }
+        let s = load_slot(d.slots, slot)
+        let w = s.base + vec3u(c % 7, (c / 7) % 7, c / 49)
+        var h = Hasher::new()
+        bitcast_u32(s.cell).state_hash(mut h)
+        w.state_hash(mut h)
+        let x = h.finish()
+        thin_keyed.push(vec2u(u32(x >> 32), u32(x & 4294967295)))
+        thin_at.push(vec3(f32(w.x), f32(w.y), f32(w.z)) * s.cell)
+    }
+    var thin_order: Vec<u32> = Vec::new()
+    for k in 0..thin_keyed.len() {
+        thin_order.push(k)
+    }
+    thin_order.sort_by(|a: u32, b: u32| thin_keyed[a].x < thin_keyed[b].x || (thin_keyed[a].x == thin_keyed[b].x && thin_keyed[a].y < thin_keyed[b].y))
+    for j in 0..thin_order.len() {
+        let k = thin_order[j]
+        if j > 0 && thin_keyed[thin_order[j - 1]] == thin_keyed[k] {
+            continue
+        }
+        out.thin.add((u64(thin_keyed[k].x) << 32) | u64(thin_keyed[k].y), thin_at[k], place_cell)
     }
     out
 }
@@ -468,6 +580,10 @@ impl PoolJudge {
         if dq.len() > 0 {
             faults.push(take dq)
         }
+        let dthin = differ("kept thin cells", p.thin, c.thin)
+        if dthin.len() > 0 {
+            faults.push(f"{dthin}; {thin_first_apart(self.pooled_drawn, self.cold_drawn)}")
+        }
         if p.stray > 0 || c.stray > 0 {
             faults.push(f"records naming no vertex: pooled {p.stray}, cold {c.stray}")
         }
@@ -481,7 +597,7 @@ impl PoolJudge {
             }
             panic(f"judge pool: {what}: the pooled mesh after {eyes.len()} eyes is not the cold extraction of its cut{said}")
         }
-        print(f"judge pool: {what}: after {eyes.len()} eyes (a walk and a turn) and {self.batches[0].pool.rebases} rebases, the pooled mesh of {cut.len()} levels is the cold extraction of its cut: {p.tris.count} triangles, {p.exact.count} exact cells, {p.quads.count} outline records, hash {p.tris.sum ^ p.exact.sum ^ p.quads.sum}")
+        print(f"judge pool: {what}: after {eyes.len()} eyes (a walk and a turn) and {self.batches[0].pool.rebases} rebases, the pooled mesh of {cut.len()} levels is the cold extraction of its cut: {p.tris.count} triangles, {p.exact.count} exact cells, {p.quads.count} outline records, {p.thin.count} kept thin cells, hash {p.tris.sum ^ p.exact.sum ^ p.quads.sum ^ p.thin.sum}")
         self.stage = 4
         true
     }
