@@ -30,6 +30,7 @@ use clips::clips::{read_all, write_all}
 use engine::body::body::{Body, Pose}
 use engine::body::fit::{Aim, aim_floor, aim_frame, aim_point, fit}
 use engine::body::joint::{Frame, numbers_of, vector_of_turn}
+use engine::judge::movement::{TREMOR_HZ, low_passed}
 use std::collections::Vec
 use std::hash::sha256::{hex, sha256}
 use std::io::print
@@ -1082,21 +1083,23 @@ fn clips_embm() -> Result<Vec<Clip>, ToolError> {
     Ok(out)
 }
 
-/// Low-passes a clip in time: each number, the root's place and its turn (averaged on the sphere)
-/// by a Gaussian of `SMOOTH` frames' spread, both ways, so no lag. The fit of each frame leaves a
-/// jitter from frame to frame that inverse dynamics differentiates twice (playing a clip faster,
-/// which resamples it, lowered its root residual); the laboratory filters markers at some 6 Hz
-/// before it does the same (D. A. Winter). Each joint stays in its range: a mean of numbers in a
-/// convex range is in it. Rewrites the clip's poses.
-const SMOOTH: f32 = 0.8
+/// Low-passes a clip in time: each number, the root's place and its turn, at the frequency above
+/// which the judge calls a joint's movement tremor (`TREMOR_HZ`, 6 Hz: the cutoff a laboratory
+/// filters gait's markers at, D. A. Winter), by the judge's own filter (a Butterworth of order 8
+/// run forward and back: no lag, 97.6% of the power at 5 Hz kept and 0.6% at 7.5 Hz). The fit of
+/// each frame leaves a jitter from frame to frame that inverse dynamics differentiates twice, and
+/// since each frame's legs start from the capture's own turns (2026-11-27) the capture's noise
+/// comes through: a Gaussian of 0.8 frames (until then) left the benchmark's clips 4.0 to 4.6% of
+/// their joints' speed's power above 6 Hz at the median, a quarter to two fifths of them past the
+/// judge's target of 5% that a tracker following them cannot be under. Rewrites the clip's poses.
 
 fn smoothed_clip(c: take Clip) -> Done {
-    if c.body.as_str() == "human" { smoothed_into(hs::REST, c) } else {
-        smoothed_into(creature_rest(), c)
+    if c.body.as_str() == "human" { smoothed_into(hs::BODY, hs::REST, c) } else {
+        smoothed_into(world::creature::BODY, creature_rest(), c)
     }
 }
 
-fn smoothed_into<const D: u32>(_rest: Pose<D>, c: Clip) -> Done {
+fn smoothed_into<const S: u32, const D: u32>(body: Body<S>, rest: Pose<D>, c: Clip) -> Done {
     var done = Done {
         clip: c.name.clone(),
         frames: 0,
@@ -1121,35 +1124,43 @@ fn smoothed_into<const D: u32>(_rest: Pose<D>, c: Clip) -> Done {
         }
     }
     let w = 7 + D
-    var out = bytes.clone()
-    let h = u32(3.0 * SMOOTH) + 1
-    for f in 0..n {
-        let a = if f > h { f - h } else { 0 }
-        let b = min(f + h, n - 1)
-        var sum: Vec<f32> = Vec::filled(w, 0.0)
-        var wsum = 0.0
-        // The root's turns, each made to agree in sign with this frame's.
-        let q0 = vec4(vals[f * w + 3], vals[f * w + 4], vals[f * w + 5], vals[f * w + 6])
-        var qsum = vec4(0.0)
-        for g in a..b + 1 {
-            let d = (f32(g) - f32(f)) / SMOOTH
-            let k = exp(-0.5 * d * d)
-            wsum += k
-            for i in 0..w {
-                sum[i] += vals[g * w + i] * k
-            }
-            var q = vec4(vals[g * w + 3], vals[g * w + 4], vals[g * w + 5], vals[g * w + 6])
-            if dot(q, q0) < 0.0 {
-                q = -q
-            }
-            qsum += q * k
+    let rate = bitcast_f32(le_word(bytes, 16))
+    // The root's turns made to agree in sign from frame to frame, so each part filters as a path.
+    for f in 1..n {
+        var d = 0.0
+        for i in 3..7 {
+            d += vals[f * w + i] * vals[(f - 1) * w + i]
         }
-        let qn = normalize(qsum)
-        for i in 0..w {
-            var v = sum[i] / wsum
-            if i >= 3 && i < 7 {
-                v = qn[i - 3]
+        if d < 0.0 {
+            for i in 3..7 {
+                vals[f * w + i] = -vals[f * w + i]
             }
+        }
+    }
+    // Each number's path low-passed at the judge's `TREMOR_HZ` (its filter, no lag).
+    var cols: Vec<Vec<f32>> = Vec::new()
+    for i in 0..w {
+        var xs: Vec<f32> = Vec::with_capacity(n)
+        for f in 0..n {
+            xs.push(vals[f * w + i])
+        }
+        cols.push(if n >= 8 { low_passed(xs.clone(), TREMOR_HZ, rate) } else { xs.clone() })
+    }
+    var out = bytes.clone()
+    for f in 0..n {
+        var p = rest
+        var q = vec4(cols[3][f], cols[4][f], cols[5][f], cols[6][f])
+        q = normalize(q)
+        for k in 0..D {
+            p.q[k] = cols[7 + k][f]
+        }
+        // A filter can ring past a range's edge by a little: each joint put back into its range.
+        for sg in 1..S {
+            let jt = body.segments[sg].joint
+            body.set_numbers(mut p, sg, jt.clamped(body.numbers(p, sg)))
+        }
+        for i in 0..w {
+            let v = if i < 3 { cols[i][f] } else if i < 7 { q[i - 3] } else { p.q[i - 7] }
             let u = bitcast_u32(v)
             let o = head + f * row + 4 * i
             out[o] = u8(u & 255)
