@@ -23,11 +23,12 @@ use matter::substance::Substance
 use mesh::dc::{HOLE_PX, HOLE_REACH_PX, QUAD_OUTLINE, decode_cell, finer_than_a_hole, on_outline}
 use mesh::grid::{
     ActiveBrick, BRICK, ExactCell, FrustumCull, GridSpec, MeshVertex, NONE, TALLY_RUNS, TALLY_SHORT,
-    TALLY_UNASKED, box_in_frustum, cell_live, unpack_oct_normal,
+    TALLY_DUE_COARSER, TALLY_DUE_FAILED, TALLY_DUE_NONE, TALLY_ROOMLESS_BESIDE, TALLY_ROOMLESS_CERT,
+    TALLY_ROOMLESS_KEPT, TALLY_UNASKED, TALLY_UNPROVEN, box_in_frustum, cell_live, unpack_oct_normal,
 }
 use std::derive::Box3
 use std::field::{Field, Live}
-use std::gpu::{Append, Atomics, GlobalId, Slots}
+use std::gpu::{Append, Atomics, DispatchArgs, GlobalId, Slots}
 
 /// An opaque quad an extraction drew: `x` where its six indices begin, `y` its brick's slot (bits
 /// 0..30), whether its cells wind against their order (bit 30: `quad_order`'s `flip`) and its
@@ -139,12 +140,32 @@ fn exact_once<M: Field<Substance>>(
     }
 }
 
+/// Gives cell `cell` of slot `slot` an exact cell, once a frame, with the parts live in its brick
+/// (more than live in the cell, which costs its rays more and draws the same): for a cell put
+/// up past its list's room, asked nothing of the field.
+fn exact_once_brick(
+    s: SlotBrick,
+    slot: u32,
+    cell: u32,
+    origin: vec3,
+    shift: vec3,
+    bits: mut Atomics<u32>,
+    exact_cells: mut Append<ExactCell>,
+) {
+    if mark(mut bits, slot, SLOT_EXACT, cell) {
+        let _ = exact_cells.push(ExactCell { lo: slot_corner(s, origin, shift, cell3(cell)), h: s.cell, live: s.live })
+    }
+}
+
 /// Each kept quad (`QuadRec`) of a live slot, held to the eye `eye` (`xyz` its place, `w` its
 /// pixel's width a metre out): on the outline (`on_outline`, the eye this frame's alone) and not
 /// finer than a hole there, its four cells are this frame's outline cells (`SLOT_LINE`), each
 /// put up for a certificate once (`cert_cands`: `(slot << 9 | cell, vertex)`), and each of its
 /// all-outside face neighbours in the brick (`SLOT_OUT`) put up as a thin candidate
-/// (`thin_cands`: `slot << 9 | cell`), for what of the field reaches past the outline.
+/// (`thin_cands`: `slot << 9 | cell`), for what of the field reaches past the outline. A cell put
+/// up past the room this frame's slices give its list (`cands_room`, `beside_room`) is given an
+/// exact cell instead: nothing this frame is left unsaid (the slices are sized by counts read
+/// frames late, and a pool's commit or a turn brought five times them).
 @strict
 @compute(64)
 pub(package) fn outline_quads(
@@ -160,9 +181,12 @@ pub(package) fn outline_quads(
     first: u32,
     eye: vec4,
     fc: FrustumCull,
+    cands_room: u32,
+    beside_room: u32,
     bits: mut Atomics<u32>,
     cert_cands: mut Append<vec2u>,
     thin_cands: mut Append<u32>,
+    exact_cells: mut Append<ExactCell>,
     id: GlobalId,
 ) {
     let qi = first + id.x
@@ -223,7 +247,9 @@ pub(package) fn outline_quads(
         let cell = cs[k]
         if mark(mut bits, slot, SLOT_LINE, cell) {
             if mark(mut bits, slot, SLOT_CERT, cell) {
-                let _ = cert_cands.push(vec2u((slot << 9) | cell, vs[k]))
+                if cert_cands.push(vec2u((slot << 9) | cell, vs[k])) >= cands_room {
+                    exact_once_brick(s, slot, cell, origin, shift, mut bits, mut exact_cells)
+                }
             }
             let (cx, cy, cz) = decode_cell(cell)
             for f in 0..6 {
@@ -235,7 +261,9 @@ pub(package) fn outline_quads(
                     let n = if up { cell + step } else { cell - step }
                     if marked(mut bits, slot, SLOT_OUT, n) && mark(mut bits, slot, SLOT_LINE, n) &&
                         !marked(mut bits, slot, SLOT_BESIDE, n) {
-                        let _ = thin_cands.push((slot << 9) | n)
+                        if thin_cands.push((slot << 9) | n) >= beside_room {
+                            exact_once_brick(s, slot, n, origin, shift, mut bits, mut exact_cells)
+                        }
                     }
                 }
             }
@@ -251,7 +279,8 @@ pub(package) fn outline_quads(
 /// `HOLE_PX` the pillars lost 16 at an outline, at twice it the crowd's near body one) holds,
 /// and the cell needs nothing; a wider one that is all its certificate can say fails, and the
 /// cell is given an exact cell; one not yet made, or one that stopped at a wider slab than this
-/// eye needs, is put up to be certified (`due`).
+/// eye needs, is put up to be certified (`due`), or given an exact cell where that is past the
+/// room `certify_watched`'s slices give it this frame (`room`).
 @strict
 @compute(64)
 pub(package) fn cert_due<M: Field<Substance>>(
@@ -267,6 +296,7 @@ pub(package) fn cert_due<M: Field<Substance>>(
     vert_cert: mut Atomics<u32>,
     bits: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
+    room: u32,
     due: mut Append<u32>,
     id: GlobalId,
 ) {
@@ -286,8 +316,7 @@ pub(package) fn cert_due<M: Field<Substance>>(
         if abs(kept) <= need && kept != 0.0 {
             return
         }
-        if !(kept < 0.0) {
-            let _ = due.push(i)
+        if !(kept < 0.0) && due.push(i) < room {
             return
         }
     }
@@ -361,10 +390,22 @@ fn watched_core(s: SlotBrick, origin: vec3, shift: vec3, cell: u32, eye: vec4) -
     (lo + vec3(m), s.cell - 2.0 * m)
 }
 
+/// What a thin list's tests are of (`thin_watched`, `thin_watched_octants`' `keep`): the cells
+/// beside this frame's outline (their proofs kept in the slot's bits), the kept thin cells due
+/// for this eye (`thin_due`'s list, into `thin_keep`), and the kept thin cells a chunk has just
+/// meshed (`thin_keep` itself, from `from[0]`: proven for the eye of the update that meshes
+/// them, in the chunk, so a commit that draws their slots brings none due; their slots are not
+/// yet alive, and they give no exact cell, which is a frame's).
+pub(package) const THIN_BESIDE: u32 = 0
+pub(package) const THIN_DUE: u32 = 1
+pub(package) const THIN_MESHED: u32 = 2
+
 /// A thin candidate's first half: the core whole, and the
-/// octants its form doesn't clear into `thin_masks` (a slice's, by invocation). A kept candidate
-/// (`keep` true, from `thin_keep`) is first held to its last proof (`thin_proof`, the core's margin
-/// it was proven empty at: an eye whose margin there is no finer holds it).
+/// octants its form doesn't clear into `thin_masks` (a slice's, by invocation). A kept
+/// candidate's (`keep` not `THIN_BESIDE`) proof is kept for this eye's margin (`thin_proof`, the
+/// core's margin it was proven empty at: an eye whose margin there is no finer holds it): the whole core's, or, where its form leaves octants to ask, the same
+/// until `thin_watched_octants` (dispatched over the same slice after it) finds one it can't
+/// prove empty and undoes it.
 @strict
 @compute(64)
 pub(package) fn thin_watched<M: Field<Substance>>(
@@ -375,6 +416,7 @@ pub(package) fn thin_watched<M: Field<Substance>>(
     order: [u32],
     count: [u32],
     cap: u32,
+    from: [u32],
     first: u32,
     origin: vec3,
     shift: vec3,
@@ -385,15 +427,15 @@ pub(package) fn thin_watched<M: Field<Substance>>(
     thin_masks: mut Slots<u32>,
     id: GlobalId,
 ) {
-    let i = first + id.x
+    let i = from[0] + first + id.x
     thin_masks[id] = 0
     if i >= min(count[0], cap) {
         return
     }
-    // A kept cell's place in `thin_keep` (from `thin_due`'s list), or the beside cell's own.
-    let at = if keep != 0 { order[i] } else { i }
+    // A due cell's place in `thin_keep` (from `thin_due`'s list), or the cell's own.
+    let at = if keep == THIN_DUE { order[i] } else { i }
     let packed = cands[at]
-    if alive[packed >> 9] == 0 {
+    if keep != THIN_MESHED && alive[packed >> 9] == 0 {
         return
     }
     let s = load_slot(slots, packed >> 9)
@@ -403,15 +445,6 @@ pub(package) fn thin_watched<M: Field<Substance>>(
         return
     }
     let m = 0.5 * (s.cell - w)
-    if keep != 0 {
-        let proven = bitcast_f32(thin_proof.load(i: at))
-        if proven < 0.0 && -proven >= m {
-            // Core at margin `m <= -proven` contains the smaller core that already failed: emit
-            // an exact cell on lane 0 without re-evaluating 9 enclosures.
-            thin_masks[id] = 256
-            return
-        }
-    }
     // Asked for `WATCH_SLACK` of this frame's margin: a wider core, held by eyes nearer still.
     let mt = WATCH_SLACK * m
     let lt = lo - vec3(m - mt)
@@ -425,25 +458,24 @@ pub(package) fn thin_watched<M: Field<Substance>>(
             }
         }
     }
-    // A proof kept from frame to frame only where the whole core is proven here: one left for its
-    // octants to confirm stood unconfirmed where they ran short (a slice of them is what the
-    // last frame's counts gave), and a pool keeps it from eye to eye (a citadel's far floor, its
-    // thin cells taken as proven, drew 136 pixels of sky).
-    if mask == 0 {
-        if keep != 0 {
-            thin_proof.store(i: at, value: bitcast_u32(mt))
-        } else {
-            let slot = packed >> 9
-            let _ = bits.or(i: slot * SLOT_WORDS + SLOT_BESIDE + (cell >> 5), value: 1 << (cell & 31))
-            let _ = bits.max(i: slot * SLOT_WORDS + SLOT_MARGIN, value: bitcast_u32(mt))
-        }
+    // A kept cell's proof is kept for the octants to undo (they are dispatched over the slice
+    // this one is, so none is left unconfirmed); a beside cell's only where the whole core is
+    // proven here. A pool keeps it from eye to eye (a citadel's far floor, its thin cells taken
+    // as proven, drew 136 pixels of sky): it holds only while an eye's margin is no finer.
+    if keep != THIN_BESIDE {
+        thin_proof.store(i: at, value: bitcast_u32(mt))
+    } else if mask == 0 {
+        let slot = packed >> 9
+        let _ = bits.or(i: slot * SLOT_WORDS + SLOT_BESIDE + (cell >> 5), value: 1 << (cell & 31))
+        let _ = bits.max(i: slot * SLOT_WORDS + SLOT_MARGIN, value: bitcast_u32(mt))
     }
     thin_masks[id] = mask
 }
 
 /// The second half: an octant of a candidate's core an invocation (eight a candidate), each the
 /// octant's own enclosure where the whole's form didn't clear it; an exact cell for a candidate
-/// one of whose octants the field's enclosure can't prove empty (and its proof undone).
+/// one of whose octants the field's enclosure can't prove empty (and its proof undone; for a
+/// cell just meshed, `THIN_MESHED`, no exact cell: those are a frame's).
 @strict
 @compute(64)
 pub(package) fn thin_watched_octants<M: Field<Substance>>(
@@ -455,6 +487,7 @@ pub(package) fn thin_watched_octants<M: Field<Substance>>(
     count: [u32],
     cap: u32,
     thin_masks: [u32],
+    from: [u32],
     first: u32,
     origin: vec3,
     shift: vec3,
@@ -465,50 +498,79 @@ pub(package) fn thin_watched_octants<M: Field<Substance>>(
     exact_cells: mut Append<ExactCell>,
     id: GlobalId,
 ) {
-    let i = first + id.x / 8
+    let i = from[0] + first + id.x / 8
     let j = id.x % 8
     if i >= min(count[0], cap) {
         return
     }
-    // A kept candidate whose smaller core already failed (`thin_watched`'s 256) is given its
-    // exact cell by its first lane, its octants not looked at again.
     let tm = thin_masks[id.x / 8]
-    let failed = tm == 256
-    if (failed && j != 0) || (!failed && ((tm >> j) & 1) == 0) {
+    if ((tm >> j) & 1) == 0 {
         return
     }
-    let at = if keep != 0 { order[i] } else { i }
+    let at = if keep == THIN_DUE { order[i] } else { i }
     let packed = cands[at]
     let slot = packed >> 9
-    if alive[slot] == 0 {
+    if keep != THIN_MESHED && alive[slot] == 0 {
         return
     }
     let cell = packed & 511
     let s = load_slot(slots, slot)
     let f = fields[s.orig]
-    var exact = failed
-    if !failed {
-        let (lo, w) = watched_core(s, origin, shift, cell, eye)
-        let m = 0.5 * (s.cell - w)
-        let mt = WATCH_SLACK * m
-        let lt = lo - vec3(m - mt)
-        let wt = w + 2.0 * (m - mt)
-        let o = lt + vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * (0.5 * wt)
-        let af = f.slope_affine(Box3 { lo: o, hi: o + vec3(0.5 * wt) }, s.live)
-        if af.lo() <= 0.0 {
-            if keep != 0 {
-                thin_proof.store(i: at, value: bitcast_u32(-mt))
-            } else {
-                let _ = bits.and(
-                    i: slot * SLOT_WORDS + SLOT_BESIDE + (cell >> 5),
-                    value: NONE ^ (u32(1) << (cell & 31)),
-                )
-            }
-            exact = true
+    let (lo, w) = watched_core(s, origin, shift, cell, eye)
+    let m = 0.5 * (s.cell - w)
+    let mt = WATCH_SLACK * m
+    let lt = lo - vec3(m - mt)
+    let wt = w + 2.0 * (m - mt)
+    let o = lt + vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * (0.5 * wt)
+    let af = f.slope_affine(Box3 { lo: o, hi: o + vec3(0.5 * wt) }, s.live)
+    if af.lo() <= 0.0 {
+        // Failed: an exact cell for this eye and any whose margin is no wider (a failure kept at
+        // the wider core asked, `mt`, put the cell up again for the same eye each frame).
+        if keep != THIN_BESIDE {
+            thin_proof.store(i: at, value: bitcast_u32(-m))
+        } else {
+            let _ = bits.and(
+                i: slot * SLOT_WORDS + SLOT_BESIDE + (cell >> 5),
+                value: NONE ^ (u32(1) << (cell & 31)),
+            )
+        }
+        if keep != THIN_MESHED {
+            exact_once(f, s, slot, cell, origin, shift, mut bits, mut exact_cells)
         }
     }
-    if exact {
-        exact_once(f, s, slot, cell, origin, shift, mut bits, mut exact_cells)
+}
+
+/// The args of a chunk's just-meshed thin cells' tests (`thin_watched` in `whole`, its octants in
+/// `octs`, `slices` of `most` from `first[0]`), and the most a chunk kept noted in `seen[16]`
+/// (what the next chunks' slices are sized by: `MeshBatch::thin_slices`); those past its slices
+/// are left unproven, for the watch to ask (`thin_due`), and counted in `tally`.
+@strict
+@compute(64)
+pub(package) fn prep_meshed_thin(
+    count: [u32],
+    cap: u32,
+    first: [u32],
+    most: u32,
+    slices: u32,
+    whole: mut Slots<DispatchArgs>,
+    octs: mut Slots<DispatchArgs>,
+    seen: mut Atomics<u32>,
+    tally: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    if id.x >= slices {
+        return
+    }
+    let n = min(count[0], cap)
+    let at = first[0] + id.x * most
+    let m = if n > at { min(n - at, most) } else { 0 }
+    whole[id] = DispatchArgs { x: (m + 63) / 64, y: 1, z: 1 }
+    octs[id] = DispatchArgs { x: (m * 8 + 63) / 64, y: 1, z: 1 }
+    if id.x == 0 && n > first[0] {
+        let _ = seen.max(i: 16, value: n - first[0])
+        if n - first[0] > slices * most {
+            let _ = tally.add(i: TALLY_UNPROVEN, value: n - first[0] - slices * most)
+        }
     }
 }
 
@@ -594,22 +656,39 @@ pub(package) fn stale_beside(
 }
 
 /// A watch run's counts (`MeshBatch::watch_counts`: outline cells put up for a certificate `[0]`,
-/// thin cells beside the outline `[1]`, kept thin cells due `[2]`, certificate candidates `[7]`)
-/// held to what its slices took (`taken`, in that order): the run counted in `tally`
-/// (`grid::TALLY_RUNS`), and where a list held more, a short run (`TALLY_SHORT`) and the cells
-/// it left unasked (`TALLY_UNASKED`).
+/// thin cells beside the outline `[1]`, kept thin cells due `[2]`, certificate candidates `[7]`,
+/// kept thin cells `[9]`, kept quads `[14]`) held to its lists' rooms (`room`, in that order of
+/// the first four) and to what its slices examined of the quads and the kept cells (`examined`):
+/// the run counted in `tally` (`grid::TALLY_RUNS`); where quads or kept cells were left
+/// unexamined, a short run (`TALLY_SHORT`) and the cells it left (`TALLY_UNASKED`); and the cells
+/// put up past a list's room, given exact cells (`TALLY_ROOMLESS_*`).
 @strict
 @compute(1)
-pub(package) fn watch_tally(counts: [u32], taken: vec4u, tally: mut Atomics<u32>, id: GlobalId) {
+pub(package) fn watch_tally(
+    counts: [u32],
+    room: vec4u,
+    examined: vec2u,
+    quads_cap: u32,
+    kept_cap: u32,
+    tally: mut Atomics<u32>,
+    id: GlobalId,
+) {
     let _ = id
-    let over = (if counts[0] > taken.x { counts[0] - taken.x } else { 0 }) +
-        (if counts[1] > taken.y { counts[1] - taken.y } else { 0 }) +
-        (if counts[2] > taken.z { counts[2] - taken.z } else { 0 }) +
-        (if counts[7] > taken.w { counts[7] - taken.w } else { 0 })
+    let cert = (if counts[0] > room.x { counts[0] - room.x } else { 0 }) +
+        (if counts[7] > room.w { counts[7] - room.w } else { 0 })
+    let beside = if counts[1] > room.y { counts[1] - room.y } else { 0 }
+    let kept = if counts[2] > room.z { counts[2] - room.z } else { 0 }
+    let quads = min(counts[14], quads_cap)
+    let thin = min(counts[9], kept_cap)
+    let left = (if quads > examined.x { quads - examined.x } else { 0 }) +
+        (if thin > examined.y { thin - examined.y } else { 0 })
     let _ = tally.add(i: TALLY_RUNS, value: 1)
-    if over > 0 {
+    let _ = tally.add(i: TALLY_ROOMLESS_CERT, value: cert)
+    let _ = tally.add(i: TALLY_ROOMLESS_BESIDE, value: beside)
+    let _ = tally.add(i: TALLY_ROOMLESS_KEPT, value: kept)
+    if left > 0 {
         let _ = tally.add(i: TALLY_SHORT, value: 1)
-        let _ = tally.add(i: TALLY_UNASKED, value: over)
+        let _ = tally.add(i: TALLY_UNASKED, value: left)
     }
 }
 
@@ -620,13 +699,19 @@ pub(package) fn zero_words(words: mut Slots<u32>, id: GlobalId) {
     words[id] = 0
 }
 
-/// Each kept thin cell (`thin_keep`) of a live slot whose last proof (`thin_proof`) doesn't hold
-/// for the eye `eye` (or that has none), put up to be asked again this frame (`due`: its place in
-/// `thin_keep`): a cheap pass over every kept cell, so the asking is of the few the eye's move
-/// left unproven.
+/// Each kept thin cell (`thin_keep`) of a live slot in view, held to its last proof
+/// (`thin_proof`) for the eye `eye`: proven empty at a margin no finer than the eye's, nothing;
+/// failed at a margin no finer (its core holds the one that failed), an exact cell, at once; else
+/// (proven at a finer margin, failed at a coarser one, or none) put up to be asked again this
+/// frame (`due`: its place in `thin_keep`). A pass over every kept cell, so the asking is of the
+/// few the eye's move left unsaid, and a list of what a turn brings into view only of those (the
+/// cells failed, asked each frame they were in view, were 7.5 million of SCENE 13 VIEW 3's 8.1
+/// million due and came due with every turn). One put up past the room this frame's slices give
+/// the list (`room`) is given an exact cell.
 @strict
 @compute(64)
-pub(package) fn thin_due(
+pub(package) fn thin_due<M: Field<Substance>>(
+    fields: [M],
     cands: [u32],
     count: [u32],
     cap: u32,
@@ -638,7 +723,11 @@ pub(package) fn thin_due(
     eye: vec4,
     fc: FrustumCull,
     thin_proof: [u32],
+    bits: mut Atomics<u32>,
+    exact_cells: mut Append<ExactCell>,
+    room: u32,
     due: mut Append<u32>,
+    tally: mut Atomics<u32>,
     id: GlobalId,
 ) {
     let i = first + id.x
@@ -646,10 +735,11 @@ pub(package) fn thin_due(
         return
     }
     let packed = cands[i]
-    if alive[packed >> 9] == 0 {
+    let slot = packed >> 9
+    if alive[slot] == 0 {
         return
     }
-    let s = load_slot(slots, packed >> 9)
+    let s = load_slot(slots, slot)
     let blo = slot_corner(s, origin, shift, vec3u(0, 0, 0))
     let bside = s.cell * f32(BRICK + 2)
     if !box_in_frustum(blo - vec3(s.cell), blo + vec3(bside), fc) {
@@ -664,7 +754,16 @@ pub(package) fn thin_due(
     if proven > 0.0 && proven <= m {
         return
     }
-    let _ = due.push(i)
+    if proven < 0.0 && -proven >= m {
+        let _ = tally.add(i: TALLY_DUE_FAILED, value: 1)
+        exact_once(fields[s.orig], s, slot, packed & 511, origin, shift, mut bits, mut exact_cells)
+        return
+    }
+    let why = if proven > 0.0 { TALLY_DUE_COARSER } else { TALLY_DUE_NONE }
+    let _ = tally.add(i: why, value: 1)
+    if due.push(i) >= room {
+        exact_once(fields[s.orig], s, slot, packed & 511, origin, shift, mut bits, mut exact_cells)
+    }
 }
 
 /// Each outline cell put up for a certificate given an exact cell, unasked: where one invocation
